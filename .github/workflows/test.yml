@@ -24,11 +24,11 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker.sh ufw-rescue tests/netns-probe.sh; do
+          for f in ufw-docker.sh ufw-rescue.sh tests/netns-probe.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: shellcheck (advisory)
-        run: shellcheck -S warning ufw-docker.sh ufw-rescue tests/netns-probe.sh || true
+        run: shellcheck -S warning ufw-docker.sh ufw-rescue.sh tests/netns-probe.sh || true
 
   bats:
     runs-on: ubuntu-latest
@@ -45,7 +45,7 @@ jobs:
       - name: Install ufw-rescue
         # Installed BEFORE anything else so the suite's teardown can always reach
         # it, including when a test fails early.
-        run: sudo install -m 0755 ufw-rescue /usr/local/sbin/ufw-rescue
+        run: sudo install -m 0755 ufw-rescue.sh /usr/local/sbin/ufw-rescue
 
       - name: Bring up a published container to filter
         # The suite needs something listening behind a Docker-published port. Port

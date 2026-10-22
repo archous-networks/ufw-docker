@@ -71,8 +71,11 @@ Undo with `sudo ./ufw-docker.sh remove`.
 **Do this before anything else, especially on a remote host.**
 
 ```bash
-sudo install -m 0755 ufw-rescue /usr/local/sbin/ufw-rescue
+sudo install -m 0755 ufw-rescue.sh /usr/local/sbin/ufw-rescue
 ```
+
+(The repo file keeps `.sh` so editors and `shellcheck` pick it up; the installed
+command drops it, matching every other tool in `sbin` — `ufw`, `iptables`, `nft`.)
 
 If the firewall ends up in a bad state, from the console:
 
