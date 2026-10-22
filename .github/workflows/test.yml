@@ -27,6 +27,12 @@ jobs:
           for f in ufw-docker tests/netns-probe.sh; do
             bash -n "$f" && echo "ok  $f"
           done
+      - name: the operator-rule invariant actually fires
+        # Proves the suite's central safety check is not vacuous. Pure logic
+        # against synthetic inputs -- touches no firewall, so it belongs here
+        # in the fast job rather than in bats.
+        run: tests/invariant-selftest.sh
+
       - name: functions defined, dispatcher and usage agree
         # Gating, not advisory: this catches a helper silently dropped by a
         # refactor, which bash -n and shellcheck both pass. It has happened.
@@ -37,7 +43,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tests/netns-probe.sh
+        run: shellcheck -S warning ufw-docker tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh
 
   bats:
     runs-on: ubuntu-latest
@@ -111,6 +117,12 @@ jobs:
           sudo ufw allow 22/tcp
           sudo ufw --force enable
           sudo ufw status verbose
+
+      - name: Mark this runner as safe to disrupt
+        # tests/run.sh refuses to run without this. Runners are disposable, so
+        # the answer here is always yes -- but it has to be said out loud,
+        # which is the whole point of the marker.
+        run: sudo touch /etc/ufw-docker-tests-allowed
 
       - name: Run the suite
         # The suite itself takes ~2 minutes of wall clock. Anything close to

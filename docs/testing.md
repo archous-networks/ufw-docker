@@ -133,6 +133,47 @@ not care which of the host's addresses the client aimed at.
 > not: `systemctl reset-failed docker.service` and start again.
 
 
+## The suite refuses to run on an unmarked host
+
+```
+sudo touch /etc/ufw-docker-tests-allowed
+```
+
+Without it, `tests/run.sh` explains what it would do to the box and stops.
+
+**This restricts the test suite, not the tool.** `ufw-docker` itself is *for* production
+Docker hosts. The suite is a different matter: over a full run it restarts the Docker
+daemon, flushes and rebuilds ufw's chains, and opens and closes ports.
+
+A per-host marker rather than an environment variable, deliberately. The realistic
+accident is not a user — deployments download the single `ufw-docker` file and never see
+this directory. It is one of us running a familiar command in the wrong SSH session, and
+an env var travels in shell history and muscle memory, which is exactly the failure. A
+file does not travel.
+
+It is also **not** a heuristic like "does this look like production". The development
+host is a full UISP stack on purpose — that is why the container-recreate test runs there
+and skips in CI. Any heuristic smart enough to refuse a customer's box would refuse the
+most valuable test environment available.
+
+## The operator's rules are an enforced invariant
+
+Every test is measured against a baseline snapshot of `/etc/ufw/user.rules` taken in
+`setup_file`, and the per-test `teardown` fails the test that violates it:
+
+| | |
+|---|---|
+| **a deleted rule** | always a failure. No test has any business removing a rule the operator put there |
+| **an added rule** | a failure unless it names a port or address the suite owns (`TEST_PORTS` / `TEST_ADDRS`) |
+| **anything left at the end** | `teardown_file` compares exactly, before it unwinds anything |
+
+This is the mechanical form of what used to be discipline, and discipline lost twice —
+once leaking a blanket SSH rule onto a restricted host, once deleting CI's SSH rule.
+**The check never asks what the host's rules look like, only whether they still look the
+same**, so the two environments are free to differ. They differ in several ways besides
+the SSH rule: UISP present or absent, 15 containers versus 1, three Docker networks
+versus one.
+
 ## Two bats traps that cost CI runs
 
 Both were diagnosed from CI logs and then reproduced locally. Worth knowing before

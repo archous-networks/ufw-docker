@@ -31,6 +31,49 @@ ensure_service() {
     return 1
 }
 
+# ── THE INVARIANT: a test may touch only what it created ──────────────────
+#
+# Everything else in the operator's rule set must be byte-identical before and
+# after EVERY test. This is the mechanical form of a rule that used to be
+# discipline, and discipline lost twice in a row:
+#
+#   - a test re-added `allow 22/tcp` unconditionally and LEAKED a blanket SSH
+#     rule onto a host whose SSH was deliberately restricted to one source;
+#   - the fix for that then DELETED CI's SSH rule and never put it back,
+#     because it asked "did we add it?" when it needed "did we delete it?".
+#
+# Both bugs were invisible in the environment they were written in and obvious
+# in the other one. The check below does not care what the host's rules look
+# like -- only whether they still look the same -- so the two environments are
+# free to differ, which they do in several ways besides this one.
+#
+# The verdict logic lives in rules-lib.bash so it can be self-tested against
+# synthetic inputs (tests/invariant-selftest.sh). A check that never fires is
+# indistinguishable from one that cannot, and this suite has already shipped
+# three assertions that passed for the wrong reason.
+# shellcheck source=tests/rules-lib.bash
+source "${BATS_TEST_DIRNAME}/rules-lib.bash"
+
+# The operator's DECLARED rules, which is the durable thing. The live chains are
+# flushed and rebuilt by tests legitimately (that is what test 19 exercises);
+# user.rules is what survives, and it is what both bugs above corrupted.
+op_rules() {
+    sudo cat /etc/ufw/user.rules /etc/ufw/user6.rules 2>/dev/null \
+        | grep -E -- '^-A ufw6?-user-' | sort
+}
+
+assert_operator_rules_intact() {
+    local before="$BATS_FILE_TMPDIR/rules-before" after="$BATS_FILE_TMPDIR/rules-after"
+    [ -f "$before" ] || return 0
+    op_rules > "$after"
+    local out
+    if ! out=$(rules_diff_report "$before" "$after"); then
+        printf '%s\n' "$out" >&3
+        return 1
+    fi
+    return 0
+}
+
 # Start a listener on the HOST (not in a container), safely.
 #
 # THE `3>&-` IS LOAD-BEARING AND IS NOT TIDINESS. bats blocks on exit until
@@ -110,11 +153,10 @@ setup_file() {
     fi
     reinstall
 
-    # Snapshot the operator's rules. The teardown compares against this: a suite
-    # that verifies a firewall tool must not leave the firewall different from
-    # how it found it. A blanket `22/tcp ALLOW Anywhere` leaked out once and was
-    # only caught by eye.
-    sudo ufw status 2>/dev/null | tail -n +4 | sort > "$BATS_FILE_TMPDIR/rules-before"
+    # The baseline every test is measured against. Taken AFTER the SSH rule
+    # above, so whatever this host's SSH rule looks like is simply part of the
+    # baseline and no test needs to know its shape.
+    op_rules > "$BATS_FILE_TMPDIR/rules-before"
 }
 
 # Fail the test that BREAKS the SSH rule, not the five downstream tests that
@@ -125,6 +167,8 @@ teardown() {
     # cleanup, and one orphan holding fd 3 hangs the whole run on exit.
     stop_host_listeners
 
+    local rc=0
+
     if [ "$(ssh_rule)" -eq 0 ]; then
         {
             echo "### THIS TEST LEFT THE HOST WITH NO SSH RULE IN ufw-user-input ###"
@@ -132,12 +176,26 @@ teardown() {
             sudo ufw status verbose 2>&1 || true
             grep -- '-A ufw-user-input' /etc/ufw/user.rules 2>/dev/null || echo "(none in user.rules either)"
         } >&3
-        return 1
+        rc=1
     fi
-    return 0
+
+    assert_operator_rules_intact || rc=1
+    return $rc
 }
 
 teardown_file() {
+    # STRICT, and FIRST -- before anything below unwinds the setup. Mid-run a
+    # test-owned rule may legitimately still be in place; by the end nothing
+    # the suite created may remain, so this compares exactly.
+    local leftover
+    leftover=$(op_rules | diff "$BATS_FILE_TMPDIR/rules-before" - || true)
+    if [ -n "$leftover" ]; then
+        {
+            echo "### THE SUITE LEFT THE OPERATOR'S RULE SET CHANGED ###"
+            printf '%s\n' "$leftover"
+        } >&3
+    fi
+
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1 || true
     # Remove the blanket SSH allow ONLY if we added it. Leaving one behind would
     # widen the operator's exposure; deleting one we were given breaks whatever
@@ -153,18 +211,8 @@ teardown_file() {
     # bounded one was ever reached.
     sudo timeout 180 "$REPO/ufw-docker" rescue >/dev/null 2>&1 || true
 
-    # And never leave it DIFFERENT, either. A suite that verifies a firewall
-    # tool must not change the operator's rules; a blanket `22/tcp ALLOW
-    # Anywhere` leaked out of this suite once and was caught only by eye.
-    if [ -f "$BATS_FILE_TMPDIR/rules-before" ]; then
-        sudo ufw status 2>/dev/null | tail -n +4 | sort > "$BATS_FILE_TMPDIR/rules-after"
-        if ! diff -q "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" >/dev/null 2>&1; then
-            {
-                echo "### WARNING: this run CHANGED the host's ufw rules ###"
-                diff "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" || true
-            } >&3
-        fi
-    fi
+    # (the strict comparison now runs at the TOP of this function, before the
+    # unwinding above can muddy it)
 }
 
 @test "install wires DOCKER-USER into ufw-user-input" {

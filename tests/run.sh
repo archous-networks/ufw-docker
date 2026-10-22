@@ -27,6 +27,59 @@ REPO="$(dirname "$HERE")"
 LOCK=/var/lock/ufw-docker-tests
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+
+# ── THE MARKER ─────────────────────────────────────────────────────────────
+# A deliberate per-HOST opt-in, not a per-command one.
+#
+# The realistic accident is not a user: deployments download the single
+# `ufw-docker` file and never see this directory. It is one of US, running a
+# command we have run a hundred times, in the wrong SSH session.
+#
+# An environment variable would not help with that -- it travels in shell
+# history and in muscle memory, which is precisely the failure. A file does
+# not travel. It is a property of the machine, so the box itself decides.
+#
+# Note it is NOT a heuristic like "does this look like production". This tool
+# is FOR production Docker hosts, and the development host is a full UISP
+# stack on purpose -- that is why the container-recreate test runs here and
+# skips in CI. Any heuristic smart enough to refuse a customer's box would
+# refuse the most valuable test environment there is.
+MARKER=/etc/ufw-docker-tests-allowed
+if [ ! -e "$MARKER" ]; then
+    cat >&2 <<EOF
+
+  REFUSING TO RUN -- this host is not marked as safe to disrupt.
+
+  WHY
+    These tests do not simulate a firewall, they rewrite THIS host's one.
+    Over a full run they will:
+
+      - restart the Docker daemon            (every container bounces)
+      - flush and rebuild ufw's chains       (brief loss of filtering)
+      - open and close ports on this host    (brief exposure)
+      - add and remove Docker networks and containers
+
+    On a box somebody depends on, that is an outage and a transient hole.
+    Everything is restored afterwards and \`$REPO/ufw-docker rescue\` runs on
+    ANY exit, including Ctrl-C -- but "it recovers" is not a reason to run it
+    somewhere it should never have run.
+
+    The tool itself is a different matter and is meant for production hosts.
+    This restriction is on the TEST SUITE only.
+
+  HOW TO ALLOW IT, if this host is genuinely yours to disrupt
+    sudo touch $MARKER
+
+  HOW TO UNDO THAT
+    sudo rm $MARKER
+
+  CI creates this marker as a step, because its runners are disposable.
+  If you are reading this on a customer's machine, the answer is no.
+
+EOF
+    exit 1
+fi
+
 : "${HOST_IP:?set HOST_IP to the primary address of this host}"
 
 if ! mkdir "$LOCK" 2>/dev/null; then
