@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# ufw-docker-survey — report what a host IS. Changes nothing.
+#
+#   sudo ./ufw-docker-survey
+#
+# SAFE TO RUN ON PRODUCTION. Every command below reads; none writes. There is
+# no install path, no rule is added or removed, no service is restarted, and no
+# file outside stdout is touched. It is a separate file from `ufw-docker` on
+# purpose: handing someone the real tool means trusting them to type the right
+# subcommand, and this one cannot do damage even if they do not.
+#
+# Needs root only because `iptables -S` and the Docker socket do.
+#
+# Paste the whole output back. It is what the supported-platform matrix gets
+# built from, so "weird" answers are the valuable ones -- do not tidy them up.
+set -u
+
+have() { command -v "$1" >/dev/null 2>&1; }
+hdr()  { printf '\n== %s\n' "$*"; }
+kv()   { printf '  %-28s %s\n' "$1" "${2:-(unknown)}"; }
+
+printf 'ufw-docker survey  —  %s  —  %s\n' "$(hostname 2>/dev/null)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+[ "$(id -u)" -eq 0 ] || printf '\n!! not root: iptables and Docker sections will be incomplete\n'
+
+hdr "OS"
+if [ -r /etc/os-release ]; then
+    . /etc/os-release 2>/dev/null
+    kv "distro"        "${PRETTY_NAME:-$ID $VERSION_ID}"
+    kv "id / version"  "${ID:-?} / ${VERSION_ID:-?}"
+fi
+kv "kernel" "$(uname -r 2>/dev/null)"
+kv "arch"   "$(uname -m 2>/dev/null)"
+
+hdr "ufw"
+if have ufw; then
+    kv "version" "$(ufw --version 2>/dev/null | head -1)"
+    kv "status"  "$(ufw status 2>/dev/null | head -1)"
+    ufw status verbose 2>/dev/null | grep -iE '^(logging|default):' | sed 's/^/  /'
+    kv "user rules (v4)" "$(grep -c -- '^-A ufw-user-'  /etc/ufw/user.rules  2>/dev/null)"
+    kv "user rules (v6)" "$(grep -c -- '^-A ufw6-user-' /etc/ufw/user6.rules 2>/dev/null)"
+else
+    kv "version" "NOT INSTALLED"
+fi
+
+hdr "iptables backend  (the single most important answer here)"
+if have iptables; then
+    kv "iptables --version" "$(iptables --version 2>/dev/null)"
+    kv "alternatives"       "$(update-alternatives --query iptables 2>/dev/null | awk '/^Value:/{print $2}')"
+else
+    kv "iptables" "NOT FOUND"
+fi
+have nft && kv "nft --version" "$(nft --version 2>/dev/null)"
+
+# MIXED BACKENDS: rules present in BOTH subsystems. Both are evaluated by the
+# kernel and a DROP in either wins, so this silently breaks filtering.
+if [ "$(id -u)" -eq 0 ] && have iptables-legacy && have iptables-nft; then
+    l=$(iptables-legacy -S 2>/dev/null | grep -c '^-A')
+    n=$(iptables-nft    -S 2>/dev/null | grep -c '^-A')
+    kv "rules in legacy / nft" "${l:-0} / ${n:-0}"
+    if [ "${l:-0}" -gt 0 ] && [ "${n:-0}" -gt 0 ]; then
+        printf '  !! MIXED BACKENDS: both populated. Both are evaluated; a DROP in either wins.\n'
+    fi
+fi
+
+hdr "Docker"
+if have docker; then
+    kv "client/server" "$(docker version --format '{{.Client.Version}} / {{.Server.Version}}' 2>/dev/null)"
+    kv "rootless"      "$(docker info --format '{{range .SecurityOptions}}{{.}} {{end}}' 2>/dev/null | grep -o rootless || echo no)"
+    kv "swarm"         "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)"
+    kv "daemon.json"   "$( [ -r /etc/docker/daemon.json ] && tr -d '\n ' < /etc/docker/daemon.json || echo '(none)')"
+    printf '  %-28s\n' "networks (name  driver  subnets):"
+    docker network ls --format '{{.Name}} {{.Driver}}' 2>/dev/null | while read -r nm dr; do
+        sn=$(docker network inspect "$nm" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null)
+        printf '    %-22s %-10s %s\n' "$nm" "$dr" "$sn"
+    done
+    kv "containers running" "$(docker ps -q 2>/dev/null | wc -l)"
+    kv "published ports"    "$(docker ps --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' | grep -c '\->' )"
+else
+    kv "docker" "NOT INSTALLED"
+fi
+
+hdr "Chains"
+if [ "$(id -u)" -eq 0 ] && have iptables; then
+    kv "DOCKER-USER rules"  "$(iptables -S DOCKER-USER 2>/dev/null | grep -c '^-A')"
+    kv "ufw logging chains" "$(iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging')"
+    kv "FORWARD policy"     "$(iptables -S FORWARD 2>/dev/null | awk '/^-P FORWARD/{print $3}')"
+    have ip6tables && kv "ip6 DOCKER-USER rules" "$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c '^-A')"
+fi
+
+hdr "SSH"
+if have sshd; then
+    kv "sshd -T port(s)" "$(sshd -T 2>/dev/null | awk '/^port /{printf "%s ", $2}')"
+elif [ -x /usr/sbin/sshd ]; then
+    kv "sshd -T port(s)" "$(/usr/sbin/sshd -T 2>/dev/null | awk '/^port /{printf "%s ", $2}')"
+fi
+kv "listening"       "$(ss -lntH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un | tr '\n' ' ')"
+# is-enabled PRINTS "disabled" and EXITS non-zero, so a naive `|| echo n/a`
+# emits both. Capture first, then decide.
+_sock=$(systemctl is-enabled ssh.socket 2>/dev/null)
+kv "ssh.socket"      "${_sock:-n/a}"
+kv "ssh.socket ports" "$(systemctl show ssh.socket -p ListenStream --value 2>/dev/null | tr '\n' ' ')"
+
+hdr "ufw-docker, if already present"
+kv "binary"        "$( [ -x /usr/local/sbin/ufw-docker ] && /usr/local/sbin/ufw-docker --version 2>/dev/null || echo '(not installed)')"
+kv "stanza"        "$(grep -o 'Managed by ufw-docker [0-9.]*' /etc/ufw/after.rules 2>/dev/null || echo '(none)')"
+if [ -f /etc/ufw/before.init ]; then
+    if grep -q 'Managed by ufw-docker' /etc/ufw/before.init 2>/dev/null; then
+        kv "before.init" "ours"
+    elif [ -f /usr/share/ufw/before.init ] && cmp -s /etc/ufw/before.init /usr/share/ufw/before.init; then
+        kv "before.init" "stock, untouched"
+    else
+        kv "before.init" "CUSTOMISED BY OPERATOR — install would refuse"
+    fi
+else
+    kv "before.init" "(absent)"
+fi
+
+printf '\n== end of survey — nothing on this host was changed\n'
