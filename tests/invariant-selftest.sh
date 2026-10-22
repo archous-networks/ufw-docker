@@ -35,14 +35,14 @@ check "leaked unrelated rule is caught"        1 "$SSH" "$SSH
 check "bare port 80 is caught"                 1 "$SSH" "$SSH
 -A ufw-user-input -p tcp -m tcp --dport 80 -j ACCEPT"
 check "test-owned port is allowed"             0 "$SSH" "$SSH
--A ufw-user-input -p tcp -m tcp --dport 8089 -j ACCEPT"
+-A ufw-user-input -p tcp -m tcp --dport 19089 -j ACCEPT"
 check "test-owned container dst is allowed"    0 "$SSH" "$SSH
 -A ufw-user-input -d 172.21.0.10/32 -p tcp -m tcp --dport 80 -j ACCEPT"
 check "test-owned probe src is allowed"        0 "$SSH" "$SSH
--A ufw-user-input -s 10.97.0.0/24 -p tcp -m tcp --dport 8089 -j ACCEPT"
+-A ufw-user-input -s 10.97.0.0/24 -p tcp -m tcp --dport 19089 -j ACCEPT"
 check "test-owned v6 dst is allowed"           0 "$SSH" "$SSH
 -A ufw6-user-input -d fd00:dead:beef::2/128 -p tcp -m tcp --dport 9200 -j ACCEPT"
-check "a delete still fails amid allowed adds" 1 "$SSH" "-A ufw-user-input -p tcp -m tcp --dport 8089 -j ACCEPT"
+check "a delete still fails amid allowed adds" 1 "$SSH" "-A ufw-user-input -p tcp -m tcp --dport 19089 -j ACCEPT"
 
 [ "$fail" -eq 0 ] && echo "ok  invariant self-test: the check fires on every violation" || echo "FAILED"
 exit $fail

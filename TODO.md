@@ -34,6 +34,7 @@ Not a rule, but these have real dependencies on each other:
 | **D4** | **`status --json`.** The exit code is all monitoring gets today — "something is wrong", never what. Anything richer means scraping coloured prose, which changed wording several times in a single day. `--json` is also the natural home for the preflight verdict and its failed checks. **Build with X1**: `cmd_status` prints as it checks and must be restructured to collect-then-render. | | S3 |
 | **D5** | **Derive ufw's paths instead of hardcoding them.** ufw has no CLI flag for this, but its Python module carries packager-patched constants: `python3 -c 'import ufw.common as c; print(c.config_dir, c.share_dir, c.state_dir, c.prefix_dir)'` → `/etc /usr/share/ufw /lib/ufw /usr`. All four derived paths verified to resolve here. Derive → fall back to Debian defaults if unavailable → **verify each path exists** → refuse as unsupported otherwise. ~10 lines; folds into X1. Gotchas: `config_dir` is `/etc`, **not** `/etc/ufw`; and it is ufw's internal module, justified only because it **fails loudly** where a wrong hardcoded path fails silently. | [verified] | S3 |
 | **B6** | **`rescue` must stop inventing an SSH rule.** If `user.rules` has none, that usually means ufw never permitted SSH — so a blanket `ACCEPT` grants access that never existed rather than restoring anything, and `rescue --open` already covers the deliberate "get me in regardless" case. New behaviour: replay from `user.rules` → else replay from the newest `/var/backups/ufw-rescue-*` snapshot → else **invent nothing** and point at `--open`. Plus `status` must flag any blanket SSH `ACCEPT` in `INPUT` that ufw did not create, for hosts that already have one. **Live bug:** detection matches `--dport <port>` only, so an operator allowing SSH by interface (`ufw allow in on wg0`) reads as "no SSH rule" and that host gets port 22 opened to the world today. | [verified] | S2 |
+| **X5** | **Three test ports still fail the test-port rule.** The rule, now written into `tests/rules-lib.bash`: *every port in `TEST_PORTS` is a port the suite will delete a rule for, so it must be a port nothing real listens on.* **9100** (node_exporter), **9200** (Elasticsearch HTTP) and **9300** (Elasticsearch transport) fail it. Nothing in this estate runs them, so there is no live breakage — but 8089, 443 and container-port 80 were all *also* fine until the day they were not, and each cost a debugging round trip. Move `collc`'s container port off 9100, `v6svc` off 9200, and the host listener off 9300. Cheap and mechanical; the only care needed is keeping `v6svc` published **1:1**, since the remap trap depends on it. | [verified] | S3 |
 | **B7** | **SSH port detection can miss, silently.** Add `systemctl show ssh.socket -p ListenStream` to the chain — socket activation is the default on Ubuntu 22.10+, and `sshd -T` can report 22 while the socket unit listens elsewhere. The more important half: make the bare-22 fallback **loud**. "Could not determine the SSH port, assuming 22" rather than presenting a guess as fact. | [suspected] | S2 |
 | **H1** | **The nft-incompatible chain condition is handled but not understood.** `rescue` step 3b fires reliably at the end of a full run and has never escaped into a failure — but a fix we do not understand is a fix we cannot rely on, and the first version of its detection was wrong in a way that would have run a destructive teardown on a healthy host. Reproduce minimally (interleave `iptables -F`/`-X` on a ufw chain with a `ufw reload`), find the mechanism in the nft compatibility layer, document it. Free experiment: if 3b never fires on the legacy leg, that localises it to iptables-nft. | [unknown] | S2 |
 | **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced — the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the cold-boot path: all of that is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Needs one deliberate reboot into breakage. | [verified] | S2 |
@@ -107,6 +108,39 @@ Not a rule, but these have real dependencies on each other:
   may not sit in at all. Wired-looking and filtering nothing. An untested claim of
   support is worse than a stated limitation.
 - **Tests** 15 → 38, covering every item above.
+
+- **The suite now returns the host to the state it was in.** `rescue` only ever promised a
+  *working* firewall, not *this host's* firewall, and the gap was not theoretical: the
+  remapped-port test published `18443:443` and deleted `allow 443/tcp` on its way out, which
+  is how this development host's UISP web UI went dark and stayed dark until it was noticed
+  by hand. Three changes: the remap test moved to container port **19443**; `443` left
+  `TEST_PORTS`; and `tests/run.sh` snapshots `/etc/ufw` plus ufw's enabled state before the
+  run, restores both after, and **exits non-zero with a diff** if a fingerprint of the
+  declared *and* live state does not match. Runs in CI too, so the restore path is exercised
+  on every push rather than only where it matters most. Verified by inflicting the exact
+  damage — delete the operator's 443 rule, leak a stray rule, leave a file in `/etc/ufw` —
+  and confirming all three were undone.
+
+  The underlying lesson is the one this project keeps relearning: **the bats-level invariant
+  only ever *reported* this drift, and reporting is not restoring.**
+
+- **The suite no longer tests against the operator's own services.** `ensure_service` only
+  curls `127.0.0.1:<port>`, and the port was **8089** — which `unms-nginx` publishes on a
+  UISP host. So the suite probed the operator's service rather than a container it
+  controlled, and deleted their rule for it. Compounding it, the container was created by
+  the **CI workflow**, so a local run had nothing of its own and fell through to whatever
+  answered. `setup_file` now creates the container, on **19089**, and the CI step is gone —
+  CI and local run the identical path. Found the honest way: after `allow 8089/tcp` was
+  added to this host, the next run failed 34 of 38 tests and named the culprit on the first
+  one.
+
+- **The per-container tests used container port 80.** Same root cause, found an hour later
+  on the same host: `-p 18090:80` means the post-DNAT dport is **80**, so on any host that
+  serves a website `ufw allow 80/tcp` matches and the "with no rule it is BLOCKED" baseline
+  fails before the test has tested anything. Moved to container port **19080**. This is the
+  third instance of one mistake — a test port chosen without asking whether a real service
+  uses it — which is why the rule is now written down in `tests/rules-lib.bash` and why X5
+  exists for the three that remain.
 
 ## Fixed while compiling this list
 

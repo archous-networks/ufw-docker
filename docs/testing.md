@@ -90,9 +90,9 @@ measuring a failure is a trap.
 
 - An apostrophe inside `${VAR:?...}` breaks bats' preprocessing with
   `unexpected EOF while looking for matching '`.
-- CI must publish test ports **1:1**. A remapped `-p 8089:80` makes the "allow opens it"
-  tests fail *and* the "blocked" tests pass vacuously — they would stay green even if the
-  tool did nothing.
+- The suite must publish its test port **1:1**. A remapped `-p 19089:80` makes the "allow
+  opens it" tests fail *and* the "blocked" tests pass vacuously — they would stay green
+  even if the tool did nothing. This is why `start_testsvc()` publishes `19089:19089`.
 
 ## The IPv6 matrix
 
@@ -155,6 +155,66 @@ It is also **not** a heuristic like "does this look like production". The develo
 host is a full UISP stack on purpose — that is why the container-recreate test runs there
 and skips in CI. Any heuristic smart enough to refuse a customer's box would refuse the
 most valuable test environment available.
+
+## The host is returned to the state it was in
+
+`rescue` guarantees a **working** firewall. It does not guarantee **this host's** firewall.
+Those are different promises, and for a long time only the first was kept.
+
+What the suite legitimately changed and never put back:
+
+- **ufw-docker's install state.** `teardown_file` ends in `remove --force`, so a host that
+  *had* the stanza installed was handed back without it. That is how the development host
+  was found unwired.
+- **Rules on ports the suite drives.** On a UISP box those are not spare ports. The
+  remapped-port test used container port 443 and deleted `allow 443/tcp` on the way out —
+  which is exactly how this host's UISP web UI went dark. That test now uses 19443.
+- **ufw's enabled/disabled state**, and any files left behind in `/etc/ufw`.
+
+The bats-level invariant (`rules-before` / `teardown_file`) only ever *reported* this
+drift, and only for user rules. **Reporting is not restoring.** `tests/run.sh` now
+snapshots the whole of `/etc/ufw` plus the enabled flag before the run, puts it all back
+after, and then proves it by diffing a fingerprint taken before and after:
+
+```
+    [21:44:02] rescue finished
+    [21:44:02] restoring this host's pre-suite state
+    host state matches the pre-suite snapshot
+    [21:44:09] restore finished
+```
+
+If the fingerprint does not match, the diff is printed, **the run exits non-zero**, and the
+snapshot is kept with the two commands needed to put it back by hand.
+
+The fingerprint covers declared *and* live state — `ufw status verbose`, both `DOCKER-USER`
+chains, and checksums of every file in `/etc/ufw`. Neither half alone is enough: `user.rules`
+can be correct while the chains are not, which is the whole failure mode `rescue` exists for.
+
+**This runs in CI too, deliberately.** Making it local-only would leave the restore path
+untested by the one thing that runs on every push, and a behaviour that differs between CI
+and the development host is precisely the shape of bug that cost this project two cancelled
+runs. `UFW_DOCKER_NO_RESTORE=1` skips it.
+
+### The suite owns its service container, and its port
+
+`ensure_service` only ever curls `127.0.0.1:<port>`, so whatever answers is what gets
+tested. That port used to be **8089**, and the container was created by the **CI workflow**
+rather than by the suite. Each half was a bug; together they were worse:
+
+- On a UISP host `unms-nginx` publishes 8089, so a local run found the **operator's own
+  service**, probed that instead of a container the suite controls, and then deleted their
+  `ufw` rule for it. That is not a hypothetical — it took this host's UISP device endpoint
+  down mid-run, and the invariant reported it 34 times in one run.
+- Because only CI created the container, a local run had nothing of its own to fall back
+  to. The divergence is what let the first problem hide.
+
+Both are fixed by the same change: `setup_file` creates the container itself, on **19089**,
+and the CI step is gone. CI and local now exercise the identical path, and the container is
+removed afterwards only if the suite created it.
+
+**Choosing a replacement port is a judgement, not a lookup**: it must be high, and not
+something a real service plausibly listens on. Every port in `TEST_PORTS` is a port the
+suite will *delete a rule for*, which is the whole reason this matters.
 
 ## The operator's rules are an enforced invariant
 

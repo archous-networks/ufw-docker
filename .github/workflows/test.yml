@@ -127,27 +127,13 @@ jobs:
         # it, including when a test fails early.
         run: sudo install -m 0755 ufw-docker /usr/local/sbin/ufw-docker
 
-      - name: Bring up a published container to filter
-        # The suite needs something listening behind a Docker-published port. Port
-        # 8089 matches the port the tests probe.
-        run: |
-          # 1:1 ON PURPOSE. Published 8089:80 would be REMAPPED, and after DNAT
-          # the rule must name the CONTAINER port -- so `ufw allow 8089` could
-          # never match and the "allow opens it" tests would fail while the
-          # "blocked" tests passed vacuously. That is a real property of this
-          # design, covered by its own test below rather than tripped over here.
-          # --restart always is REQUIRED, not tidiness: one test restarts the
-          # Docker daemon, which stops a no-policy container and removes its
-          # DNAT rule. Later tests then probe a port with nothing behind it and
-          # fail for a reason that has nothing to do with the firewall. Invisible
-          # locally, where UISP's containers are already `restart: always`.
-          # --bind :: makes it dual-stack. `python -m http.server` binds
-          # 0.0.0.0 by default, and a v6 probe of a v4-only listener gets a TCP
-          # RST -> 000, which is indistinguishable from "correctly blocked".
-          docker run -d --name testsvc --restart always -p 8089:8089 python:3-alpine \
-            python -m http.server 8089 --bind ::
-          sleep 5
-          curl -sS -o /dev/null -w 'local probe: %{http_code}\n' http://127.0.0.1:8089/
+      # NOTE: there is deliberately no step here bringing up the container the
+      # tests probe. There used to be, publishing 8089:8089, and the suite
+      # relied on it -- which meant a LOCAL run had no such container and fell
+      # through to whatever happened to answer on 8089. On a UISP host that is
+      # unms-nginx, so the suite probed the operator's own service and deleted
+      # their rule for it. setup_file now creates the container itself, on
+      # 19089, so CI and local exercise the identical path. See start_testsvc().
 
       - name: Allow SSH and enable ufw
         # The suite asserts on an SSH rule as the canary for a half-built firewall,

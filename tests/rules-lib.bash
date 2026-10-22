@@ -6,13 +6,29 @@
 # tests/invariant-selftest.sh exercises it against synthetic inputs on every CI
 # run. The bats suite supplies the real rule files; this decides the verdict.
 
-# Ports and addresses the suite owns. Port 443 is here because the remapped-port
-# test publishes 18443:443 and must write a rule for the CONTAINER port to prove
-# the warning can be silenced. Port 80 is deliberately absent: the
-# per-container tests use container port 80, but always with a 172.21.x
-# destination, so the address list covers them. A bare `ufw allow 80/tcp` is
-# therefore flagged, which is correct -- the suite never creates one.
-TEST_PORTS='443|8089|9100|9200|9300|18080|18090|18443|19100'
+# Ports and addresses the suite owns.
+#
+# EVERY PORT HERE IS A PORT THE SUITE WILL DELETE A RULE FOR. So a port only
+# belongs here if no real service plausibly listens on it. 443 used to be in
+# this list -- the remapped-port test published 18443:443 -- and on a UISP host
+# unms-nginx publishes 443, so the test deleted the operator's own web rule.
+# It now uses container port 19443 instead, which nothing serves.
+#
+# 8089 was the same bug and is also gone: UISP publishes it, so the suite was
+# probing unms-nginx and deleting the operator's rule for it. The suite now
+# creates its own container on 19089 instead -- see start_testsvc().
+#
+# Port 80 is absent and the per-container tests no longer use it either: with
+# `-p 18090:80` the post-DNAT dport is 80, so on any host serving a website
+# `ufw allow 80/tcp` matched and the "blocked with no rule" baseline could not
+# hold. They use container port 19080 now, covered by the 172.21.x address
+# rule rather than by port. A bare `ufw allow 80/tcp` is still flagged, which
+# is correct -- the suite never creates one.
+#
+# STILL IMPERFECT: 9100, 9200 and 9300 are node_exporter and Elasticsearch
+# ports. Nothing here runs them, but they fail the "nothing real listens on
+# it" test and should move. Tracked in TODO.md.
+TEST_PORTS='9100|9200|9300|18080|18090|18443|19089|19100|19443'
 TEST_ADDRS='-d (172\.21\.|172\.23\.|fd00:dead:beef:)|-s (10\.97\.|10\.98\.|fd00:97:|fd00:99:)'
 
 test_owned() {   # $1 = one rule line

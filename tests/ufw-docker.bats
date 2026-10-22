@@ -20,12 +20,51 @@ active()    { sudo ufw status 2>/dev/null | grep -c 'Status: active'; }
 # host, before asserting anything about the firewall. A probe of a port with no
 # listener returns 000 whatever the rules say -- which is indistinguishable from
 # "correctly blocked" and silently turns the allow-tests into passes-for-free.
+# The suite's own service, on a port NOTHING else serves.
+#
+# It used to be 19089, and it used to be created by the CI workflow rather than
+# here. Both were wrong, and together they were worse than either alone:
+#
+#   - 19089 is published by unms-nginx on a UISP host. `ensure_service` only
+#     curls 127.0.0.1, so it found the OPERATOR'S service, happily probed that
+#     instead of a container the suite controls, and then deleted their rule
+#     for it. On this development host that took UISP's device endpoint down
+#     mid-run and left it down.
+#   - creating it only in CI meant a local run silently fell through to
+#     whatever happened to answer on 19089 -- a CI/local divergence of exactly
+#     the kind that has already cost this project two cancelled runs.
+#
+# The suite now creates it, identically everywhere. Pick any replacement port
+# the same way: high, and not in any service list.
+TESTSVC_PORT=19089
+
+start_testsvc() {
+    # 1:1 ON PURPOSE. Published 19089:80 would be REMAPPED, and after DNAT the
+    # rule must name the CONTAINER port -- so `ufw allow 19089` could never
+    # match, and the "allow opens it" tests would fail while the "blocked"
+    # ones passed vacuously. That is a real property of this design, covered
+    # by its own test rather than tripped over here.
+    #
+    # --restart always is REQUIRED, not tidiness: one test restarts the Docker
+    # daemon, which stops a no-policy container and removes its DNAT rule.
+    # Later tests would then probe a port with nothing behind it and fail for
+    # a reason that has nothing to do with the firewall.
+    #
+    # --bind :: makes it dual-stack. `python -m http.server` binds 0.0.0.0 by
+    # default, and a v6 probe of a v4-only listener gets a TCP RST -> 000,
+    # which is indistinguishable from "correctly blocked".
+    docker run -d --name testsvc --restart always \
+        -p "${TESTSVC_PORT}:${TESTSVC_PORT}" python:3-alpine \
+        python -m http.server "$TESTSVC_PORT" --bind :: >/dev/null 2>&1
+}
+
 ensure_service() {
-    local port="${1:-8089}" i
+    local port="${1:-$TESTSVC_PORT}" i
     for i in $(seq 1 10); do
         curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null && return 0
-        # Bring back anything a daemon restart stopped.
-        docker start testsvc >/dev/null 2>&1 || true
+        # Bring back anything a daemon restart stopped -- or create it, if this
+        # is the first call of the run.
+        docker start testsvc >/dev/null 2>&1 || start_testsvc
         sleep 2
     done
     return 1
@@ -151,6 +190,15 @@ setup_file() {
         echo yes > "$BATS_FILE_TMPDIR/we-added-ssh"
         sudo ufw allow 22/tcp >/dev/null 2>&1
     fi
+    # Own the service container too, so a local run and a CI run exercise the
+    # same thing. Created BEFORE reinstall so its subnet is in the stanza.
+    if docker inspect testsvc >/dev/null 2>&1; then
+        echo no  > "$BATS_FILE_TMPDIR/we-made-testsvc"
+    else
+        echo yes > "$BATS_FILE_TMPDIR/we-made-testsvc"
+    fi
+    ensure_service >/dev/null 2>&1 || true
+
     reinstall
 
     # The baseline every test is measured against. Taken AFTER the SSH rule
@@ -203,6 +251,10 @@ teardown_file() {
     if [ "$(cat "$BATS_FILE_TMPDIR/we-added-ssh" 2>/dev/null)" = yes ]; then
         sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
     fi
+    # Same rule as the SSH rule: remove it only if we made it.
+    if [ "$(cat "$BATS_FILE_TMPDIR/we-made-testsvc" 2>/dev/null)" = yes ]; then
+        docker rm -f testsvc >/dev/null 2>&1 || true
+    fi
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" down || true
     # Non-negotiable: never leave a broken firewall behind.
     # BOUNDED, like the one in run.sh. This one was missed: a run that ended
@@ -231,32 +283,32 @@ teardown_file() {
 }
 
 @test "a Docker-published port with no ufw rule is BLOCKED" {
-    sudo ufw delete allow 8089/tcp >/dev/null 2>&1 || true
-    sudo ufw delete deny  8089/tcp >/dev/null 2>&1 || true
+    sudo ufw delete allow 19089/tcp >/dev/null 2>&1 || true
+    sudo ufw delete deny  19089/tcp >/dev/null 2>&1 || true
     sudo ufw reload >/dev/null 2>&1
-    [ "$(probe 8089)" = "000" ]
+    [ "$(probe 19089)" = "000" ]
 }
 
 @test "ufw allow opens a Docker-published port" {
-    ensure_service 8089 || skip "nothing listening on 8089"
-    sudo ufw allow 8089/tcp >/dev/null 2>&1
-    [ "$(probe 8089)" != "000" ]
+    ensure_service 19089 || skip "nothing listening on 19089"
+    sudo ufw allow 19089/tcp >/dev/null 2>&1
+    [ "$(probe 19089)" != "000" ]
 }
 
 @test "ufw deny closes a Docker-published port" {
-    sudo ufw delete allow 8089/tcp >/dev/null 2>&1
-    sudo ufw deny 8089/tcp >/dev/null 2>&1
-    [ "$(probe 8089)" = "000" ]
-    sudo ufw delete deny 8089/tcp >/dev/null 2>&1
+    sudo ufw delete allow 19089/tcp >/dev/null 2>&1
+    sudo ufw deny 19089/tcp >/dev/null 2>&1
+    [ "$(probe 19089)" = "000" ]
+    sudo ufw delete deny 19089/tcp >/dev/null 2>&1
 }
 
 @test "source-restricted allow is honoured" {
-    ensure_service 8089 || skip "nothing listening on 8089"
-    sudo ufw allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
-    [ "$(probe 8089)" != "000" ]
-    sudo ufw delete allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
+    ensure_service 19089 || skip "nothing listening on 19089"
+    sudo ufw allow from 10.97.0.0/24 to any port 19089 proto tcp >/dev/null 2>&1
+    [ "$(probe 19089)" != "000" ]
+    sudo ufw delete allow from 10.97.0.0/24 to any port 19089 proto tcp >/dev/null 2>&1
     sudo ufw reload >/dev/null 2>&1
-    [ "$(probe 8089)" = "000" ]
+    [ "$(probe 19089)" = "000" ]
 }
 
 @test "a REMAPPED published port is matched by its CONTAINER port, not the published one" {
@@ -367,28 +419,28 @@ teardown_file() {
 }
 
 @test "ufw route rules are honoured" {
-    ensure_service 8089 || skip "nothing listening on 8089"
+    ensure_service 19089 || skip "nothing listening on 19089"
     # Before this was wired, `ufw route allow` -- the verb ufw intends for
     # forwarded traffic -- was ignored entirely, with no warning.
-    sudo ufw route allow to any port 8089 proto tcp >/dev/null 2>&1
-    [ "$(probe 8089)" != "000" ]
-    sudo ufw route delete allow to any port 8089 proto tcp >/dev/null 2>&1
+    sudo ufw route allow to any port 19089 proto tcp >/dev/null 2>&1
+    [ "$(probe 19089)" != "000" ]
+    sudo ufw route delete allow to any port 19089 proto tcp >/dev/null 2>&1
     sudo ufw reload >/dev/null 2>&1
-    [ "$(probe 8089)" = "000" ]
+    [ "$(probe 19089)" = "000" ]
 }
 
 @test "blocked container traffic is logged" {
-    ensure_service 8089 || skip "nothing listening on 8089"
+    ensure_service 19089 || skip "nothing listening on 19089"
     # The LOG rule is rate-limited to 3/min with a burst of 10 -- the same limit
     # ufw uses. Earlier tests in this file generate blocks and drain that burst,
     # so a single probe can legitimately produce no line. Poll instead: at
     # 3/min a token frees up every 20s, so a minute is ample.
-    sudo ufw delete allow 8089/tcp >/dev/null 2>&1 || true
+    sudo ufw delete allow 19089/tcp >/dev/null 2>&1 || true
     sudo ufw reload >/dev/null 2>&1
     local mark; mark=$(date +%s)
     local i
     for i in $(seq 1 12); do
-        probe 8089 >/dev/null
+        probe 19089 >/dev/null
         sleep 5
         if sudo journalctl -k --since "@$mark" --no-pager 2>/dev/null | grep -q 'UFW DOCKER BLOCK'; then
             return 0
@@ -539,10 +591,16 @@ teardown_file() {
         done | grep '172.21' >&2
         return 1
     fi
-    docker run -d --name ctgt1 --network ctgtnet --ip 172.21.0.10 -p 18090:80 \
-        python:3-alpine python -m http.server 80 >/dev/null 2>&1
-    docker run -d --name ctgt2 --network ctgtnet --ip 172.21.0.11 -p 18091:80 \
-        python:3-alpine python -m http.server 80 >/dev/null 2>&1
+    # CONTAINER PORT 19080, NOT 80. After DNAT the dport is the CONTAINER port,
+    # so with `-p 18090:80` these probes are judged as port 80 -- and any host
+    # that serves a website has `ufw allow 80/tcp`, which matches, so the
+    # "with no rule it is BLOCKED" baseline fails before the test has tested
+    # anything. Found exactly that way on this host, the hour after a 80/tcp
+    # rule was legitimately added for UISP.
+    docker run -d --name ctgt1 --network ctgtnet --ip 172.21.0.10 -p 18090:19080 \
+        python:3-alpine python -m http.server 19080 >/dev/null 2>&1
+    docker run -d --name ctgt2 --network ctgtnet --ip 172.21.0.11 -p 18091:19080 \
+        python:3-alpine python -m http.server 19080 >/dev/null 2>&1
     sleep 6
     reinstall    # pick up the new subnet
 
@@ -550,20 +608,20 @@ teardown_file() {
     [ "$(probe 18091)" = "000" ]
 
     # A. destination only
-    sudo ufw allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw allow to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
     [ "$(probe 18090)" != "000" ]      # the targeted container opens
     [ "$(probe 18091)" = "000" ]       # its neighbour on the same port does not
-    sudo ufw --force delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
 
     # B. source AND destination compose
-    sudo ufw allow from 10.97.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw allow from 10.97.0.0/24 to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
     [ "$(probe 18090)" != "000" ]
-    sudo ufw --force delete allow from 10.97.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow from 10.97.0.0/24 to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
 
     # B2. a source that does NOT match must stay closed
-    sudo ufw allow from 10.98.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw allow from 10.98.0.0/24 to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
     [ "$(probe 18090)" = "000" ]
-    sudo ufw --force delete allow from 10.98.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow from 10.98.0.0/24 to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
 
     # C. THE TRAP: naming the PUBLISHED port is accepted, listed, and matches
     #    nothing -- the dport is rewritten to the container port before we see
@@ -575,19 +633,19 @@ teardown_file() {
     sudo ufw --force delete allow to 172.21.0.10 port 18090 proto tcp >/dev/null 2>&1
 
     # D. ufw route targeting a container
-    sudo ufw route allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw route allow to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
     [ "$(probe 18090)" != "000" ]
-    sudo ufw route delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw route delete allow to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
 
     # E. deny one container, leave its neighbour alone
-    sudo ufw allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
-    sudo ufw allow to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
-    sudo ufw --force delete allow to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
-    sudo ufw deny to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw allow to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
+    sudo ufw allow to 172.21.0.11 port 19080 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow to 172.21.0.11 port 19080 proto tcp >/dev/null 2>&1
+    sudo ufw deny to 172.21.0.11 port 19080 proto tcp >/dev/null 2>&1
     [ "$(probe 18090)" != "000" ]
     [ "$(probe 18091)" = "000" ]
-    sudo ufw --force delete deny to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
-    sudo ufw --force delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete deny to 172.21.0.11 port 19080 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow to 172.21.0.10 port 19080 proto tcp >/dev/null 2>&1
     docker rm -f ctgt1 ctgt2 >/dev/null 2>&1 || true
     docker network rm ctgtnet >/dev/null 2>&1 || true
     reinstall
@@ -640,8 +698,13 @@ teardown_file() {
     # because DNAT rewrote the port before DOCKER-USER ever saw the packet.
     # That is this project's own failure mode reappearing one layer up.
     docker rm -f remaptest >/dev/null 2>&1 || true
-    docker run -d --name remaptest --restart always -p 18443:443 python:3-alpine \
-        python -m http.server 443 >/dev/null 2>&1
+    # 19443, NOT 443. A UISP host publishes 443 from unms-nginx, so a test
+    # that writes and then deletes `ufw allow 443/tcp` deletes the rule the
+    # operator's web UI depends on. That is not hypothetical: it is how this
+    # host's UISP went dark. The container port only has to be a port that is
+    # NOT the published one; it has no reason to be a real service's port.
+    docker run -d --name remaptest --restart always -p 18443:19443 python:3-alpine \
+        python -m http.server 19443 >/dev/null 2>&1
     sleep 5
     reinstall
 
@@ -649,18 +712,18 @@ teardown_file() {
     sudo ufw allow 18443/tcp >/dev/null 2>&1
     run sudo "$REPO/ufw-docker" status
     echo "$output" | grep -q 'CANNOT match a container'
-    echo "$output" | grep -q 'remaptest publishes 18443 -> 443/tcp'
-    echo "$output" | grep -q 'ufw allow 443/tcp'
+    echo "$output" | grep -q 'remaptest publishes 18443 -> 19443/tcp'
+    echo "$output" | grep -q 'ufw allow 19443/tcp'
 
     # With the correct rule ALSO present it must go quiet -- a warning that
     # cannot be silenced by doing the right thing is noise, and noise gets
     # ignored along with everything else.
-    sudo ufw allow 443/tcp >/dev/null 2>&1
+    sudo ufw allow 19443/tcp >/dev/null 2>&1
     run sudo "$REPO/ufw-docker" status
     ! echo "$output" | grep -q 'CANNOT match a container'
 
     sudo ufw --force delete allow 18443/tcp >/dev/null 2>&1 || true
-    sudo ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+    sudo ufw --force delete allow 19443/tcp >/dev/null 2>&1 || true
     docker rm -f remaptest >/dev/null 2>&1 || true
     reinstall
 }
