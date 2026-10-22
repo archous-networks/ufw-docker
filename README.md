@@ -68,6 +68,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [Logging](docs/logging.md) | `[UFW DOCKER BLOCK]`, the audit trail, and what is recorded where |
 | [Rule scoping](docs/scoping.md) | which rules reach the host, which reach containers |
 | [Per-container rules](docs/per-container.md) | targeting one container rather than a port |
+| [Where a WAF fits](docs/waf.md) | why an edge WAF is not a substitute, and why this tool is what makes one worth having |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
 | [Testing](docs/testing.md) | the suite, the IPv6 matrix, and two ways to break your own host |

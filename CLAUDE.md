@@ -21,6 +21,7 @@ rule chains into Docker's `DOCKER-USER` hook.
 | host vs container rule scope | [docs/scoping.md](docs/scoping.md) |
 | targeting a single container | [docs/per-container.md](docs/per-container.md) |
 | "why doesn't rule X work" | [docs/caveats.md](docs/caveats.md) |
+| WAF / Cloudflare / reverse-proxy questions | [docs/waf.md](docs/waf.md) |
 | running or writing tests | [docs/testing.md](docs/testing.md) ← **read before running the suite** |
 | what is still missing | [TODO.md](TODO.md) |
 

@@ -93,6 +93,7 @@ be present in `nft` *and* unreadable by `iptables`.
 | A8 | **Swarm / overlay networks untested.** `docker_gwbridge` and ingress have their own paths; no idea whether subnet derivation covers them. | [suspected] | S2 |
 | A9 | **Rootless Docker almost certainly unsupported** — it uses slirp4netns, not these chains. Untested, undocumented. | [suspected] | S2 |
 | A10 | **Custom bridge names** (`com.docker.network.bridge.name`) should be fine since we match subnets, not interfaces — but untested. | [suspected] | S3 |
+| A12 | **Origin lockdown to a WAF's egress ranges is untested end to end.** `docs/waf.md` recommends restricting the origin to the WAF's ranges, and the mechanism it rests on (source-restricted allow on a container port) is covered by a test — but the full arrangement has never been stood up against a live Cloudflare or AWS WAF. The ranges are also published lists that rotate, which nothing here tracks. | [unknown] | S2 |
 | A11 | **Only tested against iptables-nft.** A host with legacy iptables, or a pure-nftables ufw, is unknown territory. | [verified] | S2 |
 
 ## B. Safety and failure modes
