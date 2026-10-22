@@ -431,6 +431,77 @@ teardown_file() {
     reinstall
 }
 
+@test "the self-heal UNIT repairs a broken firewall, not just the function" {
+    # Tests 18 and 19 call `ufw-docker selfheal` directly, which proves the
+    # repair LOGIC and nothing about the thing that actually runs unattended at
+    # boot. This drives the real systemd unit instead: its ExecStart path, its
+    # ordering, Type=oneshot, and the repair happening in systemd's environment
+    # rather than a bats shell.
+    systemctl list-unit-files ufw-docker-selfheal.service >/dev/null 2>&1 \
+        || skip "no systemd unit here"
+    command -v journalctl >/dev/null || skip "no journalctl on this host"
+
+    # The unit calls /usr/local/sbin/ufw-docker, NOT $REPO/ufw-docker. Without
+    # this the test would happily pass against whatever stale binary happens to
+    # be installed there -- which is not the thing under test.
+    sudo install -m 0755 "$REPO/ufw-docker" /usr/local/sbin/ufw-docker
+
+    # Enabled and correctly ordered, or the repair logic will never get the
+    # chance to run no matter how good it is. Checked declaratively because a
+    # reboot cannot be part of a test suite.
+    sudo systemctl is-enabled ufw-docker-selfheal.service
+    local after; after=$(systemctl show -p After --value ufw-docker-selfheal.service)
+    echo "$after" | grep -q 'ufw.service'
+    echo "$after" | grep -q 'docker.service'
+    systemctl show -p WantedBy --value ufw-docker-selfheal.service | grep -q 'multi-user.target'
+
+    # Break it the way a bad boot does: ufw up, chains present, no user rules.
+    sudo iptables -F ufw-user-input
+    [ "$(ssh_rule)" -eq 0 ]
+
+    local mark; mark=$(date +%s)
+    # restart, not start: RemainAfterExit=yes means a `start` on an already
+    # active oneshot does nothing at all, which would pass vacuously.
+    # Blocks for the unit's real 20s delay -- deliberately not short-circuited,
+    # since the delay is part of what is being tested.
+    sudo systemctl restart ufw-docker-selfheal.service
+
+    [ "$(ssh_rule)" -gt 0 ]                                       # SSH is back
+    [ "$(sudo iptables -S INPUT | grep -c 'dport 22')" -eq 0 ]    # restricted, not blanket
+
+    # And it must have said what it did. A silent repair is its own problem:
+    # nobody would ever know the host had come up broken.
+    local jl; jl=$(sudo journalctl -t ufw-docker-selfheal --since "@$mark" --no-pager 2>/dev/null)
+    echo "$jl" | grep -q 'running rescue'
+    # rescue strips the stanza by design, so the host is reachable but UNWIRED.
+    # That warning is the difference between a safe host and one that looks
+    # fine and filters nothing.
+    echo "$jl" | grep -q 'RECOVERED but UNWIRED'
+
+    reinstall
+}
+
+@test "the self-heal unit leaves a HEALTHY firewall alone" {
+    # The other half, and the more dangerous one: a repair path that fires when
+    # it should not would rebuild the firewall on every boot of every host.
+    systemctl list-unit-files ufw-docker-selfheal.service >/dev/null 2>&1 \
+        || skip "no systemd unit here"
+    command -v journalctl >/dev/null || skip "no journalctl on this host"
+    sudo install -m 0755 "$REPO/ufw-docker" /usr/local/sbin/ufw-docker
+
+    local before_rules before_jumps mark
+    before_rules=$(sudo iptables -S ufw-user-input)
+    before_jumps=$(jumps)
+    mark=$(date +%s)
+
+    sudo systemctl restart ufw-docker-selfheal.service
+
+    [ "$(sudo iptables -S ufw-user-input)" = "$before_rules" ]
+    [ "$(jumps)" -eq "$before_jumps" ]
+    sudo journalctl -t ufw-docker-selfheal --since "@$mark" --no-pager 2>/dev/null \
+        | grep -q 'ufw healthy at boot'
+}
+
 @test "install refuses to overwrite a customised before.init" {
     local saved; saved=$(mktemp)
     sudo cp -a /etc/ufw/before.init "$saved"

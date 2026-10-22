@@ -55,7 +55,15 @@ out, **S2** produces wrong or confusing behaviour, **S3** is ergonomics or polis
   allow / deny / source-restricted / per-container-destination all behave exactly as on
   v4. The netns probe gained a v6 side, and **CI now runs the whole suite twice** —
   `ip6tables` off and on — because both are real deployments exercising different code.
-- **Tests** 15 → 35, covering every item above.
+- **E1 closed.** CI is green on all three jobs — `shellcheck` (including the invariant
+  self-test), `bats (docker ipv6=false)` and `bats (docker ipv6=true)` — in under five
+  minutes. Note `gh run list` reports a run-level conclusion *before* its jobs finish;
+  query `/jobs` if you ever gate on this.
+- **E2 closed.** Two tests now drive the real systemd unit rather than the function:
+  one against a broken firewall (repairs, restricted not blanket, logs what it did), one
+  against a healthy firewall (changes nothing — the more dangerous direction, and the one
+  that was never covered at all).
+- **Tests** 15 → 37, covering every item above.
 
 ## Fixed while compiling this list
 
@@ -100,7 +108,7 @@ be present in `nft` *and* unreadable by `iptables`.
 
 | # | Gap | | |
 |---|---|---|---|
-| B1 | **Self-heal has never repaired anything at boot.** Its detection ran and said `ufw healthy at boot`; `rescue` is well exercised by hand; the two have never been joined up in anger because no boot has gone wrong. The one path whose entire purpose is an unattended lockout is the one never exercised. | [verified] | S1 |
+| B1 | **The self-heal unit has never repaired anything at an actual cold boot.** Much reduced: the real systemd unit is now driven against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log `running rescue` and `RECOVERED but UNWIRED`, and leave a healthy firewall untouched — plus its enablement and `After=ufw.service docker.service` ordering are asserted declaratively. What remains is only the cold-boot path itself: everything above is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Closing it needs one deliberate reboot into breakage. | [verified] | S2 |
 | B5 | **`remove` does not uninstall the binary.** It undoes all configuration but leaves `/usr/local/sbin/ufw-docker` behind. Arguably right, but undocumented and surprising. | [verified] | S3 |
 | B6 | **`rescue`'s blanket fallback is unbounded in time.** When `user.rules` has no SSH rule, it leaves a blanket ACCEPT in place indefinitely — loudly, but forever. No expiry, no follow-up check. | [verified] | S2 |
 | B7 | **SSH port detection could miss.** `sshd -T` is authoritative, but if it fails and the `ss` parse misfires, the fallback is a bare `22` — which on a host using a different port protects nothing. | [suspected] | S2 |
@@ -123,8 +131,6 @@ be present in `nft` *and* unreadable by `iptables`.
 
 | # | Gap | | |
 |---|---|---|---|
-| E1 | **CI has never been confirmed green.** The workflow now calls `tests/run.sh --tap`, which has never run on a GitHub runner. The lock and trap behaviour there is unverified. | [verified] | S1 |
-| E2 | **No test for the self-heal repair path** (B1) — would need to break ufw, reboot, and assert recovery. |  | S1 |
 | E8 | **One test needs a UISP-shaped host** and skips elsewhere, so container-recreate coverage is thinner in CI than locally. |  | S3 |
 | E10 | **Single platform.** Debian 12, one host, one Docker version. | | S2 |
 
