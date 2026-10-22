@@ -49,7 +49,13 @@ out, **S2** produces wrong or confusing behaviour, **S3** is ergonomics or polis
 - **E6** `--include-backups` and the `remove` dry-run default are both tested.
 - **E9** shellcheck is now gating, not advisory — the file is clean at `-S warning`.
 - **Docs** restructured into `docs/`, with the README as a table of contents.
-- **Tests** 15 → 33, covering every item above.
+- **A6 / E3 closed.** The daemon was given `"ipv6": true, "ip6tables": true` with a ULA
+  `fixed-cidr-v6`, and the v6 path is now verified end to end: Docker's `raw`/PREROUTING
+  DROP **disappears** (it existed only because the daemon lacked `ip6tables`), and
+  allow / deny / source-restricted / per-container-destination all behave exactly as on
+  v4. The netns probe gained a v6 side, and **CI now runs the whole suite twice** —
+  `ip6tables` off and on — because both are real deployments exercising different code.
+- **Tests** 15 → 35, covering every item above.
 
 ## Fixed while compiling this list
 
@@ -83,7 +89,6 @@ be present in `nft` *and* unreadable by `iptables`.
 |---|---|---|---|
 | A2 | **Remapped ports need the container port.** Published `8443:443` means `ufw allow 443`, not `8443`, because DNAT runs before FORWARD. Pinned by a test, but still a footgun. Fixing it properly means translating ufw's rules into `DOCKER-USER` with `--ctorigdstport` — a resident translator, not a static stanza. | [verified] | S2 |
 | A3 | **No way to target a container by name.** Rules can target a container's *address* (verified — see `docs/per-container.md`), but iptables matches addresses, not names. Static IPAM addresses make that usable today; tracking a **dynamic** address needs `ipset` plus a `docker events` watcher, i.e. a resident daemon. Not built. | [verified] | S2 |
-| A6 | **IPv6 filtering is unreachable unless the Docker daemon has `ip6tables` enabled** — now understood rather than merely untested. With a v6-enabled *network* but a daemon lacking v6 support, Docker installs its own `raw`/PREROUTING `DROP` for inbound traffic to container v6 addresses, ahead of FORWARD: `DROP !br-xxxx -> fd00:dead:beef::2`. Our stanza is correct and applied but never consulted. Verifying the stanza for real needs `"ipv6": true, "ip6tables": true` in `daemon.json` and a daemon restart — a change to the host's Docker config, not made here. | [verified] | S1 |
 | A7 | **`--network host` containers are unaffected** — they use INPUT, not FORWARD. Correct behaviour, nowhere documented, and a reasonable person would expect otherwise. | [verified] | S3 |
 | A8 | **Swarm / overlay networks untested.** `docker_gwbridge` and ingress have their own paths; no idea whether subnet derivation covers them. | [suspected] | S2 |
 | A9 | **Rootless Docker almost certainly unsupported** — it uses slirp4netns, not these chains. Untested, undocumented. | [suspected] | S2 |
@@ -119,7 +124,6 @@ be present in `nft` *and* unreadable by `iptables`.
 |---|---|---|---|
 | E1 | **CI has never been confirmed green.** The workflow now calls `tests/run.sh --tap`, which has never run on a GitHub runner. The lock and trap behaviour there is unverified. | [verified] | S1 |
 | E2 | **No test for the self-heal repair path** (B1) — would need to break ufw, reboot, and assert recovery. |  | S1 |
-| E3 | **No functional IPv6 test** (A6) — needs a v6-capable host. |  | S1 |
 | E8 | **One test needs a UISP-shaped host** and skips elsewhere, so container-recreate coverage is thinner in CI than locally. |  | S3 |
 | E10 | **Single platform.** Debian 12, one host, one Docker version. | | S2 |
 

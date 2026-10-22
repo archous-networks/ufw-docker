@@ -8,6 +8,12 @@
 # internet client's does -- PREROUTING/DNAT, then FORWARD, then DOCKER-USER.
 set -uo pipefail
 NS=ufwprobe; HOST_IP="${HOST_IP:?set HOST_IP}"
+# The v6 side of the probe is ULA-only and self-contained: the probe reaches the
+# container through the HOST END of the veth, which is a destination Docker has
+# DNAT'd, so no global IPv6 on the host is needed. That is what makes a v6 test
+# possible on a box with no IPv6 service at all.
+V6_HOST=fd00:97::1
+V6_PEER=fd00:97::2
 case "${1:-}" in
   up)
     ip netns add $NS 2>/dev/null || true
@@ -19,6 +25,11 @@ case "${1:-}" in
     ip netns exec $NS ip link set vprobe-n up
     ip netns exec $NS ip link set lo up
     ip netns exec $NS ip route add default via 10.97.0.1 2>/dev/null || true
+    # nodad: without it the address sits "tentative" for a second or two and
+    # binding to it fails, which looks exactly like a firewall block.
+    ip addr add "$V6_HOST/64" dev vprobe-h nodad 2>/dev/null || true
+    ip netns exec $NS ip addr add "$V6_PEER/64" dev vprobe-n nodad 2>/dev/null || true
+    ip netns exec $NS ip -6 route add default via "$V6_HOST" 2>/dev/null || true
     ;;
   down)
     ip netns del $NS 2>/dev/null || true
@@ -34,4 +45,14 @@ case "${1:-}" in
     printf '%s' "${code:-000}"
     exit 0
     ;;
+  get6)  # $2 = port, $3 = scheme -- the IPv6 twin of `get`
+    # Targets the HOST END of the veth, not a global address: Docker's v6 DNAT
+    # rule is `! -i docker0 --dport N -j DNAT`, which does not care which of the
+    # host's addresses was aimed at. Same always-exits-0 contract as `get`.
+    code=$(ip netns exec $NS curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+        "${3:-http}://[${V6_HOST}]:${2}/" 2>/dev/null)
+    printf '%s' "${code:-000}"
+    exit 0
+    ;;
+  peer6) printf '%s' "$V6_PEER" ;;
 esac

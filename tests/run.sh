@@ -39,7 +39,15 @@ cleanup() {
     local rc=$?
     echo
     echo "--- restoring the firewall (runs on any exit, including Ctrl-C) ---"
-    "$REPO/ufw-docker" rescue 2>&1 | sed 's/^/    /'
+    # BOUNDED. A CI run once failed late and then sat in this teardown for 13
+    # minutes until the job timeout cancelled it -- which threw away the
+    # post-failure diagnostics that would have explained the failure. A rescue
+    # that cannot finish in 3 minutes is itself the thing to report.
+    if ! timeout 180 "$REPO/ufw-docker" rescue 2>&1 | sed 's/^/    /'; then
+        echo "    !!! rescue did not finish in 180s -- firewall state below" >&2
+        timeout 20 ufw status verbose 2>&1 | sed 's/^/    /' >&2 || true
+        timeout 20 iptables -S ufw-user-input 2>&1 | sed 's/^/    /' >&2 || true
+    fi
     rmdir "$LOCK" 2>/dev/null
     exit $rc
 }

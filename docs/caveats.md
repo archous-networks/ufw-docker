@@ -67,8 +67,29 @@ DROP  !br-xxxx  ->  fd00:dead:beef::2
 Our v6 stanza is written and applied correctly but never consulted. It becomes live only
 with `"ipv6": true, "ip6tables": true` in `daemon.json`.
 
+**Both halves of that are now measured.** Enabling the daemon flags makes Docker's
+`raw`/PREROUTING DROP disappear — it existed *only* because the daemon lacked
+`ip6tables` — and the v6 stanza takes over. With it on, IPv6 behaves exactly like IPv4:
+
+| rule | v6 probe |
+|---|---|
+| none | `000` blocked |
+| `ufw allow 9200/tcp` | `200` |
+| `ufw deny 9200/tcp` | `000` |
+| `ufw allow to <container v6> port 9200` | `200` |
+| `ufw allow from <client v6> to any port 9200` | `200` |
+| `ufw allow from <a different v6> …` | `000` |
+
+CI runs the whole suite **twice**, with daemon `ip6tables` off and on, because the two
+legs exercise different code and both are real deployments. See [testing.md](testing.md).
+
 `status` reports v6 as not wired when Docker has no v6 networks, and **fails** if Docker
 has them and we are not wired — a v4-only setup that looks complete is worse than none.
+
+> ⚠️ **Testing v6 by hand: bind the listener to `::`.** `python -m http.server` binds
+> `0.0.0.0` only, so a v6 probe of it gets a TCP RST and returns `000` — identical to a
+> correctly blocked port. That cost a real debugging round here: the firewall was working
+> the entire time and the service was not listening.
 
 ## Subnets are frozen at install time
 

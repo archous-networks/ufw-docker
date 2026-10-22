@@ -70,7 +70,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [Per-container rules](docs/per-container.md) | targeting one container rather than a port |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
-| [Testing](docs/testing.md) | the suite, and two ways to break your own host |
+| [Testing](docs/testing.md) | the suite, the IPv6 matrix, and two ways to break your own host |
 | [Known gaps](TODO.md) | everything we know is missing, tagged and triaged |
 
 ---
@@ -135,8 +135,14 @@ port. → [rescue.md](docs/rescue.md)
 ## Requirements
 
 Debian/Ubuntu with `ufw`, Docker, `iptables`, and root. Tested on Debian 12 with
-ufw 0.36.2, Docker 28.x, nftables-backed iptables 1.8.9 — including across a real reboot,
-where ufw starts before Docker and the wiring survives intact.
+ufw 0.36.2, Docker 29.7.1, nftables-backed iptables 1.8.9 — including across a real
+reboot, where ufw starts before Docker and the wiring survives intact.
+
+**IPv4 and IPv6.** v6 filtering is real but needs the Docker daemon to be doing v6
+itself — `"ipv6": true, "ip6tables": true` in `daemon.json`. Without that, Docker drops
+inbound v6 to containers in its own `raw` chain, ahead of where we sit, so the v6 stanza
+is written and never consulted. CI runs the whole suite both ways.
+→ [caveats.md](docs/caveats.md), [testing.md](docs/testing.md)
 
 ## License
 

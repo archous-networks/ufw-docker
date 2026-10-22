@@ -93,3 +93,41 @@ measuring a failure is a trap.
 - CI must publish test ports **1:1**. A remapped `-p 8089:80` makes the "allow opens it"
   tests fail *and* the "blocked" tests pass vacuously — they would stay green even if the
   tool did nothing.
+
+## The IPv6 matrix
+
+CI runs the whole suite **twice**: once with Docker's daemon `ip6tables` off, once on.
+Both are real deployments and they exercise different code, so proving one proves half
+the tool.
+
+| leg | what it covers |
+|---|---|
+| `docker_ipv6: false` | the common production case. Docker installs its own `raw`/PREROUTING DROP ahead of FORWARD, so our v6 stanza is written but never consulted. `status` must report "no v6 networks; nothing to wire" and must **not** call that a fault |
+| `docker_ipv6: true` | the v6 stanza actually decides. allow / deny / source-restricted / per-container-destination, all probed over IPv6 |
+
+The two IPv6 tests each skip on the wrong leg, so the suite is honest about which one it
+is running rather than silently covering less than it appears to.
+
+To run the `true` leg locally:
+
+```bash
+sudo tee /etc/docker/daemon.json <<'JSON'
+{ "ipv6": true, "ip6tables": true, "fixed-cidr-v6": "fd00:dead:beef::/64" }
+JSON
+sudo systemctl restart docker
+sudo ufw-docker install        # pick up the new v6 subnet
+```
+
+**No global IPv6 on the host is required**, and this was set up on a host that has none.
+The probe reaches the container through the *host end of a veth* — a ULA address that
+Docker's DNAT rule (`! -i docker0 --dport N -j DNAT`) is happy to match, because it does
+not care which of the host's addresses the client aimed at.
+
+> ⚠️ **Bind the test listener to `::`.** `python -m http.server` binds `0.0.0.0` only. A
+> v6 probe of a v4-only listener gets a TCP RST and returns `000` — indistinguishable
+> from "correctly blocked", and it will look exactly like a firewall bug. It did.
+
+> ⚠️ **`fd00:d0ck:...` is not a valid ULA.** `k` is not a hex digit, and dockerd refuses
+> to start with an invalid `fixed-cidr-v6` — then systemd's restart limit keeps refusing
+> even after the config is fixed, which reads like a second, different failure. It is
+> not: `systemctl reset-failed docker.service` and start again.

@@ -242,7 +242,12 @@ validate_stanza() {   # $1 = 4|6 ; stanza text on stdin
     [ "$1" = "6" ] && cmd=ip6tables-restore
     # No validator is not a reason to block an install; it is a reason to say so.
     command -v "$cmd" >/dev/null 2>&1 || { cat >/dev/null; return 0; }
-    "$cmd" --test 2>&1
+    # -w: WAIT for the xtables lock rather than failing on it. Without it this
+    # check loses a race it has no business losing -- `docker network create`
+    # and `ufw reload` both take that lock, and a validation step that reports
+    # "the stanza does not parse" because something else was mid-write would
+    # refuse a perfectly good install. A transient must not look like a defect.
+    "$cmd" --test -w 10 2>&1
 }
 
 # Subnets the INSTALLED stanza covers, as opposed to the ones Docker has now.

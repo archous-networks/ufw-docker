@@ -31,6 +31,32 @@ ensure_service() {
     return 1
 }
 
+# Re-install, and SAY WHY if it fails.
+#
+# Every one of these was `reinstall` as a
+# bare statement: under bats' errexit a non-zero install fails the test with
+# nothing but the line number, and the output that would have explained it was
+# sent to /dev/null. A CI run failed that way at test 17 and cascaded through
+# fifteen more tests, and the log could not say why for any of them.
+#
+# install's exit code is cmd_status's, so a non-zero result means the firewall
+# is genuinely unhealthy -- exactly the thing worth printing.
+reinstall() {
+    local out rc
+    out=$(sudo "$REPO/ufw-docker" install 2>&1); rc=$?
+    if [ $rc -ne 0 ]; then
+        {
+            echo "--- install exited $rc ---"
+            echo "$out"
+            echo "--- ufw status ---";      sudo ufw status verbose 2>&1 || true
+            echo "--- DOCKER-USER ---";     sudo iptables -S DOCKER-USER 2>&1 || true
+            echo "--- ufw-user-input ---";  sudo iptables -S ufw-user-input 2>&1 || true
+        } >&2
+        return $rc
+    fi
+    return 0
+}
+
 setup_file() {
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" up
     # A rule we can prove host-level filtering with, independent of Docker.
@@ -44,7 +70,7 @@ setup_file() {
         echo yes > "$BATS_FILE_TMPDIR/we-added-ssh"
         sudo ufw allow 22/tcp >/dev/null 2>&1
     fi
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 
     # Snapshot the operator's rules. The teardown compares against this: a suite
     # that verifies a firewall tool must not leave the firewall different from
@@ -130,7 +156,7 @@ teardown_file() {
     docker run -d --name remapsvc -p 18443:18080 python:3-alpine \
         python -m http.server 18080 >/dev/null 2>&1
     sleep 5
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1   # pick up any new subnet
+    reinstall   # pick up any new subnet
 
     sudo ufw allow 18443/tcp >/dev/null 2>&1
     run probe 18443
@@ -248,11 +274,11 @@ teardown_file() {
     [ "$status" -ne 0 ]
     echo "$output" | grep -q 'SUBNET DRIFT'
     echo "$output" | grep -q '10.78.0.0/24'
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1   # re-install clears it
+    reinstall   # re-install clears it
     run sudo "$REPO/ufw-docker" status
     echo "$output" | grep -q 'all Docker IPv4 subnets are covered'
     docker network rm drifttest >/dev/null 2>&1
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 }
 
 @test "selfheal rewires DOCKER-USER if it is found empty" {
@@ -272,7 +298,7 @@ teardown_file() {
     [ "$(ssh_rule)" -gt 0 ]
     # It must NOT have left a blanket ACCEPT behind in INPUT.
     [ "$(sudo iptables -S INPUT | grep -c 'dport 22')" -eq 0 ]
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 }
 
 @test "install refuses to overwrite a customised before.init" {
@@ -285,7 +311,7 @@ teardown_file() {
     echo "$output" | grep -q 'customised'
     sudo grep -q 'operator hook' /etc/ufw/before.init     # untouched
     sudo cp -a "$saved" /etc/ufw/before.init; rm -f "$saved"
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 }
 
 @test "remove without --force changes nothing" {
@@ -317,7 +343,7 @@ teardown_file() {
     docker run -d --name ctgt2 --network ctgtnet --ip 172.21.0.11 -p 18091:80 \
         python:3-alpine python -m http.server 80 >/dev/null 2>&1
     sleep 6
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1    # pick up the new subnet
+    reinstall    # pick up the new subnet
 
     [ "$(probe 18090)" = "000" ]
     [ "$(probe 18091)" = "000" ]
@@ -363,7 +389,7 @@ teardown_file() {
     sudo ufw --force delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
     docker rm -f ctgt1 ctgt2 >/dev/null 2>&1 || true
     docker network rm ctgtnet >/dev/null 2>&1 || true
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 }
 
 @test "destination scopes a rule to the host or to a container, not both" {
@@ -378,7 +404,7 @@ teardown_file() {
     python3 -m http.server 9100 --bind 0.0.0.0 >/dev/null 2>&1 &
     local hostpid=$!
     sleep 5
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 
     clr() {
         sudo ufw --force delete allow 9100/tcp >/dev/null 2>&1
@@ -405,7 +431,7 @@ teardown_file() {
     kill "$hostpid" 2>/dev/null || true
     docker rm -f collc >/dev/null 2>&1 || true
     docker network rm collnet >/dev/null 2>&1 || true
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
 }
 
 @test "containers subcommand lists addresses and flags dynamic ones" {
@@ -488,7 +514,7 @@ teardown_file() {
     ! echo "$output" | grep -q 'UFW DOCKER BLOCK'
 
     sudo ufw logging on >/dev/null 2>&1
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
     run sudo "$REPO/ufw-docker" status
     echo "$output" | grep -q 'blocked container traffic is logged'
 }
@@ -497,7 +523,7 @@ bakcount() { sudo find /etc/ufw -maxdepth 1 -name 'after.rules.ufw-docker-bak-*'
 
 @test "remove keeps backups by default; --include-backups keeps only the fresh one" {
     # install writes a backup, so there is something to reason about.
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
     [ "$(bakcount)" -gt 0 ]
 
     # Default: every backup survives, plus the one this remove just took.
@@ -507,7 +533,7 @@ bakcount() { sudo find /etc/ufw -maxdepth 1 -name 'after.rules.ufw-docker-bak-*'
     # --include-backups deletes the rest but DELIBERATELY keeps the backup taken
     # by this run -- the moment you are undoing a firewall change is the worst
     # moment to also destroy the only copy of what it looked like.
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
     sudo "$REPO/ufw-docker" remove --force --include-backups >/dev/null 2>&1
     [ "$(bakcount)" -eq 1 ]
 
@@ -517,18 +543,85 @@ bakcount() { sudo find /etc/ufw -maxdepth 1 -name 'after.rules.ufw-docker-bak-*'
     echo "$output" | grep -q 'pass --force'
     [ "$(bakcount)" -eq 1 ]
 
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
     [ "$(jumps)" -gt 0 ]
 }
 
 @test "state changes leave an audit trail in syslog" {
     command -v journalctl >/dev/null || skip "no journalctl on this host"
     sudo journalctl -t ufw-docker --no-pager -n 1 >/dev/null 2>&1 || skip "journal not readable"
-    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    reinstall
     sleep 1
     run sudo journalctl -t ufw-docker --since "-2 min" --no-pager
     [ "$status" -eq 0 ]
     echo "$output" | grep -q 'install complete and verified'
+}
+
+probe6() { sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" get6 "$1" "${2:-http}"; }
+v6nets() {
+    docker network ls -q 2>/dev/null | while read -r i; do
+        docker network inspect "$i" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null
+    done | tr ' ' '\n' | grep -c ':' || true
+}
+
+@test "IPv6: with daemon ip6tables OFF, status says there is nothing to wire" {
+    [ "$(v6nets)" -eq 0 ] || skip "Docker has IPv6 networks — this is the ip6tables-ON leg"
+    run sudo "$REPO/ufw-docker" status
+    echo "$output" | grep -q 'IPv6: Docker has no v6 networks; nothing to wire'
+    # And it must NOT be reported as a fault: a v4-only Docker is a normal host.
+    ! echo "$output" | grep -q 'IPv6 is NOT wired'
+}
+
+@test "IPv6: ufw governs a v6-published container port exactly as it does v4" {
+    [ "$(v6nets)" -gt 0 ] || skip "Docker has no IPv6 networks — daemon ipv6/ip6tables is off"
+    reinstall
+
+    # --bind :: is NOT optional. `python -m http.server` binds 0.0.0.0 only, so
+    # a v6 probe of it gets a TCP RST -- which returns 000, exactly like a
+    # correctly blocked port. That cost a real debugging round: the firewall was
+    # working the whole time and the service was not listening.
+    docker rm -f v6svc >/dev/null 2>&1 || true
+    docker run -d --name v6svc --restart always -p 9200:9200 python:3-alpine \
+        python -m http.server 9200 --bind :: >/dev/null 2>&1
+    sleep 6
+    local cip
+    cip=$(docker inspect v6svc --format '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}')
+    [ -n "$cip" ]
+
+    # HOST_IP must be passed through: the probe script hard-requires it, and
+    # sudo does not forward the environment. Without it this returns empty and
+    # the `from <peer>` rules below are silently nonsense.
+    local peer; peer=$(sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" peer6)
+    [ -n "$peer" ]
+    clr6() {
+        sudo ufw --force delete allow 9200/tcp >/dev/null 2>&1
+        sudo ufw --force delete deny 9200/tcp >/dev/null 2>&1
+        sudo ufw --force delete allow to "$cip" port 9200 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow from "$peer" to any port 9200 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow from fd00:99::2 to any port 9200 proto tcp >/dev/null 2>&1
+        sudo ufw reload >/dev/null 2>&1
+    }
+
+    clr6;  [ "$(probe6 9200)" = "000" ]                       # default deny
+
+    clr6; sudo ufw allow 9200/tcp >/dev/null 2>&1
+    [ "$(probe6 9200)" != "000" ]                             # allow opens it
+
+    clr6; sudo ufw deny 9200/tcp >/dev/null 2>&1
+    [ "$(probe6 9200)" = "000" ]                              # deny closes it
+
+    clr6; sudo ufw allow to "$cip" port 9200 proto tcp >/dev/null 2>&1
+    [ "$(probe6 9200)" != "000" ]                             # per-container v6 dst
+
+    clr6; sudo ufw allow from "$peer" to any port 9200 proto tcp >/dev/null 2>&1
+    [ "$(probe6 9200)" != "000" ]                             # source-restricted
+
+    clr6; sudo ufw allow from fd00:99::2 to any port 9200 proto tcp >/dev/null 2>&1
+    [ "$(probe6 9200)" = "000" ]                              # ...and a WRONG source
+
+    clr6
+    docker rm -f v6svc >/dev/null 2>&1 || true
+    reinstall
 }
 
 @test "remove returns DOCKER-USER to stock" {

@@ -41,9 +41,35 @@ jobs:
 
   bats:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Was 15, and a run that failed late then spent 13 minutes in teardown got
+    # CANCELLED instead of reporting -- losing the diagnostics that would have
+    # explained the failure. The teardown is now bounded too (see run.sh).
+    timeout-minutes: 25
+    strategy:
+      # Both legs are real deployments, and they exercise DIFFERENT code.
+      # ip6tables OFF is the common production case: Docker installs its own
+      # raw/PREROUTING DROP ahead of FORWARD, so our v6 stanza is written but
+      # never consulted. ip6tables ON is the case where the v6 stanza actually
+      # decides. Testing only one of them would leave half the tool unproven.
+      fail-fast: false
+      matrix:
+        docker_ipv6: [false, true]
+    name: bats (docker ipv6=${{ matrix.docker_ipv6 }})
     steps:
       - uses: actions/checkout@v4
+
+      - name: Enable IPv6 in the Docker daemon
+        if: matrix.docker_ipv6
+        # ULA only -- the runner has no global IPv6 and does not need one. The
+        # probe reaches the container through the host end of a veth, which is
+        # a destination Docker has DNAT'd.
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"ipv6": true, "ip6tables": true, "fixed-cidr-v6": "fd00:dead:beef::/64"}' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 10
+          docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'
 
       - name: Install ufw and bats
         run: |
@@ -70,8 +96,11 @@ jobs:
           # DNAT rule. Later tests then probe a port with nothing behind it and
           # fail for a reason that has nothing to do with the firewall. Invisible
           # locally, where UISP's containers are already `restart: always`.
+          # --bind :: makes it dual-stack. `python -m http.server` binds
+          # 0.0.0.0 by default, and a v6 probe of a v4-only listener gets a TCP
+          # RST -> 000, which is indistinguishable from "correctly blocked".
           docker run -d --name testsvc --restart always -p 8089:8089 python:3-alpine \
-            python -m http.server 8089
+            python -m http.server 8089 --bind ::
           sleep 5
           curl -sS -o /dev/null -w 'local probe: %{http_code}\n' http://127.0.0.1:8089/
 
