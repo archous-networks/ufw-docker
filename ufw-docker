@@ -285,6 +285,72 @@ EOM
     say "getting a green CI leg for it — not by assuming a family resemblance."
 }
 
+# Rules in a ufw user.rules file that PERMIT a given port.
+#
+# Not just `--dport <port>`. That was the whole bug: `ufw allow in on wg0`
+# writes `-A ufw-user-input -i wg0 -j ACCEPT`, with no --dport at all, so a
+# host whose only SSH path was an interface or a source read as "no SSH rule"
+# -- and rescue then opened the port to the world. Measured, not theorised.
+#
+# So: an explicit rule for the port, OR any ACCEPT that names no port at all,
+# since a rule without a port permits every port including this one.
+# B7: four sources, in order of how much they actually know. Shared, because
+# `status` has to ask the same question `rescue` does and two answers would be
+# worse than none.
+#
+# `sshd -T` is authoritative ONLY where sshd owns its own listener. Socket
+# activation has been the default since Ubuntu 22.10, and there `sshd -T`
+# happily reports 22 while ssh.socket listens somewhere else -- a confident
+# wrong answer, and the consequence is opening the wrong port while leaving
+# the real one shut.
+SSH_SRC=""
+detect_ssh_ports() {
+    local ports
+    ports="$(systemctl show ssh.socket sshd.socket -p ListenStream 2>/dev/null \
+        | sed 's/^ListenStream=//' | grep -oE '[0-9]+$' | sort -u)"
+    SSH_SRC="systemd socket activation"
+    if [ -z "$ports" ]; then
+        ports="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
+        SSH_SRC="sshd -T"
+    fi
+    if [ -z "$ports" ]; then
+        ports="$(ss -tlnp 2>/dev/null \
+            | awk '/sshd/{split($4,a,":"); print a[length(a)]}' | sort -u)"
+        SSH_SRC="listening sockets"
+    fi
+    if [ -z "$ports" ]; then
+        # Say it is a GUESS. Presenting a fallback as a finding is how an
+        # operator ends up trusting a number nothing measured.
+        ports=22
+        SSH_SRC="GUESS"
+    fi
+    printf '%s' "$ports"
+}
+
+# A blanket SSH ACCEPT sitting directly in INPUT that ufw did not put there.
+#
+# Older versions of `rescue` inserted exactly this, and if ufw then came back
+# WITHOUT its own SSH rule the blanket was left in place -- permanently, and
+# silently, on a host whose SSH was meant to be restricted. That behaviour is
+# gone, but the rules it already left behind are still out there, so `status`
+# names them.
+stray_ssh_accept() {
+    local port
+    for port in $(detect_ssh_ports); do
+        iptables -S INPUT 2>/dev/null \
+            | grep -E -- "^-A INPUT .*--dport ${port}( |$).*-j ACCEPT" \
+            | grep -v -- '-s '
+    done
+}
+
+ssh_rules_in() {   # $1 = rules file, $2 = port
+    local f="$1" port="$2"
+    [ -r "$f" ] || return 0
+    grep -E -- "^-A ufw6?-user-input .*--dport ${port}( |$)" "$f" 2>/dev/null
+    grep -E -- '^-A ufw6?-user-input ' "$f" 2>/dev/null \
+        | grep -v -- '--dport' | grep -E -- '-j (ACCEPT|ufw-user-limit-accept)'
+}
+
 # Is every current preflight failure one the operator already accepted?
 # $1 = current failed keys, $2 = keys recorded in the stanza at install time.
 pf_all_accepted() {
@@ -1169,6 +1235,13 @@ cmd_status() {
     [ "${logc:-0}" -ge 9 ] && st ufw-chains ok "ufw chains complete ($logc logging chains)" \
         || { st ufw-chains bad "ufw is half-built ($logc logging chains) — run ufw-docker rescue"; rc=1; }
 
+    # B6: a blanket SSH accept an old `rescue` left in INPUT is a standing
+    # exposure nobody chose, and nothing used to mention it.
+    local stray; stray="$(stray_ssh_accept)"
+    [ -n "$stray" ] && st stray-ssh-accept warn \
+        "a blanket SSH ACCEPT sits directly in INPUT, outside ufw's chains:" \
+        "$(printf '%s\n' "$stray"; printf 'an older ufw-docker rescue inserted this and left it.\nIf you did not intend SSH open to the world, remove it with:\n  iptables -D INPUT <the rule above, with -D in place of -A>\n')"
+
     local sshr; sshr=$(iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22') || true
     [ "${sshr:-0}" -gt 0 ] && st ssh-rule ok "SSH rule present" \
         || { st ssh-rule bad "NO SSH rule in ufw-user-input — run ufw-docker rescue NOW"; rc=1; }
@@ -1345,17 +1418,32 @@ cmd_rescue() {
     # So: find the real SSH port(s), and replay the operator's OWN rules from
     # user.rules, which is untouched by anything here. A blanket is the last
     # resort, and it says so loudly.
-    SSH_PORTS="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
-    [ -n "$SSH_PORTS" ] || SSH_PORTS="$(ss -tlnp 2>/dev/null \
-        | awk '/sshd/{split($4,a,":"); print a[length(a)]}' | sort -u)"
-    [ -n "$SSH_PORTS" ] || SSH_PORTS=22
-    say "sshd port(s): $(echo "$SSH_PORTS" | tr '\n' ' ')"
+    SSH_PORTS="$(detect_ssh_ports)"
+    if [ "$SSH_SRC" = GUESS ]; then
+        warn "could not determine the SSH port from systemd, sshd -T or the"
+        warn "listening sockets. ASSUMING 22 — if sshd is on another port,"
+        warn "this rescue will not restore access to it. Check before relying"
+        warn "on this, and use 'ufw-docker rescue --open' if you are locked out."
+    fi
+    say "sshd port(s): $(echo "$SSH_PORTS" | tr '\n' ' ') (from: $SSH_SRC)"
 
-    INSERTED="" ; BLANKET=""
+    INSERTED="" ; NOSSH=""
     for port in $SSH_PORTS; do
-        # The operator's own rules for this port, exactly as ufw stored them.
-        rules="$(grep -E -- "^-A ufw-user-input .*--dport ${port}( |$)" \
-                 $USER4 2>/dev/null)"
+        rules="$(ssh_rules_in "$USER4" "$port")"
+        src="your user.rules"
+
+        # Fall back to the newest forensic snapshot. Every previous rescue
+        # copied user.rules into one, so if ufw's file has since been reset or
+        # truncated, the operator's real rules are still recoverable from
+        # there -- and recovering them beats inventing something.
+        if [ -z "$rules" ]; then
+            snap="$(ls -1dt /var/backups/ufw-rescue-*/user.rules 2>/dev/null | head -1)"
+            if [ -n "$snap" ]; then
+                rules="$(ssh_rules_in "$snap" "$port")"
+                [ -n "$rules" ] && src="$snap"
+            fi
+        fi
+
         if [ -n "$rules" ]; then
             echo "$rules" | while IFS= read -r r; do
                 # shellcheck disable=SC2086
@@ -1363,13 +1451,27 @@ cmd_rescue() {
             done
             INSERTED="${INSERTED}${rules}
 "
-            ok "replayed your own rule(s) for port $port:"
+            ok "replayed your own rule(s) for port $port (from $src):"
             echo "$rules" | sed 's/^/      /'
         else
-            iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT 2>/dev/null
-            BLANKET="${BLANKET}${port} "
-            warn "no rule for port $port in user.rules — inserted a BLANKET ACCEPT"
-            warn "  port $port is now reachable from ANYWHERE until you add a rule"
+            # ── B6: INVENT NOTHING ────────────────────────────────────────
+            # This used to insert a blanket ACCEPT. On a host whose SSH is
+            # deliberately restricted -- to a VPN source, or to an interface --
+            # that does not RESTORE access, it GRANTS access that never
+            # existed, and silently widens the host's exposure at the exact
+            # moment nobody is watching, because this also runs unattended
+            # from the self-heal unit at boot.
+            #
+            # If ufw has no rule permitting SSH, the honest reading is that ufw
+            # was never permitting SSH. `rescue --open` already exists for the
+            # deliberate "get me in regardless" case, and it is explicit about
+            # what it costs.
+            NOSSH="${NOSSH}${port} "
+            warn "no rule permitting port $port found in user.rules or any snapshot"
+            warn "  NOT inventing one. If ufw never allowed $port, opening it now"
+            warn "  would grant access that never existed rather than restore it."
+            warn "  If you are locked out and want the firewall down:"
+            warn "      ufw-docker rescue --open"
         fi
     done
 
@@ -1495,16 +1597,23 @@ cmd_rescue() {
     [ "$LOGCHAINS" -ge 9 ] && ok "logging chains complete ($LOGCHAINS)" \
       || { bad "only $LOGCHAINS logging chains — ufw is still half-built"; RC=1; }
 
+    # The live chain is written in exactly the syntax user.rules uses, so the
+    # SAME matcher decides here. It used to count `--dport $port` only -- the
+    # identical blind spot step 1 had, which meant a host whose SSH is allowed
+    # by interface was told "ufw has NO SSH rule" and had the temporary rules
+    # left in place permanently.
+    LIVE="$BACKUP/live-ufw-user-input"
+    iptables -S ufw-user-input > "$LIVE" 2>/dev/null
     SSHRULES=0
     for port in $SSH_PORTS; do
-        n=$(iptables -S ufw-user-input 2>/dev/null | grep -c -- "--dport $port")
+        n=$(ssh_rules_in "$LIVE" "$port" | grep -c . || true)
         SSHRULES=$((SSHRULES + n))
     done
 
     if [ "$SSHRULES" -gt 0 ]; then
         ok "ufw has its own SSH rule(s) back:"
         for port in $SSH_PORTS; do
-            iptables -S ufw-user-input | grep -- "--dport $port" | sed 's/^/      /'
+            ssh_rules_in "$LIVE" "$port" | sed 's/^/      /'
         done
         # Remove exactly what step 1 added -- no more, no less.
         printf '%s' "$INSERTED" | while IFS= read -r r; do
@@ -1512,16 +1621,18 @@ cmd_rescue() {
             # shellcheck disable=SC2086
             iptables -D INPUT ${r#-A ufw-user-input } 2>/dev/null
         done
-        for port in $BLANKET; do
-            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
-        done
         say "removed the temporary rule(s) added at step 1"
     else
-        bad "ufw has NO SSH rule — the step 1 rule(s) are being LEFT IN PLACE"
-        for port in $BLANKET; do
-            bad "  port $port is open to the WORLD until you fix this:"
+        bad "ufw has NO rule permitting SSH after the rebuild"
+        printf '%s' "$INSERTED" | grep -q . && {
+            bad "  the step 1 rule(s) are being LEFT IN PLACE so you keep access"
+            bad "  they are YOUR OWN rules replayed, not a widening of exposure"
+        }
+        for port in $NOSSH; do
+            say  "  nothing permits port $port, and rescue did not invent anything."
+            say  "  If you expect ufw to allow it, add the rule you meant:"
             say  "      ufw allow from <your-ip> to any port $port proto tcp"
-            say  "      iptables -D INPUT -p tcp --dport $port -j ACCEPT"
+            say  "  If you are locked out right now:  ufw-docker rescue --open"
         done
         RC=1
     fi

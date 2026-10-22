@@ -1125,6 +1125,42 @@ assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
     [ "$dir" = "$want" ]
 }
 
+@test "status names a blanket SSH ACCEPT that ufw did not create" {
+    # B6. An older `rescue` inserted exactly this and, when ufw came back
+    # without its own SSH rule, left it in place -- permanently widening a
+    # host whose SSH was meant to be restricted, with nothing ever mentioning
+    # it again. The behaviour is gone; the rules it already left are not.
+    run sudo "$REPO/ufw-docker" status
+    ! echo "$output" | grep -q 'blanket SSH ACCEPT'
+
+    sudo iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT
+    run sudo "$REPO/ufw-docker" status
+    sudo iptables -D INPUT -p tcp --dport 22 -j ACCEPT    # before any assertion
+    echo "$output" | grep -q 'blanket SSH ACCEPT'
+    echo "$output" | grep -q 'outside'
+
+    run sudo "$REPO/ufw-docker" status
+    ! echo "$output" | grep -q 'blanket SSH ACCEPT'
+}
+
+@test "rescue replays an interface-scoped SSH rule instead of inventing one" {
+    # The regression test for the live bug: ufw permits SSH only via an
+    # interface, so there is no --dport 22 rule anywhere. rescue must NOT
+    # conclude "no SSH rule" and open the port to the world.
+    sudo ufw allow in on lo >/dev/null 2>&1
+
+    run sudo "$REPO/ufw-docker" rescue
+    sudo ufw --force delete allow in on lo >/dev/null 2>&1
+    reinstall
+
+    [ "$status" -eq 0 ]
+    # It found a permitting rule...
+    echo "$output" | grep -q 'replayed your own rule'
+    # ...and did not invent anything.
+    ! echo "$output" | grep -q 'NOT inventing one'
+    ! echo "$output" | grep -qi 'BLANKET ACCEPT'
+}
+
 @test "remove returns DOCKER-USER to stock" {
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
     [ "$(jumps)" -eq 0 ]

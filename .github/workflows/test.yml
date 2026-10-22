@@ -12,6 +12,10 @@ on:
     branches: [ main ]
   pull_request:
   workflow_dispatch:
+  # Callable, so release.yml runs THE SAME gates rather than a copy of them.
+  # A release pipeline with its own slightly-different checks is a release
+  # pipeline that eventually ships something main would have rejected.
+  workflow_call:
 
 permissions:
   contents: read
@@ -38,6 +42,13 @@ jobs:
         # refactor, which bash -n and shellcheck both pass. It has happened.
         run: tests/lint-functions.sh
 
+      - name: the SSH-permission matcher finds every form of permission
+        # `rescue` decides whether to touch SSH from this matcher. It used to
+        # look for `--dport <port>` only, so a host whose SSH was allowed by
+        # INTERFACE read as "no SSH rule" and got the port opened to the world
+        # unattended at boot. Pure logic, no firewall -- it belongs here.
+        run: tests/ssh-detect-selftest.sh
+
       - name: the platform matrix and the docs agree
         # Two copies of the matrix exist on purpose -- the heredoc in
         # `ufw-docker`, because the preflight must read it on a host that
@@ -52,7 +63,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh
+        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh
 
   bats:
     runs-on: ubuntu-latest

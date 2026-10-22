@@ -18,24 +18,71 @@ Keep that if you change anything here.
 
 ## What it does to SSH
 
-It does **not** simply open port 22.
+**It never opens a port you had not already opened.** That is the whole contract, and it
+is worth stating plainly because an earlier version of this tool broke it.
 
-1. **Finds the real sshd port(s)**: `sshd -T`, falling back to listening sockets, then 22.
-   A host running sshd on 2222 is handled — the first version hardcoded 22 and would have
-   protected nothing there.
+1. **Finds the real sshd port(s)**, in order: systemd socket activation
+   (`ssh.socket`/`sshd.socket` `ListenStream`), then `sshd -T`, then the listening
+   sockets, then 22 — and it **says which source it used**:
+   ```
+   sshd port(s): 22  (from: sshd -T)
+   ```
+   Socket activation is checked first and is not a nicety: it has been the Ubuntu
+   default since 22.10, and on such a host `sshd -T` reports 22 while the socket unit
+   listens elsewhere. A confident wrong answer here opens the wrong port and leaves the
+   real one shut. If every source fails, the fallback to 22 is announced as a **GUESS**,
+   not presented as a finding.
+
 2. **Replays your own rules** from `user.rules`, which nothing in this tool modifies:
    ```
-   replayed your own rule(s) for port 22:
+   replayed your own rule(s) for port 22 (from your user.rules):
        -A ufw-user-input -p tcp --dport 22 -s 198.51.100.7 -j ACCEPT
    ```
    A host locked to one source stays locked to that source.
-3. **Removes exactly what it added** once ufw has its own rules back — tracked, not
+
+   "Your own rules" means **anything that permits the port**, not only `--dport` rules.
+   `ufw allow in on wg0` writes `-A ufw-user-input -i wg0 -j ACCEPT`, with no port at
+   all — see below.
+
+3. **Falls back to the newest forensic snapshot.** Every previous rescue copied
+   `user.rules` into `/var/backups/ufw-rescue-*`, so if ufw's own file has since been
+   reset the real rules are still recoverable. Recovering beats inventing.
+
+4. **Invents nothing** if neither has a rule permitting the port:
+   ```
+   no rule permitting port 22 found in user.rules or any snapshot
+     NOT inventing one. If ufw never allowed 22, opening it now
+     would grant access that never existed rather than restore it.
+   ```
+   `rescue --open` exists for the deliberate "get me in regardless" case, and is
+   explicit about what it costs.
+
+5. **Removes exactly what it added** once ufw has its own rules back — tracked, not
    guessed.
 
-The one case where it opens a port: `user.rules` has no rule for an SSH port, so there is
-nothing to replay. It inserts a blanket `ACCEPT` rather than leave you with no way in,
-reports it loudly, and if ufw still has no SSH rule at the end it **leaves it** with the
-commands to close it.
+### Why it no longer inserts a blanket ACCEPT
+
+It used to. If `user.rules` had no rule for the SSH port, it inserted
+`-A INPUT -p tcp --dport 22 -j ACCEPT` so you could not be locked out.
+
+Two things were wrong with that, and they compound:
+
+- **It did not restore access, it granted it.** On a host whose SSH is deliberately
+  restricted, "no rule in `user.rules`" means ufw was never permitting SSH. Opening it
+  widens the host beyond anything the operator chose.
+- **The detection was wrong, so it fired on hosts that *were* protected.** The matcher
+  looked for `--dport <port>` only. An operator allowing SSH by interface has
+  `-A ufw-user-input -i wg0 -j ACCEPT` — no `--dport` — and read as "no SSH rule". That
+  host got port 22 opened to the world. Unattended, since the self-heal unit runs this
+  at boot. (It also only searched the v4 chain, never `ufw6-user-input`.)
+
+Both are fixed, and `tests/ssh-detect-selftest.sh` pins the matcher against every form
+of permission — including a portless `DROP`, which must *not* count as permission, or
+rescue would decide you were already covered and leave you locked out.
+
+**The blanket rules an old version already left behind are still out there**, so
+`status` now names any blanket SSH `ACCEPT` sitting in `INPUT` outside ufw's chains,
+with the command to remove it.
 
 ## The steps
 

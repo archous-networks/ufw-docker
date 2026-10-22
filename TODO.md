@@ -14,7 +14,7 @@ Not a rule, but these have real dependencies on each other:
 
 1. ~~**X1 + D4 + D5 together.**~~ **Done** — see *Implemented* below.
 2. ~~**A11**~~ and ~~**E10 stage 1**~~ — **Done**, see *Implemented* below.
-3. **B6, B7** — the two recovery-path defects. B6 contains a live bug. **Next.**
+3. ~~**B6, B7**~~ — **Done**, see *Implemented* below.
 4. **F1 + F2** — release and checksums, once the above makes `v1.0.0` mean something.
 5. **D3 last** — per-subcommand help, after the new flags exist, or it gets written twice.
 
@@ -24,9 +24,7 @@ Not a rule, but these have real dependencies on each other:
 
 | # | | | |
 |---|---|---|---|
-| **B6** | **`rescue` must stop inventing an SSH rule.** If `user.rules` has none, that usually means ufw never permitted SSH — so a blanket `ACCEPT` grants access that never existed rather than restoring anything, and `rescue --open` already covers the deliberate "get me in regardless" case. New behaviour: replay from `user.rules` → else replay from the newest `/var/backups/ufw-rescue-*` snapshot → else **invent nothing** and point at `--open`. Plus `status` must flag any blanket SSH `ACCEPT` in `INPUT` that ufw did not create, for hosts that already have one. **Live bug:** detection matches `--dport <port>` only, so an operator allowing SSH by interface (`ufw allow in on wg0`) reads as "no SSH rule" and that host gets port 22 opened to the world today. | [verified] | S2 |
 | **X5** | **Three test ports still fail the test-port rule.** The rule, now written into `tests/rules-lib.bash`: *every port in `TEST_PORTS` is a port the suite will delete a rule for, so it must be a port nothing real listens on.* **9100** (node_exporter), **9200** (Elasticsearch HTTP) and **9300** (Elasticsearch transport) fail it. Nothing in this estate runs them, so there is no live breakage — but 8089, 443 and container-port 80 were all *also* fine until the day they were not, and each cost a debugging round trip. Move `collc`'s container port off 9100, `v6svc` off 9200, and the host listener off 9300. Cheap and mechanical; the only care needed is keeping `v6svc` published **1:1**, since the remap trap depends on it. | [verified] | S3 |
-| **B7** | **SSH port detection can miss, silently.** Add `systemctl show ssh.socket -p ListenStream` to the chain — socket activation is the default on Ubuntu 22.10+, and `sshd -T` can report 22 while the socket unit listens elsewhere. The more important half: make the bare-22 fallback **loud**. "Could not determine the SSH port, assuming 22" rather than presenting a guess as fact. | [suspected] | S2 |
 | **H1** | **The nft-incompatible chain condition is handled but not understood.** `rescue` step 3b fires reliably at the end of a full run and has never escaped into a failure — but a fix we do not understand is a fix we cannot rely on, and the first version of its detection was wrong in a way that would have run a destructive teardown on a healthy host. Reproduce minimally (interleave `iptables -F`/`-X` on a ufw chain with a `ufw reload`), find the mechanism in the nft compatibility layer, document it. Free experiment: if 3b never fires on the legacy leg, that localises it to iptables-nft. | [unknown] | S2 |
 | **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced — the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the cold-boot path: all of that is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Needs one deliberate reboot into breakage. | [verified] | S2 |
 | **F1** | **Tags and releases.** `main` is the only thing anyone can fetch, so a customer curling mid-push gets an arbitrary intermediate state. Point the README at `releases/latest/download/ufw-docker` (stable, never an intermediate commit) and document the pinned `releases/download/vX.Y.Z/` form. Release workflow: on tag, run CI, attach the artifact **only on green**. Lint: `VERSION` must equal the tag. Branch protection on `main` requiring green CI rather than a dev branch — dev branches solve the developer problem, releases solve the user problem. Sequence **after** X1 and A11 so `v1.0.0` means "refuses on anything unproven". | [verified] | S2 |
@@ -203,6 +201,40 @@ Not a rule, but these have real dependencies on each other:
   the platform matrix, so a wrong answer becomes a row nobody re-checks. Also fixed the
   `/usr/sbin` PATH assumption that caused two of the four — the third time that trap
   has bitten this project.
+
+- **B6 — `rescue` no longer invents an SSH rule, and the detection that made it
+  necessary was itself broken.** Two defects, and the second is why the first mattered.
+
+  It used to insert a blanket `ACCEPT` when `user.rules` had no rule for the SSH port.
+  That does not *restore* access on a host whose SSH is deliberately restricted — it
+  *grants* access that never existed, unattended, because the self-heal unit runs rescue
+  at boot. Now: replay from `user.rules` → else replay from the newest
+  `/var/backups/ufw-rescue-*` snapshot → else **invent nothing** and point at `--open`.
+
+  **The live bug:** the matcher looked for `--dport <port>` only, so `ufw allow in on
+  wg0` (`-A ufw-user-input -i wg0 -j ACCEPT`, no port) read as "no SSH rule" and that
+  host got 22 opened to the world. Confirmed by measurement, not reasoning. It also only
+  searched `ufw-user-input`, never `ufw6-user-input` — a second bug found while fixing
+  the first. The same blind spot existed in rescue's *verification* step, which would
+  have told such a host "ufw has NO SSH rule" and left the temporary rules in place
+  permanently; it now uses the same matcher, so the two cannot disagree.
+
+  `tests/ssh-detect-selftest.sh` pins it with 11 synthetic cases and is proven to fail
+  against the old matcher. It includes the cases that must NOT match — a portless `DROP`
+  is not permission, or rescue would conclude you were already covered and leave you
+  locked out. And `status` now names any blanket SSH `ACCEPT` left in `INPUT` by an older
+  version, since those are still out there.
+
+  Worth recording *why* this hid: the development host had both an interface rule and a
+  `--dport` rule, so the matcher looked correct here. Pure-logic self-tests exist
+  precisely because the environment keeps voting.
+- **B7 — SSH port detection asks systemd first, and admits when it is guessing.**
+  `systemctl show ssh.socket sshd.socket -p ListenStream` now leads the chain, because
+  socket activation has been the Ubuntu default since 22.10 and `sshd -T` reports 22
+  there while the socket listens elsewhere — a confident wrong answer that opens the
+  wrong port and leaves the real one shut. `rescue` prints which source it used, and the
+  fallback to 22 is announced as a **GUESS** rather than presented as a finding. The
+  detector is shared with `status`, so both ask the same question.
 
 ## Fixed while compiling this list
 
