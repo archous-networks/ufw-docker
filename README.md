@@ -72,7 +72,8 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
 | [Testing](docs/testing.md) | the suite, the IPv6 matrix, and two ways to break your own host |
-| [Known gaps](TODO.md) | everything we know is missing, tagged and triaged |
+| [Known gaps](TODO.md) | approved for immediate work, tagged and triaged |
+| [Deferred](FUTURE.md) | reviewed and put off, each with what would bring it forward |
 
 ---
 

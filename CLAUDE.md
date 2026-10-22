@@ -23,7 +23,8 @@ rule chains into Docker's `DOCKER-USER` hook.
 | "why doesn't rule X work" | [docs/caveats.md](docs/caveats.md) |
 | WAF / Cloudflare / reverse-proxy questions | [docs/waf.md](docs/waf.md) |
 | running or writing tests | [docs/testing.md](docs/testing.md) ← **read before running the suite** |
-| what is still missing | [TODO.md](TODO.md) |
+| what is still missing, approved to build | [TODO.md](TODO.md) |
+| what was deferred, and what would un-defer it | [FUTURE.md](FUTURE.md) |
 
 ## Invariants — do not break these
 

@@ -1,16 +1,52 @@
-# Known gaps
+# TODO — approved for immediate work
 
-Everything below is a real gap in `ufw-docker` as it stands. Nothing here is decided —
-this is the raw list to review, triage, and split between "now" and `FUTURE.md`.
+Triaged 2026-10-22, item by item. Everything here was reviewed and marked **now**;
+everything marked **later** moved to [FUTURE.md](FUTURE.md). Nothing is unsorted any more.
 
-Each item is marked:
+Severity is the original read: **S1** could leave someone unfiltered or locked out,
+**S2** produces wrong or confusing behaviour, **S3** is ergonomics or polish.
+Evidence tags: **[verified]** reproduced here · **[suspected]** reasoned, not reproduced ·
+**[unknown]** we do not know.
 
-- **[verified]** — reproduced or confirmed on the dev host
-- **[suspected]** — reasoned from the code or from how the components behave; not reproduced
-- **[unknown]** — we genuinely do not know
+## Suggested order
 
-Rough severity is my read, not a decision: **S1** could leave someone unfiltered or locked
-out, **S2** produces wrong or confusing behaviour, **S3** is ergonomics or polish.
+Not a rule, but these have real dependencies on each other:
+
+1. **X1 + D4 + D5 together.** All three restructure `cmd_status`, and doing that three
+   times is the waste. X1 is also what makes "unsupported" a refusal rather than a
+   sentence in a doc.
+2. **A11** — the legacy CI leg is currently failing and Debian 10 is in the estate, so
+   this is the most load-bearing unknown.
+3. **E10 stage 1** — the support matrix, which X1 reads and CI generates legs from.
+4. **B6, B7** — the two recovery-path defects. B6 contains a live bug.
+5. **F1 + F2** — release and checksums, once the above makes `v1.0.0` mean something.
+6. **D3 last** — per-subcommand help, after the new flags exist, or it gets written twice.
+
+---
+
+## The list
+
+| # | | | |
+|---|---|---|---|
+| **X1** | **Supported-environment preflight that REFUSES.** Nothing enforces our "untested" caveats today, so a customer on an unsupported setup gets the worst outcome: `install` succeeds, `status` reports everything wired, nothing is filtered. Checks: iptables backend is nft; **no mixed backends** (rules in both subsystems — both are evaluated, a `DROP` in either wins); Swarm inactive; Docker not rootless; ufw paths resolve (see D5). Runs in `install` **and** `status`, because a host that is fine today can have its backend switched tomorrow. `--dry-run` reports it. `--unsupported` **alone refuses** and lists each failed check, requiring `--force` as well — same pattern as `--include-backups`. Loudness must be **persistent**: a banner at install, a `# INSTALLED IN UNSUPPORTED MODE: <checks>` line in the stanza, a line in **every** `status` run, and a syslog audit entry. A host that took the flag must never quietly pass for supported. *No ufw-backend check is needed — upstream ufw has no native nftables backend.* | [verified] | S1 |
+| **A11** | **iptables-legacy is unproven, and Debian 10 is in the estate** — so this is a real deployment target, not an edge case. The CI leg exists and **currently fails**: every "should be open" assertion fails while every "should be blocked" one passes. Hypothesis, not yet confirmed: nft rules created at boot coexist with the legacy rules we add, both are evaluated, and a `DROP` in either wins. Fix the leg with `nft flush ruleset` after the switch. Until it is green we cannot say whether legacy works. Already confirmed: legacy **rejects** `-j NOSUCHCHAIN` where nft accepts it. | [verified] | S2 |
+| **E10** | **Supported-platform matrix, feeding the preflight and CI.** Lives **inside `ufw-docker`** as a heredoc — the single-file property means the preflight cannot read an external file. Field order mirrors `tools/ufw-docker-survey` so a pasted survey line can be matched against it. Columns: `label \| distro \| ver \| ufw \| backend \| docker \| verified-by \| status`. Three consumers: the preflight matches the live host; CI generates matrix legs from `status=supported` rows; a `tests/lint-supported.sh` fails on drift between the table and the docs. **Rule: a row may claim `supported` only where a green CI leg proves it** — a surveyed host matching no row is `unverified`. Use opaque `site-NN` labels; the mapping lives outside this repo. **Stage 1** (table, preflight wiring, lint, fix the legacy leg) is cheap. **Stage 2** (real Debian 10/11/12 legs) is not: GitHub hosts no Debian runners and the suite needs real kernel netfilter, systemd and a Docker daemon, so it means privileged DinD, VMs, or self-hosted runners. | [verified] | S2 |
+| **D4** | **`status --json`.** The exit code is all monitoring gets today — "something is wrong", never what. Anything richer means scraping coloured prose, which changed wording several times in a single day. `--json` is also the natural home for the preflight verdict and its failed checks. **Build with X1**: `cmd_status` prints as it checks and must be restructured to collect-then-render. | | S3 |
+| **D5** | **Derive ufw's paths instead of hardcoding them.** ufw has no CLI flag for this, but its Python module carries packager-patched constants: `python3 -c 'import ufw.common as c; print(c.config_dir, c.share_dir, c.state_dir, c.prefix_dir)'` → `/etc /usr/share/ufw /lib/ufw /usr`. All four derived paths verified to resolve here. Derive → fall back to Debian defaults if unavailable → **verify each path exists** → refuse as unsupported otherwise. ~10 lines; folds into X1. Gotchas: `config_dir` is `/etc`, **not** `/etc/ufw`; and it is ufw's internal module, justified only because it **fails loudly** where a wrong hardcoded path fails silently. | [verified] | S3 |
+| **B6** | **`rescue` must stop inventing an SSH rule.** If `user.rules` has none, that usually means ufw never permitted SSH — so a blanket `ACCEPT` grants access that never existed rather than restoring anything, and `rescue --open` already covers the deliberate "get me in regardless" case. New behaviour: replay from `user.rules` → else replay from the newest `/var/backups/ufw-rescue-*` snapshot → else **invent nothing** and point at `--open`. Plus `status` must flag any blanket SSH `ACCEPT` in `INPUT` that ufw did not create, for hosts that already have one. **Live bug:** detection matches `--dport <port>` only, so an operator allowing SSH by interface (`ufw allow in on wg0`) reads as "no SSH rule" and that host gets port 22 opened to the world today. | [verified] | S2 |
+| **B7** | **SSH port detection can miss, silently.** Add `systemctl show ssh.socket -p ListenStream` to the chain — socket activation is the default on Ubuntu 22.10+, and `sshd -T` can report 22 while the socket unit listens elsewhere. The more important half: make the bare-22 fallback **loud**. "Could not determine the SSH port, assuming 22" rather than presenting a guess as fact. | [suspected] | S2 |
+| **H1** | **The nft-incompatible chain condition is handled but not understood.** `rescue` step 3b fires reliably at the end of a full run and has never escaped into a failure — but a fix we do not understand is a fix we cannot rely on, and the first version of its detection was wrong in a way that would have run a destructive teardown on a healthy host. Reproduce minimally (interleave `iptables -F`/`-X` on a ufw chain with a `ufw reload`), find the mechanism in the nft compatibility layer, document it. Free experiment: if 3b never fires on the legacy leg, that localises it to iptables-nft. | [unknown] | S2 |
+| **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced — the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the cold-boot path: all of that is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Needs one deliberate reboot into breakage. | [verified] | S2 |
+| **F1** | **Tags and releases.** `main` is the only thing anyone can fetch, so a customer curling mid-push gets an arbitrary intermediate state. Point the README at `releases/latest/download/ufw-docker` (stable, never an intermediate commit) and document the pinned `releases/download/vX.Y.Z/` form. Release workflow: on tag, run CI, attach the artifact **only on green**. Lint: `VERSION` must equal the tag. Branch protection on `main` requiring green CI rather than a dev branch — dev branches solve the developer problem, releases solve the user problem. Sequence **after** X1 and A11 so `v1.0.0` means "refuses on anything unproven". | [verified] | S2 |
+| **F2** | **No checksum or signature.** Publish `SHA256SUMS` with each release and document verifying before install. Rides along with F1 at almost no extra cost. | [verified] | S2 |
+| **A7** | **`--network host` containers are unaffected, and nothing says so.** Correct behaviour — they traverse `INPUT`, so plain ufw rules govern them — but it is the opposite of what a user of this tool will assume, and they have **no address of their own**, so `-d <ip>` can never target them and `containers` shows nothing to target. Same presentation discipline as X1 (detected, named in `containers` and `status`, documented alongside) but **deliberately different vocabulary**: *"not governed by ufw-docker — host network, plain ufw INPUT rules apply"*, **not** "unsupported". It does not trip the preflight. Reserving "unsupported" for genuinely dangerous cases is what keeps the word worth reading. | [verified] | S3 |
+| **C5** | **Chain counters are not surfaced.** `status --counters` (or fold into `--rules`) showing `DOCKER-USER` packet/byte counts with a one-line interpretation. Value: **"wired but counters flat"** is the cheapest visible signal of the wired-but-filtering-nothing family. Do **not** warn on flat counters — a quiet host is legitimate; show the number and let the operator read it. Update `logging.md`, which currently tells you to run raw `iptables -L -v -n` yourself. | [verified] | S3 |
+| **B5** | **`remove` leaves the binary, undocumented.** Keep that behaviour — reinstall is the likely next step and `rescue` must stay available exactly when you have just unwound the firewall — but **say so** in the preview and the done message, since the preview exists to answer "what remains?". Add `--purge` to also remove the binary, requiring `--force`, orthogonal to `--include-backups` so they compose. **Implementation note:** bash reads a script incrementally, so deleting `$0` mid-run can make it read garbage. Do the `rm` from an `EXIT` trap. | [verified] | S3 |
+| **A10** | **Custom bridge names untested.** Matching is on subnets, never interface names, so it should be irrelevant — but that is reasoning, not measurement. Add `com.docker.network.bridge.name` to the network the per-container test already creates; existing assertions then cover it. ~3 lines, converts [suspected] → [verified] for free. | [suspected] | S3 |
+| **E8** | **Test 12 skips in CI**, so its green/red depends on *where* it runs — the exact shape we spent a day removing. The property is not UISP-specific, and test 22 already creates its own static-IPAM container and asserts survival across recreate **in CI**. Read both, determine the overlap, then either generalise test 12 to create its own container or **retire it as duplicate**. Likely outcome: delete. Removes a skip that makes CI look more thorough than it is. | | S3 |
+| **D3** | **No per-subcommand help.** `remove --help` gives the global block rather than explaining `--force`, `--include-backups`, `--purge`. **Sequence last** — the items above add `--dry-run`, `--rules`, `--counters`, `--unsupported`, `--purge` and the preflight flags, so writing this first means writing it twice. No man page: it fights the single-file design for something `--help` already covers. The dangerous half is already fixed — the usage block is marker-ranged, after a hardcoded line range silently truncated it once. | [verified] | S3 |
+| **X3** | **Document the backend-change procedure.** `ufw-docker remove --force` → switch the alternative → **reboot** (or flush the departing backend's ruleset) → `ufw-docker install`. The reboot is the guaranteed-clean step; `remove` unwinds our stanza but Docker's own chains stay in the old backend, and both are evaluated. X1's mixed-backend check is what catches whoever skips a step — the check and the procedure are two halves of one thing. | | S3 |
+| **X4** | **Document the update process.** `curl` the new file, then re-run `install` — which refreshes all three pieces of installed state (the stanza, `before.init` if tool-managed, the selfheal unit), then reloads and verifies. Worth stating: the `before.init` backup is taken **once only**, so the original is preserved across updates; and the gap between the two commands is safe, because the old stanza keeps working and `status` flags the version mismatch. **The trap:** curl without re-running `install` leaves a new binary enforcing the *old* version's rules. | | S3 |
 
 ---
 
@@ -97,65 +133,3 @@ absent chain would have triggered a destructive nft teardown. It now requires th
 be present in `nft` *and* unreadable by `iptables`.
 
 ---
-
-## A. Coverage — things it silently does not do
-
-| # | Gap | | |
-|---|---|---|---|
-| A2 | **Remapped ports need the container port.** Published `8443:443` means `ufw allow 443`, not `8443`, because DNAT runs before FORWARD. Pinned by a test, but still a footgun. Fixing it properly means translating ufw's rules into `DOCKER-USER` with `--ctorigdstport` — a resident translator, not a static stanza. | [verified] | S2 |
-| A3 | **No way to target a container by name.** Rules can target a container's *address* (verified — see `docs/per-container.md`), but iptables matches addresses, not names. Static IPAM addresses make that usable today; tracking a **dynamic** address needs `ipset` plus a `docker events` watcher, i.e. a resident daemon. Not built. | [verified] | S2 |
-| A7 | **`--network host` containers are unaffected** — they use INPUT, not FORWARD. Correct behaviour, nowhere documented, and a reasonable person would expect otherwise. | [verified] | S3 |
-| A9 | **Rootless Docker almost certainly unsupported** — it uses slirp4netns, not these chains. Untested, undocumented. | [suspected] | S2 |
-| A10 | **Custom bridge names** (`com.docker.network.bridge.name`) should be fine since we match subnets, not interfaces — but untested. | [suspected] | S3 |
-| A12 | **Origin lockdown to a WAF's egress ranges is untested end to end.** `docs/waf.md` recommends restricting the origin to the WAF's ranges, and the mechanism it rests on (source-restricted allow on a container port) is covered by a test — but the full arrangement has never been stood up against a live Cloudflare or AWS WAF. The ranges are also published lists that rotate, which nothing here tracks. | [unknown] | S2 |
-| A11 | **Only tested against iptables-nft.** A host with legacy iptables, or a pure-nftables ufw, is unknown territory. | [verified] | S2 |
-
-## B. Safety and failure modes
-
-| # | Gap | | |
-|---|---|---|---|
-| B1 | **The self-heal unit has never repaired anything at an actual cold boot.** Much reduced: the real systemd unit is now driven against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log `running rescue` and `RECOVERED but UNWIRED`, and leave a healthy firewall untouched — plus its enablement and `After=ufw.service docker.service` ordering are asserted declaratively. What remains is only the cold-boot path itself: everything above is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Closing it needs one deliberate reboot into breakage. | [verified] | S2 |
-| B5 | **`remove` does not uninstall the binary.** It undoes all configuration but leaves `/usr/local/sbin/ufw-docker` behind. Arguably right, but undocumented and surprising. | [verified] | S3 |
-| B6 | **`rescue`'s blanket fallback is unbounded in time.** When `user.rules` has no SSH rule, it leaves a blanket ACCEPT in place indefinitely — loudly, but forever. No expiry, no follow-up check. | [verified] | S2 |
-| B7 | **SSH port detection could miss.** `sshd -T` is authoritative, but if it fails and the `ss` parse misfires, the fallback is a bare `22` — which on a host using a different port protects nothing. | [suspected] | S2 |
-
-## C. Observability
-
-| # | Gap | | |
-|---|---|---|---|
-| C5 | **Chain counters are not surfaced.** `iptables -L DOCKER-USER -v` has the drop counts; nothing presents them. | [verified] | S3 |
-
-## D. Ergonomics
-
-| # | Gap | | |
-|---|---|---|---|
-| D3 | **`--help` is the header comment.** `-h`/`--help` now print it (and the range is marker-based, so adding a subcommand can no longer truncate it silently — it had). Still no man page and no per-subcommand help. | [verified] | S3 |
-| D4 | **No machine-readable `status`** (`--json`), which monitoring would want. | [verified] | S3 |
-| D5 | **Debian/Ubuntu paths are hardcoded** (`/etc/ufw/...`, `/usr/share/ufw/...`). Other distros will fail in unhelpful ways. | [verified] | S3 |
-
-## E. Testing
-
-| # | Gap | | |
-|---|---|---|---|
-| E8 | **One test needs a UISP-shaped host** and skips elsewhere, so container-recreate coverage is thinner in CI than locally. |  | S3 |
-| E10 | **Single platform.** Debian 12, one host, one Docker version. | | S2 |
-
-## F. Packaging and distribution
-
-| # | Gap | | |
-|---|---|---|---|
-| F1 | **No tags or releases.** There is now a `VERSION` string, `--version`, and the stanza records the version that wired the host — so "which version is this" is answerable. What is still missing is a tagged artifact: `main` is the only thing anyone can fetch. | [verified] | S2 |
-| F2 | **No checksum or signature** for the `curl | sudo install` one-liner. The README warns about the pattern; it does not give a way to verify. | [verified] | S2 |
-| F3 | **No `.deb`**, which would solve F1, F2, D5 and the install ergonomics together. | | S3 |
-
-## G. Documentation
-
-| # | Gap | | |
-|---|---|---|---|
-
-## H. Unexplained
-
-| # | Gap | | |
-|---|---|---|---|
-| H1 | **The nft-incompatible chain condition.** Recurs reliably at the end of a full suite run, where teardown's `rescue` interleaves `iptables -F/-X` with ufw's rebuild. Step 3b handles it every time, so it is contained — but the mechanism is unknown, and a fix we do not understand is a fix we cannot rely on. | [unknown] | S2 |
-| H2 | **Is Docker's preservation of `DOCKER-USER` contractual or incidental?** We rely on it across daemon restart and cold boot, both verified empirically. Whether Docker *guarantees* it is not established, and B2 is the consequence if it ever changes. | [unknown] | S1 |
