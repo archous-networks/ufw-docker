@@ -190,10 +190,7 @@ cmd_install() {
     local selfheal=1
     while [ $# -gt 0 ]; do
         case "$1" in
-            --no-selfheal)   selfheal=0 ;;
-            # Accepted and ignored: this was opt-in briefly, and a script that
-            # passes it should keep working rather than die on an unknown flag.
-            --with-selfheal) selfheal=1 ;;
+            --no-selfheal) selfheal=0 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
@@ -429,14 +426,47 @@ cmd_rescue() {
     # Before touching anything else. A blanket accept at the top of INPUT works no
     # matter what state ufw's chains are in, and survives the cleanup below.
     head_ "1. restoring SSH"
-    iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null \
-      || iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT 2>/dev/null
-    if iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null; then
-        ok "temporary blanket ACCEPT on tcp/22 is in place"
-        say "(removed at the end if ufw comes back healthy with its own SSH rule)"
-    else
-        bad "could not insert the SSH rule — is iptables working at all?"
-    fi
+
+    # ── WHY THIS IS NOT JUST `-A INPUT --dport 22 -j ACCEPT` ───────────────
+    # The first version inserted a blanket ACCEPT on tcp/22 from anywhere. Two
+    # problems, both serious once this runs unattended at boot:
+    #
+    #   * On a host deliberately locked to one source (a VPN endpoint, say), it
+    #     silently opened SSH to the internet -- and if ufw then came back
+    #     WITHOUT its own SSH rule, the blanket was left in place permanently.
+    #   * It hardcoded port 22, so a host running sshd on 2222 got no
+    #     protection from this step at all.
+    #
+    # So: find the real SSH port(s), and replay the operator's OWN rules from
+    # user.rules, which is untouched by anything here. A blanket is the last
+    # resort, and it says so loudly.
+    SSH_PORTS="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
+    [ -n "$SSH_PORTS" ] || SSH_PORTS="$(ss -tlnp 2>/dev/null \
+        | awk '/sshd/{split($4,a,":"); print a[length(a)]}' | sort -u)"
+    [ -n "$SSH_PORTS" ] || SSH_PORTS=22
+    say "sshd port(s): $(echo "$SSH_PORTS" | tr '\n' ' ')"
+
+    INSERTED="" ; BLANKET=""
+    for port in $SSH_PORTS; do
+        # The operator's own rules for this port, exactly as ufw stored them.
+        rules="$(grep -E -- "^-A ufw-user-input .*--dport ${port}( |$)" \
+                 /etc/ufw/user.rules 2>/dev/null)"
+        if [ -n "$rules" ]; then
+            echo "$rules" | while IFS= read -r r; do
+                # shellcheck disable=SC2086
+                iptables -I INPUT 1 ${r#-A ufw-user-input } 2>/dev/null
+            done
+            INSERTED="${INSERTED}${rules}
+"
+            ok "replayed your own rule(s) for port $port:"
+            echo "$rules" | sed 's/^/      /'
+        else
+            iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT 2>/dev/null
+            BLANKET="${BLANKET}${port} "
+            warn "no rule for port $port in user.rules — inserted a BLANKET ACCEPT"
+            warn "  port $port is now reachable from ANYWHERE until you add a rule"
+        fi
+    done
 
     if [ "$MODE" = "open" ]; then
         head_ "2. emergency: taking the firewall down"
@@ -552,15 +582,34 @@ cmd_rescue() {
     [ "$LOGCHAINS" -ge 9 ] && ok "logging chains complete ($LOGCHAINS)" \
       || { bad "only $LOGCHAINS logging chains — ufw is still half-built"; RC=1; }
 
-    SSHRULES=$(iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22')
+    SSHRULES=0
+    for port in $SSH_PORTS; do
+        n=$(iptables -S ufw-user-input 2>/dev/null | grep -c -- "--dport $port")
+        SSHRULES=$((SSHRULES + n))
+    done
+
     if [ "$SSHRULES" -gt 0 ]; then
-        ok "ufw has its own SSH rule back:"
-        iptables -S ufw-user-input | grep 'dport 22' | sed 's/^/      /'
-        iptables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null \
-          && say "removed the temporary blanket ACCEPT"
+        ok "ufw has its own SSH rule(s) back:"
+        for port in $SSH_PORTS; do
+            iptables -S ufw-user-input | grep -- "--dport $port" | sed 's/^/      /'
+        done
+        # Remove exactly what step 1 added -- no more, no less.
+        printf '%s' "$INSERTED" | while IFS= read -r r; do
+            [ -n "$r" ] || continue
+            # shellcheck disable=SC2086
+            iptables -D INPUT ${r#-A ufw-user-input } 2>/dev/null
+        done
+        for port in $BLANKET; do
+            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
+        done
+        say "removed the temporary rule(s) added at step 1"
     else
-        warn "ufw has NO SSH rule — leaving the blanket tcp/22 ACCEPT in place"
-        warn "add one with: ufw allow from <your-ip> to any port 22 proto tcp"
+        bad "ufw has NO SSH rule — the step 1 rule(s) are being LEFT IN PLACE"
+        for port in $BLANKET; do
+            bad "  port $port is open to the WORLD until you fix this:"
+            say  "      ufw allow from <your-ip> to any port $port proto tcp"
+            say  "      iptables -D INPUT -p tcp --dport $port -j ACCEPT"
+        done
         RC=1
     fi
 

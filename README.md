@@ -158,6 +158,35 @@ It restores SSH **first**, before any cleanup, then rebuilds ufw from its own
 `user.rules` — so your real rules come back exactly as they were. A snapshot of the
 broken state is kept in `/var/backups/ufw-rescue-<timestamp>/`.
 
+### What it does to your SSH exposure
+
+It does **not** simply open port 22 to the world.
+
+1. It finds the real sshd port(s) — `sshd -T`, falling back to listening sockets, then
+   to 22. A host running sshd on 2222 is handled.
+2. For each, it replays **your own rule** from `user.rules`, which nothing here modifies:
+   ```
+   replayed your own rule(s) for port 22:
+       -A ufw-user-input -p tcp --dport 22 -s 198.51.100.7 -j ACCEPT
+   ```
+   A host locked to one source stays locked to that source.
+3. Those temporary rules are removed once ufw has its own back.
+
+**The one case where it does open a port:** if `user.rules` has no rule for an SSH port
+there is nothing to replay, so it inserts a blanket `ACCEPT` rather than leave you with no
+way in. It says so loudly — and if ufw still has no SSH rule at the end it **leaves that
+rule in place** and tells you how to close it:
+
+```
+ufw has NO SSH rule — the step 1 rule(s) are being LEFT IN PLACE
+  port 22 is open to the WORLD until you fix this:
+      ufw allow from <your-ip> to any port 22 proto tcp
+      iptables -D INPUT -p tcp --dport 22 -j ACCEPT
+```
+
+Reachable-and-noisy beats bricked-and-silent, but it is a real trade and you should know
+it is being made.
+
 **Why rescue lives in the same file.** It was a separate script at first, which is tidier
 in theory: a rescue tool should not share fate with the thing it rescues. In practice the
 likelier failure is someone installing the tool and skipping the rescue — and one file

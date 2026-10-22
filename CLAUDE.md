@@ -158,9 +158,11 @@ Two details worth keeping:
   and a first version treated that as incompatibility — sending a perfectly healthy host
   down the nft-destruction path. A rescue script must never take drastic action on a
   false positive.
-- The root cause of the syntax divergence is **not established**. It appeared during a
-  bats run that interleaved `rescue`'s `iptables -F/-X` with ufw's own rebuild. If
-  you can reproduce it deterministically, write it down here.
+- The root cause of the syntax divergence is **not established**, but it is not a one-off:
+  it recurs reliably at the end of a full suite run, where the teardown's `rescue`
+  interleaves `iptables -F/-X` with ufw's own rebuild. Step 3b handles it every time, so
+  it is a known-and-contained condition rather than an open hazard — but if you can
+  pin the mechanism down, write it here.
 
 ## CI caught a blind spot in the test design
 
@@ -250,8 +252,7 @@ should be the safe one, and safe here means "you can still log in". The operator
 exposed to a bad boot are also the least likely to find an opt-in flag.
 
 `--no-selfheal` exists for hosts whose boot-time state is owned by config management or an
-immutable image. `--with-selfheal` is still accepted and ignored, so anything scripted
-against the brief opt-in period keeps working.
+immutable image.
 
 The check stays deliberately narrow — one symptom, the one that locks people out. Anything
 broader risks running a rebuild over a merely unusual state.
@@ -278,6 +279,27 @@ success. Caught only because `rescue` prints the path and someone read it.
 
 When renaming across a file that holds both prose and filesystem paths, check the paths
 individually. `grep -n 'var/\|/etc/\|/usr/'` after the rename is enough.
+
+## Rescue must not quietly widen SSH exposure
+
+The first version of step 1 was `iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT`. Two
+defects, both only dangerous once self-heal runs unattended at boot:
+
+- On a host deliberately locked to one source it **silently opened SSH to the internet** —
+  and if ufw then came back with no SSH rule of its own, the blanket was left there
+  permanently, with only a warning nobody was present to read.
+- It **hardcoded port 22**. A host running sshd on 2222 got nothing useful from the step
+  whose whole job is keeping you logged in.
+
+It now derives the real port(s) (`sshd -T`, then listening sockets, then 22) and replays
+the operator's own rules out of `user.rules`, which nothing in this tool modifies. The
+blanket is a last resort for when there is genuinely nothing to replay, it is reported as
+such, and step 6 removes exactly what step 1 added — tracked in `$INSERTED`/`$BLANKET`,
+not guessed at.
+
+Keep that property if you touch this: **the rescue path may never leave a host more
+exposed than it found it, except where the alternative is no access at all** — and then it
+must say so in terms someone reading a log will act on.
 
 ## Still open
 
