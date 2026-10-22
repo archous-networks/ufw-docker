@@ -1,0 +1,85 @@
+name: test
+
+# Unlike most suites, these tests MUTATE THE RUNNER'S FIREWALL. That is safe here
+# only because the runner is ephemeral — never point this at a self-hosted runner
+# you care about.
+#
+# ufw defaults to "allow outgoing", and the Actions agent talks outbound, so
+# enabling a default-deny-incoming firewall does not cut the job off. The suite
+# also calls ufw-rescue in teardown, so a failure cannot wedge the job.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: syntax
+        run: |
+          for f in ufw-docker.sh ufw-rescue tests/netns-probe.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+      - name: shellcheck (advisory)
+        run: shellcheck -S warning ufw-docker.sh ufw-rescue tests/netns-probe.sh || true
+
+  bats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ufw and bats
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw bats
+          bats --version
+
+      - name: Install ufw-rescue
+        # Installed BEFORE anything else so the suite's teardown can always reach
+        # it, including when a test fails early.
+        run: sudo install -m 0755 ufw-rescue /usr/local/sbin/ufw-rescue
+
+      - name: Bring up a published container to filter
+        # The suite needs something listening behind a Docker-published port. Port
+        # 8089 matches the port the tests probe.
+        run: |
+          docker run -d --name testsvc -p 8089:80 nginx:alpine
+          sleep 3
+          curl -sS -o /dev/null -w 'local probe: %{http_code}\n' http://127.0.0.1:8089/
+
+      - name: Allow SSH and enable ufw
+        # The suite asserts on an SSH rule as the canary for a half-built firewall,
+        # so one must exist before it starts.
+        run: |
+          sudo ufw allow 22/tcp
+          sudo ufw --force enable
+          sudo ufw status verbose
+
+      - name: Run the suite
+        env:
+          # The runner's own primary address — what the netns probe targets.
+          HOST_IP: ""
+        run: |
+          HOST_IP=$(ip -4 -br addr show scope global | awk 'NR==1{print $3}' | cut -d/ -f1)
+          echo "probing $HOST_IP"
+          sudo HOST_IP="$HOST_IP" bats --tap tests/ufw-docker.bats
+
+      - name: Firewall state on failure
+        if: failure()
+        run: |
+          sudo ufw status verbose || true
+          sudo iptables -S DOCKER-USER || true
+          sudo iptables -S ufw-user-input || true
+          sudo iptables -S | grep -cE '^-N ufw.*logging' || true
+
+      - name: Always leave the runner sane
+        if: always()
+        run: sudo /usr/local/sbin/ufw-rescue || true

@@ -1,0 +1,132 @@
+#!/usr/bin/env bats
+#
+# These tests MUTATE THE LIVE FIREWALL of the machine they run on. Run them on a
+# disposable VM or in CI, never on anything you care about.
+#
+# teardown_file always runs ufw-rescue, so a failing test cannot leave the host
+# unreachable -- that is the single most important property of this suite.
+
+REPO="${BATS_TEST_DIRNAME}/.."
+HOST_IP="${HOST_IP:?set HOST_IP to the primary address of this host}"
+
+probe()  { sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" get "$1" "${2:-http}"; }
+health() { sudo iptables -S ufw-user-input 2>/dev/null; }
+logchains() { sudo iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging'; }
+ssh_rule()  { sudo iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22'; }
+jumps()     { sudo iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input'; }
+active()    { sudo ufw status 2>/dev/null | grep -c 'Status: active'; }
+
+setup_file() {
+    sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" up
+    # A rule we can prove host-level filtering with, independent of Docker.
+    sudo ufw allow 22/tcp >/dev/null 2>&1
+    sudo "$REPO/ufw-docker.sh" install >/dev/null 2>&1
+}
+
+teardown_file() {
+    sudo "$REPO/ufw-docker.sh" remove >/dev/null 2>&1 || true
+    # setup_file added a blanket SSH allow for the host-level test; leaving it
+    # behind would quietly widen the operator's SSH exposure after a test run.
+    sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
+    sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" down || true
+    # Non-negotiable: never leave a broken firewall behind.
+    sudo /usr/local/sbin/ufw-rescue >/dev/null 2>&1 || true
+}
+
+@test "install wires DOCKER-USER into ufw-user-input" {
+    [ "$(jumps)" -gt 0 ]
+}
+
+@test "install leaves ufw healthy" {
+    [ "$(active)" -eq 1 ]
+    [ "$(logchains)" -ge 9 ]
+    [ "$(ssh_rule)" -gt 0 ]
+}
+
+@test "before.init hook is installed (required for reload safety)" {
+    sudo test -x /etc/ufw/before.init
+    sudo grep -q 'ufw-docker' /etc/ufw/before.init
+}
+
+@test "a Docker-published port with no ufw rule is BLOCKED" {
+    sudo ufw delete allow 8089/tcp >/dev/null 2>&1 || true
+    sudo ufw delete deny  8089/tcp >/dev/null 2>&1 || true
+    sudo ufw reload >/dev/null 2>&1
+    [ "$(probe 8089)" = "000" ]
+}
+
+@test "ufw allow opens a Docker-published port" {
+    sudo ufw allow 8089/tcp >/dev/null 2>&1
+    [ "$(probe 8089)" != "000" ]
+}
+
+@test "ufw deny closes a Docker-published port" {
+    sudo ufw delete allow 8089/tcp >/dev/null 2>&1
+    sudo ufw deny 8089/tcp >/dev/null 2>&1
+    [ "$(probe 8089)" = "000" ]
+    sudo ufw delete deny 8089/tcp >/dev/null 2>&1
+}
+
+@test "source-restricted allow is honoured" {
+    sudo ufw allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
+    [ "$(probe 8089)" != "000" ]
+    sudo ufw delete allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
+    sudo ufw reload >/dev/null 2>&1
+    [ "$(probe 8089)" = "000" ]
+}
+
+@test "REGRESSION: repeated ufw reload does not break the firewall" {
+    # Without before.init this fails on reload #2: ufw aborts half-built,
+    # ufw-user-input ends up EMPTY, and the SSH allow silently disappears.
+    for _ in 1 2 3 4 5; do sudo ufw reload >/dev/null 2>&1; done
+    [ "$(active)" -eq 1 ]
+    [ "$(logchains)" -ge 9 ]
+    [ "$(ssh_rule)" -gt 0 ]
+    [ "$(jumps)" -gt 0 ]
+}
+
+@test "REGRESSION: reload does not duplicate DOCKER-USER rules" {
+    local before after
+    before=$(sudo iptables -S DOCKER-USER | wc -l)
+    sudo ufw reload >/dev/null 2>&1
+    after=$(sudo iptables -S DOCKER-USER | wc -l)
+    [ "$before" -eq "$after" ]
+}
+
+@test "ufw disable then enable restores the wiring" {
+    sudo ufw --force disable >/dev/null 2>&1
+    sudo ufw --force enable  >/dev/null 2>&1
+    [ "$(active)" -eq 1 ]
+    [ "$(jumps)" -gt 0 ]
+    [ "$(ssh_rule)" -gt 0 ]
+}
+
+@test "rules survive a container recreate" {
+    [ -d /home/unms/app ] || skip "no UISP install here"
+    ( cd /home/unms/app && sudo -u unms docker compose -p unms up -d --force-recreate ucrm >/dev/null 2>&1 )
+    sleep 8
+    [ "$(jumps)" -gt 0 ]
+}
+
+@test "rules survive a Docker daemon restart" {
+    sudo systemctl restart docker
+    sleep 20
+    [ "$(jumps)" -gt 0 ]
+    [ "$(ssh_rule)" -gt 0 ]
+}
+
+@test "host-level INPUT filtering still works independently" {
+    # The whole point: wiring FORWARD in must not change host behaviour.
+    sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
+    sudo ufw reload >/dev/null 2>&1
+    run sudo ip netns exec ufwprobe timeout 4 bash -c "exec 3<>/dev/tcp/${HOST_IP}/22"
+    [ "$status" -ne 0 ]      # refused: no allow rule for this source
+    sudo ufw allow 22/tcp >/dev/null 2>&1
+}
+
+@test "remove returns DOCKER-USER to stock" {
+    sudo "$REPO/ufw-docker.sh" remove >/dev/null 2>&1
+    [ "$(jumps)" -eq 0 ]
+    [ "$(active)" -eq 1 ]
+    [ "$(ssh_rule)" -gt 0 ]
+}
