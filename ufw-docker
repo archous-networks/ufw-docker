@@ -2,9 +2,16 @@
 #
 # ufw-docker — make plain `ufw allow/deny` actually govern Docker-published ports.
 #
-#   ufw-docker install    wire ufw into Docker's DOCKER-USER chain
-#   ufw-docker remove     undo it
-#   ufw-docker status     report what is wired and whether it is healthy
+#   ufw-docker install         wire ufw into Docker's DOCKER-USER chain
+#   ufw-docker install --with-selfheal
+#                              ...and enable a boot-time repair service
+#   ufw-docker remove          preview the undo; --force to actually do it
+#   ufw-docker remove --force --include-backups
+#                              ...and delete old backups/rescue snapshots too
+#   ufw-docker status          report what is wired and whether it is healthy
+#   ufw-docker rescue          get SSH back and rebuild ufw after a bad state
+#   ufw-docker rescue --open   emergency: firewall OFF, you are definitely back in
+
 #
 # Docker publishes ports by DNAT in PREROUTING and then FORWARDs them, while ufw
 # filters INPUT. Forwarded traffic never traverses INPUT, so `ufw deny 443` has
@@ -25,6 +32,67 @@ head_(){ printf '\n%s\n' "$*"; }
 die()  { bad "$*"; exit 1; }
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0 $*)"; }
+
+# Keep a few backups, not every one ever made. Twelve accumulated on the dev box
+# before anyone noticed; a backup nobody prunes is just litter in /etc.
+KEEP_BACKUPS=3
+prune_backups() {   # $1 = glob prefix
+    local n; n=$(ls -1t "$1"* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | wc -l)
+    [ "$n" -gt 0 ] || return 0
+    ls -1t "$1"* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r f; do rm -rf "$f"; done
+    say "pruned $n old backup(s), keeping the newest $KEEP_BACKUPS"
+}
+
+# ── self-heal unit (opt-in) ────────────────────────────────────────────────
+# Boot ordering between ufw and docker is the one thing this design cannot fully
+# control, and its failure mode is the worst one: ufw comes up without an SSH
+# rule and nobody can log in to fix it.
+#
+# OPT-IN on purpose. It is a systemd unit that runs a destructive repair
+# unattended at boot. That is a fair trade against a lockout, but it is the
+# operator's trade to make, not ours to assume.
+SELFHEAL_UNIT=/etc/systemd/system/ufw-docker-selfheal.service
+
+install_selfheal() {
+    cat > "$SELFHEAL_UNIT" <<'UNIT'
+[Unit]
+Description=Repair ufw if it came up half-built (ufw + Docker integration)
+After=ufw.service docker.service
+Wants=ufw.service
+
+[Service]
+# The check is deliberately narrow -- "is there an SSH rule in ufw-user-input" --
+# because that is the single symptom that locks people out. A broader health
+# check would risk running a destructive rebuild over a merely unusual state.
+Type=oneshot
+ExecStart=/bin/sh -c 'sleep 20; \
+  if ! /sbin/iptables -S ufw-user-input 2>/dev/null | grep -q "dport 22"; then \
+    logger -t ufw-docker-selfheal "ufw came up without an SSH rule - running rescue"; \
+    /usr/local/sbin/ufw-docker rescue >/var/log/ufw-docker-selfheal.log 2>&1; \
+  else \
+    logger -t ufw-docker-selfheal "ufw healthy at boot"; \
+  fi'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable ufw-docker-selfheal.service >/dev/null 2>&1 \
+        && ok "self-heal service installed and enabled" \
+        || warn "self-heal service written but could not be enabled"
+
+    [ -x /usr/local/sbin/ufw-docker ] \
+        || warn "the unit calls /usr/local/sbin/ufw-docker, which is not installed there yet"
+}
+
+remove_selfheal() {
+    [ -f "$SELFHEAL_UNIT" ] || return 0
+    systemctl disable --now ufw-docker-selfheal.service >/dev/null 2>&1
+    rm -f "$SELFHEAL_UNIT"
+    systemctl daemon-reload 2>/dev/null
+    ok "self-heal service removed"
+}
 
 # Docker subnets, per address family. Derived at install time rather than
 # hardcoding 172.16/12: a user-defined network can sit on 10.x or 192.168.x, and
@@ -111,6 +179,15 @@ cmd_install() {
     command -v docker >/dev/null || die "docker is not installed"
     command -v ufw    >/dev/null || die "ufw is not installed"
 
+    local with_selfheal=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --with-selfheal) with_selfheal=1 ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+
     head_ "ufw-docker install"
 
     local v4 v6 wrote=0
@@ -133,6 +210,15 @@ cmd_install() {
 
     [ "$wrote" -eq 1 ] || die "no Docker subnets found — nothing to wire"
 
+    prune_backups /etc/ufw/after.rules.ufw-docker-bak-
+    prune_backups /etc/ufw/after6.rules.ufw-docker-bak-
+
+    if [ "$with_selfheal" -eq 1 ]; then
+        install_selfheal
+    else
+        say "self-heal service not installed (pass --with-selfheal to enable it)"
+    fi
+
     head_ "applying"
     ufw reload 2>&1 | sed 's/^/  /'
     cmd_status
@@ -140,14 +226,92 @@ cmd_install() {
 
 cmd_remove() {
     require_root remove
+
+    local force=0 wipe=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f)        force=1 ;;
+            --include-backups) wipe=1 ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    # Gated behind --force on purpose. These files are the only way back if this
+    # removal itself goes wrong, and the rescue snapshots are incident forensics.
+    # Losing either to a stray flag on a dry run would be a bad trade.
+    [ "$wipe" -eq 1 ] && [ "$force" -eq 0 ] \
+        && die "--include-backups is destructive; pass --force as well"
+
     head_ "ufw-docker remove"
+
+    # Show the consequence BEFORE asking, not after. The dangerous part of this
+    # operation is not the files it deletes -- it is that the operator's DENY
+    # rules quietly stop protecting container ports while `ufw status` keeps
+    # printing them unchanged.
+    say "WOULD REMOVE:"
+    say "  - the DOCKER-UFW stanza from after.rules / after6.rules"
+    say "  - our before.init hook (the original is restored if there was one)"
+    say "  - the self-heal systemd unit, if installed"
+    say "  - every DOCKER-USER rule, leaving Docker's own single RETURN"
+    say ""
+    local nbak nsnap
+    nbak=$(ls -1 /etc/ufw/after*.rules.ufw-docker-bak-* 2>/dev/null | wc -l)
+    nsnap=$(ls -1d /var/backups/ufw-rescue-* 2>/dev/null | wc -l)
+
+    if [ "$wipe" -eq 1 ]; then
+        [ "${nbak:-0}"  -gt 0 ] && say "  - $nbak existing after.rules backup(s) in /etc/ufw"
+        [ "${nsnap:-0}" -gt 0 ] && say "  - $nsnap rescue snapshot(s) in /var/backups"
+    fi
+    say ""
+    say "WOULD LEAVE:"
+    say "  - all of your ufw rules, untouched"
+    say "  - a fresh backup of after.rules, taken before anything is changed"
+    if [ "$wipe" -eq 0 ]; then
+        [ "${nbak:-0}"  -gt 0 ] && say "  - $nbak older after.rules backup(s)  (--include-backups to delete)"
+        [ "${nsnap:-0}" -gt 0 ] && say "  - $nsnap rescue snapshot(s)           (--include-backups to delete)"
+    fi
+    say ""
+    warn "after this, your ufw rules will NO LONGER affect Docker-published ports."
+    local denies; denies=$(ufw status 2>/dev/null | grep -ciE '^[0-9].*DENY' || true)
+    if [ "${denies:-0}" -gt 0 ]; then
+        warn "these $denies DENY rule(s) will stop closing container ports:"
+        ufw status 2>/dev/null | grep -iE '^[0-9].*DENY' | sed 's/^/      /'
+    fi
+    say ""
+
+    # No prompt. Without --force this is a dry run: it reports exactly what it
+    # WOULD do and changes nothing. That behaves identically at a console and in
+    # a script, needs no tty, and makes the preview above useful on its own --
+    # whereas a y/N prompt is both skippable by habit and awkward to automate.
+    if [ "$force" -eq 0 ]; then
+        say "nothing has been changed."
+        say "re-run with --force to go ahead:"
+        say "    sudo ufw-docker remove --force"
+        return 0
+    fi
+
+    # Back up BEFORE modifying, exactly as install does. Without this, a bad
+    # strip would leave no way back to the working after.rules.
+    local keep; keep="/etc/ufw/after.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
+    cp -a /etc/ufw/after.rules "$keep"
+    say "backed up after.rules -> $(basename "$keep")"
+
     strip_stanza /etc/ufw/after.rules  && ok "IPv4 stanza removed"
     strip_stanza /etc/ufw/after6.rules && ok "IPv6 stanza removed"
+    # Restore the original if we have one; otherwise still strip OUR hook rather
+    # than leaving it behind. Relying on a backup existing meant that on a host
+    # with no original before.init, our hook survived `remove` uninvited.
     if [ -f /etc/ufw/before.init.ufw-docker-backup ]; then
         mv /etc/ufw/before.init.ufw-docker-backup /etc/ufw/before.init
         chmod 0640 /etc/ufw/before.init
         ok "before.init restored to its original"
+    elif grep -q 'ufw-docker' /etc/ufw/before.init 2>/dev/null; then
+        rm -f /etc/ufw/before.init
+        ok "before.init hook removed (there was no original to restore)"
     fi
+
+    remove_selfheal
     for ipt in iptables ip6tables; do
         "$ipt" -S DOCKER-USER >/dev/null 2>&1 || continue
         "$ipt" -F DOCKER-USER 2>/dev/null; "$ipt" -A DOCKER-USER -j RETURN 2>/dev/null
@@ -155,6 +319,25 @@ cmd_remove() {
     ok "DOCKER-USER reset to stock"
     ufw reload 2>&1 | sed 's/^/  /'
     cmd_status || true
+
+    if [ "$wipe" -eq 1 ]; then
+        # Everything except the backup this run just took.
+        local n=0
+        for f in /etc/ufw/after*.rules.ufw-docker-bak-*; do
+            [ -e "$f" ] || continue
+            [ "$f" = "$keep" ] && continue
+            rm -f "$f" && n=$((n + 1))
+        done
+        for d in /var/backups/ufw-rescue-*; do
+            [ -e "$d" ] || continue
+            rm -rf "$d" && n=$((n + 1))
+        done
+        ok "deleted $n backup(s)/snapshot(s); kept $(basename "$keep")"
+    fi
+
+    head_ "done"
+    say "your ufw rules still apply to services on the HOST, unchanged."
+    warn "they no longer affect Docker-published ports."
 }
 
 cmd_status() {
@@ -203,8 +386,187 @@ cmd_status() {
     return $rc
 }
 
+
+# ── rescue ─────────────────────────────────────────────────────────────────
+# Deliberately different discipline from the rest of this file: NO `set -e`
+# behaviour is relied on, every step is independent, and SSH is restored before
+# any cleanup. A rescue path must push through failures, not abort on the first.
+#
+# Lives in the same file on purpose. Two files meant someone could install the
+# tool and skip the rescue, which is the realistic failure -- more likely than a
+# syntax error getting past `bash -n` and CI. One file cannot be half-installed.
+cmd_rescue() {
+    require_root rescue
+    local MODE="restore"
+    [ "${1:-}" = "--open" ] && MODE="open"
+
+    STAMP="$(date +%Y%m%d%H%M%S)"
+    BACKUP="/var/backups/ufw-rescue-${STAMP}"
+    mkdir -p "$BACKUP"
+
+    head_ "ufw-docker rescue (${MODE})"
+    say "forensic snapshot: $BACKUP"
+    iptables-save  > "$BACKUP/iptables.v4"  2>/dev/null
+    ip6tables-save > "$BACKUP/iptables.v6"  2>/dev/null
+    cp -a /etc/ufw/after.rules  "$BACKUP/" 2>/dev/null
+    cp -a /etc/ufw/after6.rules "$BACKUP/" 2>/dev/null
+    cp -a /etc/ufw/user.rules   "$BACKUP/" 2>/dev/null
+
+    # ── 1. SSH FIRST ───────────────────────────────────────────────────────────
+    # Before touching anything else. A blanket accept at the top of INPUT works no
+    # matter what state ufw's chains are in, and survives the cleanup below.
+    head_ "1. restoring SSH"
+    iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT 2>/dev/null
+    if iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null; then
+        ok "temporary blanket ACCEPT on tcp/22 is in place"
+        say "(removed at the end if ufw comes back healthy with its own SSH rule)"
+    else
+        bad "could not insert the SSH rule — is iptables working at all?"
+    fi
+
+    if [ "$MODE" = "open" ]; then
+        head_ "2. emergency: taking the firewall down"
+        ufw --force disable >/dev/null 2>&1
+        for t in INPUT FORWARD OUTPUT; do iptables -P "$t" ACCEPT 2>/dev/null; done
+        ok "ufw disabled; INPUT/FORWARD/OUTPUT policies set to ACCEPT"
+        warn "THIS HOST IS NOW UNFILTERED. Re-run 'ufw-docker rescue' without --open"
+        warn "once you have access, to rebuild a working firewall."
+        return 0
+    fi
+
+    # ── 2. remove our Docker stanza ────────────────────────────────────────────
+    head_ "2. removing the DOCKER-UFW stanza"
+    for f in /etc/ufw/after.rules /etc/ufw/after6.rules; do
+        [ -f "$f" ] || continue
+        if grep -qF 'BEGIN DOCKER-UFW' "$f" 2>/dev/null; then
+            sed -i '/# BEGIN DOCKER-UFW/,/# END DOCKER-UFW/d' "$f"
+            ok "stripped from $f"
+        else
+            say "not present in $f"
+        fi
+    done
+
+    # ── 3. release references to ufw's chains ──────────────────────────────────
+    # This is the step that actually unblocks ufw. While DOCKER-USER still jumps to
+    # ufw-user-input, iptables refuses to delete that chain, ufw's rebuild fails
+    # part-way, and the firewall is left inconsistent.
+    head_ "3. returning DOCKER-USER to stock"
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null || continue
+        if "$ipt" -S DOCKER-USER >/dev/null 2>&1; then
+            "$ipt" -F DOCKER-USER 2>/dev/null
+            "$ipt" -A DOCKER-USER -j RETURN 2>/dev/null
+            ok "$ipt: DOCKER-USER reset to a single RETURN"
+        fi
+    done
+
+    # ── 3b. nft fallback ───────────────────────────────────────────────────────
+    # Observed for real after a test run: ufw-user-input ended up expressed in
+    # NATIVE nft syntax (`tcp dport 22 accept`, without the `meta l4proto tcp`
+    # prefix iptables-nft emits). The compat layer then refuses to touch it --
+    #   iptables: chain `ufw-user-input' in table `filter' is incompatible, use 'nft'
+    # -- so every iptables -F/-X above silently does nothing, ufw cannot rebuild,
+    # and the firewall stays broken. The only way out is to clear the chains at the
+    # nft level, which also means removing the base-chain jumps that reference them.
+    head_ "3b. checking for nft-incompatible chains"
+    if command -v nft >/dev/null 2>&1; then
+        # Match the SPECIFIC error. An absent chain also makes iptables fail, and
+        # treating that as incompatibility sent this down the nft path on a healthy
+        # host -- a rescue script must not take drastic action on a false positive.
+        if iptables -S ufw-user-input 2>&1 | grep -q 'incompatible'; then
+            warn "ufw chains are not readable by iptables; clearing them with nft"
+            for base in INPUT FORWARD OUTPUT; do
+                while :; do
+                    h=$(nft -a list chain ip filter "$base" 2>/dev/null \
+                        | grep -E 'jump ufw' | grep -oE 'handle [0-9]+' | head -1 | awk '{print $2}')
+                    [ -n "$h" ] || break
+                    nft delete rule ip filter "$base" handle "$h" 2>/dev/null || break
+                done
+            done
+            for c in $(nft list table ip filter 2>/dev/null | grep -oE 'chain ufw[A-Za-z0-9_-]*' | awk '{print $2}'); do
+                nft flush chain ip filter "$c" 2>/dev/null
+            done
+            for c in $(nft list table ip filter 2>/dev/null | grep -oE 'chain ufw[A-Za-z0-9_-]*' | awk '{print $2}'); do
+                nft delete chain ip filter "$c" 2>/dev/null
+            done
+            LEFT=$(nft list table ip filter 2>/dev/null | grep -c 'chain ufw')
+            [ "$LEFT" -eq 0 ] && ok "nft: ufw chains cleared" \
+                              || warn "nft: $LEFT ufw chain(s) remain"
+        else
+            say "iptables can read ufw's chains — no nft cleanup needed"
+        fi
+    else
+        say "nft not available — skipping"
+    fi
+
+    # ── 4. tear ufw down to nothing ────────────────────────────────────────────
+    head_ "4. tearing ufw down"
+    ufw --force disable >/dev/null 2>&1
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null || continue
+        CHAINS=$("$ipt" -S 2>/dev/null | grep -oE '^-N ufw[A-Za-z0-9_-]*' | awk '{print $2}')
+        for c in $CHAINS; do "$ipt" -F "$c" 2>/dev/null; done
+        for c in $CHAINS; do "$ipt" -X "$c" 2>/dev/null; done
+        # Chains still referenced by the builtin INPUT/FORWARD/OUTPUT jumps cannot
+        # be deleted ("CHAIN_DEL failed (Device or resource busy)"), and ufw does
+        # not remove those jumps on disable. That is FINE -- `ufw enable` flushes
+        # and reuses them. What actually matters is that they are EMPTY, so no stale
+        # rule survives the rebuild. Reporting the leftover count as a problem was a
+        # false alarm, which is the last thing a rescue script should produce.
+        LEFT=$("$ipt" -S 2>/dev/null | grep -cE '^-N ufw')
+        STALE=$("$ipt" -S 2>/dev/null | grep -cE '^-A ufw')
+        if [ "$STALE" -eq 0 ]; then
+            ok "$ipt: ufw chains emptied ($LEFT skeleton chain(s) kept, reused on rebuild)"
+        else
+            warn "$ipt: $STALE rule(s) still in ufw chains after flush"
+        fi
+    done
+
+    # ── 5. rebuild from ufw's own config ───────────────────────────────────────
+    # user.rules is untouched by any of the above, so the operator's real rules --
+    # including their SSH allow -- come back exactly as they were.
+    head_ "5. rebuilding ufw"
+    if ufw --force enable 2>&1 | sed 's/^/  /'; then :; fi
+
+    # ── 6. verify ──────────────────────────────────────────────────────────────
+    head_ "6. verification"
+    RC=0
+    ufw status >/dev/null 2>&1 && ufw status | grep -q 'Status: active' \
+      && ok "ufw is active" || { bad "ufw is NOT active"; RC=1; }
+
+    LOGCHAINS=$(iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging')
+    [ "$LOGCHAINS" -ge 9 ] && ok "logging chains complete ($LOGCHAINS)" \
+      || { bad "only $LOGCHAINS logging chains — ufw is still half-built"; RC=1; }
+
+    SSHRULES=$(iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22')
+    if [ "$SSHRULES" -gt 0 ]; then
+        ok "ufw has its own SSH rule back:"
+        iptables -S ufw-user-input | grep 'dport 22' | sed 's/^/      /'
+        iptables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null \
+          && say "removed the temporary blanket ACCEPT"
+    else
+        warn "ufw has NO SSH rule — leaving the blanket tcp/22 ACCEPT in place"
+        warn "add one with: ufw allow from <your-ip> to any port 22 proto tcp"
+        RC=1
+    fi
+
+    head_ "result"
+    if [ "$RC" -eq 0 ]; then
+        ok "firewall restored and verified"
+    else
+        bad "restore incomplete — SSH should still work, but check the above"
+        say "if you are still locked out, run: ufw-docker rescue --open"
+    fi
+    say "snapshot of the broken state kept at: $BACKUP"
+    prune_backups /var/backups/ufw-rescue-
+    return $RC
+
+}
+
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
+    rescue)  shift; cmd_rescue "$@" ;;
     remove|uninstall) shift; cmd_remove "$@" ;;
     status)  shift; cmd_status "$@" ;;
     *) sed -n '2,14p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit 1 ;;

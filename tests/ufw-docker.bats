@@ -3,7 +3,7 @@
 # These tests MUTATE THE LIVE FIREWALL of the machine they run on. Run them on a
 # disposable VM or in CI, never on anything you care about.
 #
-# teardown_file always runs ufw-rescue, so a failing test cannot leave the host
+# teardown_file always runs `ufw-docker rescue`, so a failing test cannot leave the host
 # unreachable -- that is the single most important property of this suite.
 
 REPO="${BATS_TEST_DIRNAME}/.."
@@ -24,13 +24,13 @@ setup_file() {
 }
 
 teardown_file() {
-    sudo "$REPO/ufw-docker" remove >/dev/null 2>&1 || true
+    sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1 || true
     # setup_file added a blanket SSH allow for the host-level test; leaving it
     # behind would quietly widen the operator's SSH exposure after a test run.
     sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" down || true
     # Non-negotiable: never leave a broken firewall behind.
-    sudo /usr/local/sbin/ufw-rescue >/dev/null 2>&1 || true
+    sudo "$REPO/ufw-docker" rescue >/dev/null 2>&1 || true
 }
 
 @test "install wires DOCKER-USER into ufw-user-input" {
@@ -133,8 +133,15 @@ teardown_file() {
 }
 
 @test "rules survive a Docker daemon restart" {
+    # Poll rather than sleeping a fixed 20s. A single sample after an async
+    # operation is a coin flip -- this test failed once that way while 100
+    # samples at 0.5s across a real restart never saw the rules missing.
     sudo systemctl restart docker
-    sleep 20
+    local i
+    for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && [ "$(jumps)" -gt 0 ] && break
+        sleep 2
+    done
     [ "$(jumps)" -gt 0 ]
     [ "$(ssh_rule)" -gt 0 ]
 }
@@ -149,7 +156,7 @@ teardown_file() {
 }
 
 @test "remove returns DOCKER-USER to stock" {
-    sudo "$REPO/ufw-docker" remove >/dev/null 2>&1
+    sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
     [ "$(jumps)" -eq 0 ]
     [ "$(active)" -eq 1 ]
     [ "$(ssh_rule)" -gt 0 ]

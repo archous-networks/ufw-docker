@@ -73,30 +73,19 @@ container ports behave per their own rules.
 
 ## Install
 
-**Install the rescue script first.** Especially on a remote host — it is what gets you
-back in if anything goes wrong.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-rescue \
-  | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-rescue
-```
-
-Then the tool itself:
+One file, one line:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-docker \
   | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-docker
 ```
 
-Those two files are everything — there is nothing else to clone.
-
 > **You are piping a script into `sudo`.** That is convenient and it is also exactly the
-> pattern you should be suspicious of, particularly for something that rewrites your
-> firewall. Read them first if that matters to you:
+> pattern to be suspicious of, particularly for something that rewrites your firewall.
+> Read it first if that matters to you — it is plain shell with no dependencies:
 > ```bash
-> curl -fsSL .../ufw-rescue | less
+> curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-docker | less
 > ```
-> Both are a few hundred lines of plain shell with no dependencies.
 
 Wire it up:
 
@@ -104,6 +93,20 @@ Wire it up:
 sudo ufw-docker install
 sudo ufw-docker status
 ```
+
+### Optional: survive a bad boot
+
+```bash
+sudo ufw-docker install --with-selfheal
+```
+
+Boot ordering between `ufw` and `docker` is the one thing this cannot fully control, and
+its failure mode is the worst one — ufw comes up without its SSH rule and nobody can log
+in to fix it. `--with-selfheal` installs a systemd unit that checks 20s after boot and
+runs `rescue` if the SSH rule is missing.
+
+It is **opt-in** because it runs a destructive repair unattended. That is a fair trade
+against a lockout, but it is yours to make. `remove` deletes it either way.
 
 Then use ufw exactly as you always have:
 
@@ -113,19 +116,54 @@ sudo ufw deny 8089/tcp
 sudo ufw allow from 10.0.0.0/8 to any port 8089 proto tcp
 ```
 
-Undo with `sudo ufw-docker remove`.
+### Undoing it
+
+```bash
+sudo ufw-docker remove            # preview — changes nothing
+sudo ufw-docker remove --force    # actually do it
+```
+
+Without `--force` it reports what it *would* do and exits. No prompt: that behaves the
+same at a console and in a script, and the preview is useful on its own.
+
+```
+WOULD REMOVE:
+  - the DOCKER-UFW stanza from after.rules / after6.rules
+  - our before.init hook (the original is restored if there was one)
+  - the self-heal systemd unit, if installed
+  - every DOCKER-USER rule, leaving Docker's own single RETURN
+
+WOULD LEAVE:
+  - all of your ufw rules, untouched
+  - 6 after.rules backup(s) in /etc/ufw
+  - 11 rescue snapshot(s) in /var/backups
+
+after this, your ufw rules will NO LONGER affect Docker-published ports.
+these 2 DENY rule(s) will stop closing container ports:
+    8089/tcp    DENY    Anywhere
+```
+
+That last part is the reason the preview exists. Your rules are never touched — but they
+quietly stop reaching containers while `ufw status` prints them exactly as before. A
+`deny` that stopped protecting something is the worst thing to leave someone holding.
 
 ## If something breaks
 
 From the console:
 
 ```bash
-sudo ufw-rescue          # strip the stanza, rebuild ufw, verify
-sudo ufw-rescue --open   # last resort: firewall OFF, you are definitely back in
+sudo ufw-docker rescue
+sudo ufw-docker rescue --open   # last resort: firewall OFF, you are definitely back in
 ```
 
-It restores SSH **first**, before any cleanup, and keeps a snapshot of the broken state
-in `/var/backups/ufw-rescue-<timestamp>/`.
+It restores SSH **first**, before any cleanup, then rebuilds ufw from its own
+`user.rules` — so your real rules come back exactly as they were. A snapshot of the
+broken state is kept in `/var/backups/ufw-rescue-<timestamp>/`.
+
+**Why rescue lives in the same file.** It was a separate script at first, which is tidier
+in theory: a rescue tool should not share fate with the thing it rescues. In practice the
+likelier failure is someone installing the tool and skipping the rescue — and one file
+cannot be half-installed.
 
 ## Two things that will bite you
 
@@ -165,12 +203,34 @@ ufw 0.36.2, Docker 28.x, nftables-backed iptables 1.8.9.
 
 ```bash
 sudo apt-get install -y bats
-sudo HOST_IP=<this host's ip> bats tests/ufw-docker.bats
+sudo HOST_IP=<this host's address> tests/run.sh
 ```
 
-**These tests mutate the live firewall.** Run them on a disposable VM or in CI, never on
-anything you care about. `teardown_file` always calls `ufw-rescue`, so a failing test
-cannot leave the host unreachable.
+Use `tests/run.sh`, not `bats` directly — it takes a lock and restores the firewall on
+any exit.
+
+> ### ⚠️ These tests mutate the live firewall
+>
+> Run them on a **disposable VM or in CI**, never on a host you care about. They enable
+> and disable ufw, rewrite `/etc/ufw/*.rules`, restart the Docker daemon, and recreate
+> containers.
+
+Two rules, both learned by breaking a host during development:
+
+**1. Nothing else may touch the firewall while they run.** Not another test run, not a
+manual `ufw-docker install`, not an `ufw` command in another shell. A suite's teardown
+will strip configuration out from under you, and the result looks exactly like a
+reproducible bug that is not there. `tests/run.sh` takes `/var/lock/ufw-docker-tests` so a
+second run refuses to start.
+
+**2. Do not kill the run.** bats' `teardown_file` does not fire on SIGINT/SIGTERM, so a
+Ctrl-C leaves ufw half-built — no SSH rule, chains missing. `tests/run.sh` traps
+`EXIT INT TERM` and runs `rescue` regardless. If a run is killed in a way that escapes
+even that (`SIGKILL`, power loss):
+
+```bash
+sudo ufw-docker rescue
+```
 
 ## License
 

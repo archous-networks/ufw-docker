@@ -6,7 +6,7 @@ name: test
 #
 # ufw defaults to "allow outgoing", and the Actions agent talks outbound, so
 # enabling a default-deny-incoming firewall does not cut the job off. The suite
-# also calls ufw-rescue in teardown, so a failure cannot wedge the job.
+# also calls `ufw-docker rescue` in teardown, so a failure cannot wedge the job.
 on:
   push:
     branches: [ main ]
@@ -24,11 +24,11 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker ufw-rescue tests/netns-probe.sh; do
+          for f in ufw-docker tests/netns-probe.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: shellcheck (advisory)
-        run: shellcheck -S warning ufw-docker ufw-rescue tests/netns-probe.sh || true
+        run: shellcheck -S warning ufw-docker tests/netns-probe.sh || true
 
   bats:
     runs-on: ubuntu-latest
@@ -42,10 +42,10 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw bats
           bats --version
 
-      - name: Install ufw-rescue
-        # Installed BEFORE anything else so the suite's teardown can always reach
+      - name: Install ufw-docker
+        # Installed BEFORE anything else so the suite teardown can always reach
         # it, including when a test fails early.
-        run: sudo install -m 0755 ufw-rescue /usr/local/sbin/ufw-rescue
+        run: sudo install -m 0755 ufw-docker /usr/local/sbin/ufw-docker
 
       - name: Bring up a published container to filter
         # The suite needs something listening behind a Docker-published port. Port
@@ -76,7 +76,7 @@ jobs:
         run: |
           HOST_IP=$(ip -4 -br addr show scope global | awk 'NR==1{print $3}' | cut -d/ -f1)
           echo "probing $HOST_IP"
-          sudo HOST_IP="$HOST_IP" bats --tap tests/ufw-docker.bats
+          sudo HOST_IP="$HOST_IP" tests/run.sh --tap
 
       - name: Firewall state on failure
         if: failure()
@@ -88,4 +88,4 @@ jobs:
 
       - name: Always leave the runner sane
         if: always()
-        run: sudo /usr/local/sbin/ufw-rescue || true
+        run: sudo /usr/local/sbin/ufw-docker rescue || true
