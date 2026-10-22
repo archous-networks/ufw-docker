@@ -3,8 +3,8 @@
 # ufw-docker — make plain `ufw allow/deny` actually govern Docker-published ports.
 #
 #   ufw-docker install         wire ufw into Docker's DOCKER-USER chain
-#   ufw-docker install --with-selfheal
-#                              ...and enable a boot-time repair service
+#                              (also enables a boot-time repair service;
+#                               --no-selfheal to skip it)
 #   ufw-docker remove          preview the undo; --force to actually do it
 #   ufw-docker remove --force --include-backups
 #                              ...and delete old backups/rescue snapshots too
@@ -48,9 +48,17 @@ prune_backups() {   # $1 = glob prefix
 # control, and its failure mode is the worst one: ufw comes up without an SSH
 # rule and nobody can log in to fix it.
 #
-# OPT-IN on purpose. It is a systemd unit that runs a destructive repair
-# unattended at boot. That is a fair trade against a lockout, but it is the
-# operator's trade to make, not ours to assume.
+# ON BY DEFAULT, and `--no-selfheal` opts out.
+#
+# This was briefly opt-in, on the reasoning that it is "a destructive repair run
+# unattended". That was wrong: it fires ONLY when ufw came up with no SSH rule at
+# all -- a host that is already unreachable. There is no healthy state it can
+# damage, and the alternative is somebody driving to a console. A default should
+# be the safe one, and here safe means "you can still log in".
+#
+# `--no-selfheal` exists for hosts whose boot-time state is owned by config
+# management or an immutable image, where an unexpected unit is the bigger
+# surprise.
 SELFHEAL_UNIT=/etc/systemd/system/ufw-docker-selfheal.service
 
 install_selfheal() {
@@ -179,10 +187,13 @@ cmd_install() {
     command -v docker >/dev/null || die "docker is not installed"
     command -v ufw    >/dev/null || die "ufw is not installed"
 
-    local with_selfheal=0
+    local selfheal=1
     while [ $# -gt 0 ]; do
         case "$1" in
-            --with-selfheal) with_selfheal=1 ;;
+            --no-selfheal)   selfheal=0 ;;
+            # Accepted and ignored: this was opt-in briefly, and a script that
+            # passes it should keep working rather than die on an unknown flag.
+            --with-selfheal) selfheal=1 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
@@ -213,10 +224,12 @@ cmd_install() {
     prune_backups /etc/ufw/after.rules.ufw-docker-bak-
     prune_backups /etc/ufw/after6.rules.ufw-docker-bak-
 
-    if [ "$with_selfheal" -eq 1 ]; then
+    if [ "$selfheal" -eq 1 ]; then
         install_selfheal
     else
-        say "self-heal service not installed (pass --with-selfheal to enable it)"
+        warn "self-heal service NOT installed (--no-selfheal)"
+        say "  if ufw ever comes up without its SSH rule, this host will need"
+        say "  console access to recover. 'ufw-docker install' restores it."
     fi
 
     head_ "applying"

@@ -232,13 +232,29 @@ stop reaching containers, while `ufw status` prints exactly the same thing eithe
 names the specific DENY rules that just became container-ineffective. Silence there would
 hand someone a firewall they will misread.
 
-## Why self-heal is opt-in
+## Why self-heal is ON by default
 
-It is a systemd unit that runs a destructive repair unattended at boot. Against a lockout
-that is a fair trade — but it is the operator's trade, not ours to assume on their behalf.
-The check is deliberately narrow (is there an SSH rule in `ufw-user-input`) because that is
-the one symptom that locks people out; anything broader risks a rebuild over a merely
-unusual state.
+It shipped opt-in for one commit, argued as "a systemd unit that runs a destructive repair
+unattended at boot — the operator's trade to make". That reasoning was wrong, and the word
+doing the damage was *destructive*.
+
+The unit fires only when this is false:
+
+```sh
+iptables -S ufw-user-input | grep -q "dport 22"
+```
+
+That is a host with **no SSH rule at all** — already unreachable. There is no healthy
+state it can damage, and the alternative is somebody driving to a console. A default
+should be the safe one, and safe here means "you can still log in". The operators most
+exposed to a bad boot are also the least likely to find an opt-in flag.
+
+`--no-selfheal` exists for hosts whose boot-time state is owned by config management or an
+immutable image. `--with-selfheal` is still accepted and ignored, so anything scripted
+against the brief opt-in period keeps working.
+
+The check stays deliberately narrow — one symptom, the one that locks people out. Anything
+broader risks running a rebuild over a merely unusual state.
 
 ## Docker daemon restart: measured, not assumed
 

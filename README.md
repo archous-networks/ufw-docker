@@ -94,27 +94,25 @@ sudo ufw-docker install
 sudo ufw-docker status
 ```
 
-### Optional: survive a bad boot
+### Boot-time self-heal (on by default)
+
+`install` also enables a systemd unit that checks 20 s after boot and runs `rescue` if
+ufw came up without an SSH rule.
+
+Boot ordering between `ufw` and `docker` is the one thing this design cannot fully
+control, and its failure mode is the worst one: ufw starts half-built, the SSH allow is
+missing, and the host needs console access to recover. The unit fires **only** in that
+state — a host that is already unreachable — so there is no healthy configuration it can
+disturb.
+
+Opt out if your boot-time state is owned by config management or an immutable image,
+where an unexpected unit is the bigger surprise:
 
 ```bash
-sudo ufw-docker install --with-selfheal
+sudo ufw-docker install --no-selfheal
 ```
 
-Boot ordering between `ufw` and `docker` is the one thing this cannot fully control, and
-its failure mode is the worst one — ufw comes up without its SSH rule and nobody can log
-in to fix it. `--with-selfheal` installs a systemd unit that checks 20s after boot and
-runs `rescue` if the SSH rule is missing.
-
-It is **opt-in** because it runs a destructive repair unattended. That is a fair trade
-against a lockout, but it is yours to make. `remove` deletes it either way.
-
-Then use ufw exactly as you always have:
-
-```bash
-sudo ufw allow 443/tcp
-sudo ufw deny 8089/tcp
-sudo ufw allow from 10.0.0.0/8 to any port 8089 proto tcp
-```
+`remove` deletes the unit either way.
 
 ### Undoing it
 
