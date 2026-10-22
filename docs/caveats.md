@@ -104,7 +104,29 @@ SUBNET DRIFT — Docker networks not covered by the installed stanza:
 
 Worth running `status` from cron for exactly this reason.
 
-## Swarm, overlay and rootless Docker are untested
+## Swarm is NOT supported — do not assume it works
 
-Overlay/ingress networking and rootless Docker (slirp4netns) take different paths. Nothing
-here is known to work there.
+**Untested, deliberately, and not on the roadmap.** This is a statement of scope, not a
+gap waiting to be filled: an untested claim of support is worse than a stated limitation.
+
+`subnets()` would pick up an overlay network's subnet, so `install` will appear to
+succeed and `status` will report everything wired. That tells you nothing, because Swarm
+does not take the packet path this tool hooks:
+
+| | |
+|---|---|
+| `docker_gwbridge` | external access, bridge-like — *might* behave, untested |
+| `ingress` | published Swarm ports route through the routing mesh with IPVS load balancing, not plain DNAT. `DOCKER-USER` may not sit in that path at all |
+
+So the dangerous outcome is the familiar one: **wired-looking and filtering nothing**, for
+exactly the services you most wanted filtered. `status` cannot detect this and will not
+warn you.
+
+If you need Swarm, verify it yourself on a disposable host with the probe matrix in
+[testing.md](testing.md) before trusting any of it. Treat a pass as evidence about your
+Docker version and topology, not as support.
+
+## Rootless Docker is untested
+
+Rootless Docker uses slirp4netns, not these chains. Almost certainly unsupported; nothing
+here has been run against it.

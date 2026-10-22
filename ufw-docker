@@ -656,6 +656,57 @@ container_rows() {
     done
 }
 
+# A2: the published port does NOT exist by the time DOCKER-USER sees the packet.
+# Docker's DNAT has already rewritten the destination, so a rule naming the
+# published port of a REMAPPED mapping can never match -- and ufw will list it
+# as though it were doing something, which is precisely the failure this tool
+# exists to stop.
+#
+# This detects the mistake rather than preventing it. Preventing it means
+# matching the pre-DNAT port with `-m conntrack --ctorigdstport`, which in turn
+# means generating DOCKER-USER from ufw's rule set and keeping the two in sync:
+# a resident translator rather than a static stanza. The static stanza is what
+# makes this tool auditable and survivable, so the trade is not obviously worth
+# making. Tracked in FUTURE.md.
+remap_rows() {   # name<TAB>published<TAB>container<TAB>proto, remapped only
+    docker ps --format '{{.Names}}' 2>/dev/null | while read -r c; do
+        [ -n "$c" ] || continue
+        docker inspect "$c" --format \
+            '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}} {{$p}}
+{{end}}{{end}}' 2>/dev/null \
+        | while read -r hp cp; do
+            [ -n "$hp" ] && [ -n "$cp" ] || continue
+            local proto="${cp#*/}" port="${cp%%/*}"
+            [ "$hp" = "$port" ] && continue          # 1:1, the rule works as written
+            printf '%s\t%s\t%s\t%s\n' "$c" "$hp" "$port" "$proto"
+        done
+    done
+}
+
+check_remapped_rules() {
+    local rules
+    rules="$(iptables -S ufw-user-input 2>/dev/null; iptables -S ufw-user-forward 2>/dev/null)"
+    [ -n "$rules" ] || return 0
+
+    local name hp cp proto hit=0
+    while IFS="$(printf '\t')" read -r name hp cp proto; do
+        [ -n "$hp" ] || continue
+        printf '%s' "$rules" | grep -qE -- "--dport $hp\\b" || continue
+        # They may already have the right rule too, in which case say nothing.
+        printf '%s' "$rules" | grep -qE -- "--dport $cp\\b" && continue
+        [ "$hit" -eq 0 ] && bad "ufw rules that CANNOT match a container, because the port is remapped:"
+        hit=1
+        say  "    $name publishes $hp -> $cp/$proto, and you have a rule for $hp."
+        say  "      after DNAT the rule must name the CONTAINER port:"
+        say  "        ufw allow $cp/$proto        # not $hp"
+        say  "      (if that rule is for a HOST service on $hp, it is correct as it is)"
+    done <<EOF
+$(remap_rows)
+EOF
+    [ "$hit" -eq 1 ] && return 1
+    return 0
+}
+
 cmd_containers() {
     require_docker containers
     head_ "containers"
@@ -776,6 +827,10 @@ cmd_status() {
     ntot=$(docker ps -q 2>/dev/null | wc -l)
     nstat=$(container_rows | grep -c 'static' || true)
     [ "${ntot:-0}" -gt 0 ] && say "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
+
+    # Loud, not fatal: the rule may legitimately be for a host service on that
+    # same port. Does not set rc -- a confusing rule is the operator's to judge.
+    check_remapped_rules || true
 
     # C3: "are we wired?" is not the question an operator actually has. The
     # question is "which rules decide what reaches my containers?" -- and the

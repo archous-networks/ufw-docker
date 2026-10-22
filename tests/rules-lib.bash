@@ -6,11 +6,13 @@
 # tests/invariant-selftest.sh exercises it against synthetic inputs on every CI
 # run. The bats suite supplies the real rule files; this decides the verdict.
 
-# Ports and addresses the suite owns. Port 80 is deliberately absent: the
+# Ports and addresses the suite owns. Port 443 is here because the remapped-port
+# test publishes 18443:443 and must write a rule for the CONTAINER port to prove
+# the warning can be silenced. Port 80 is deliberately absent: the
 # per-container tests use container port 80, but always with a 172.21.x
 # destination, so the address list covers them. A bare `ufw allow 80/tcp` is
 # therefore flagged, which is correct -- the suite never creates one.
-TEST_PORTS='8089|9100|9200|9300|18080|18090|18443|19100'
+TEST_PORTS='443|8089|9100|9200|9300|18080|18090|18443|19100'
 TEST_ADDRS='-d (172\.21\.|172\.23\.|fd00:dead:beef:)|-s (10\.97\.|10\.98\.|fd00:97:|fd00:99:)'
 
 test_owned() {   # $1 = one rule line

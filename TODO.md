@@ -63,7 +63,14 @@ out, **S2** produces wrong or confusing behaviour, **S3** is ergonomics or polis
   one against a broken firewall (repairs, restricted not blanket, logs what it did), one
   against a healthy firewall (changes nothing — the more dangerous direction, and the one
   that was never covered at all).
-- **Tests** 15 → 37, covering every item above.
+- **A8 closed as OUT OF SCOPE, not fixed.** Swarm is not run anywhere at Archous and is
+  not on the roadmap, so `docs/caveats.md` now states plainly that it is unsupported and
+  explains the trap: `install` will appear to succeed and `status` will report everything
+  wired, because `subnets()` does pick up overlay subnets — while published Swarm ports
+  route through the ingress mesh with IPVS rather than plain DNAT, which `DOCKER-USER`
+  may not sit in at all. Wired-looking and filtering nothing. An untested claim of
+  support is worse than a stated limitation.
+- **Tests** 15 → 38, covering every item above.
 
 ## Fixed while compiling this list
 
@@ -98,7 +105,6 @@ be present in `nft` *and* unreadable by `iptables`.
 | A2 | **Remapped ports need the container port.** Published `8443:443` means `ufw allow 443`, not `8443`, because DNAT runs before FORWARD. Pinned by a test, but still a footgun. Fixing it properly means translating ufw's rules into `DOCKER-USER` with `--ctorigdstport` — a resident translator, not a static stanza. | [verified] | S2 |
 | A3 | **No way to target a container by name.** Rules can target a container's *address* (verified — see `docs/per-container.md`), but iptables matches addresses, not names. Static IPAM addresses make that usable today; tracking a **dynamic** address needs `ipset` plus a `docker events` watcher, i.e. a resident daemon. Not built. | [verified] | S2 |
 | A7 | **`--network host` containers are unaffected** — they use INPUT, not FORWARD. Correct behaviour, nowhere documented, and a reasonable person would expect otherwise. | [verified] | S3 |
-| A8 | **Swarm / overlay networks untested.** `docker_gwbridge` and ingress have their own paths; no idea whether subnet derivation covers them. | [suspected] | S2 |
 | A9 | **Rootless Docker almost certainly unsupported** — it uses slirp4netns, not these chains. Untested, undocumented. | [suspected] | S2 |
 | A10 | **Custom bridge names** (`com.docker.network.bridge.name`) should be fine since we match subnets, not interfaces — but untested. | [suspected] | S3 |
 | A12 | **Origin lockdown to a WAF's egress ranges is untested end to end.** `docs/waf.md` recommends restricting the origin to the WAF's ranges, and the mechanism it rests on (source-restricted allow on a container port) is covered by a test — but the full arrangement has never been stood up against a live Cloudflare or AWS WAF. The ranges are also published lists that rotate, which nothing here tracks. | [unknown] | S2 |

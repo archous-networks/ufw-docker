@@ -634,6 +634,37 @@ teardown_file() {
     reinstall
 }
 
+@test "status names a rule that can never match a remapped container port" {
+    # The A2 footgun, caught rather than merely documented: publish 18443:443,
+    # write `ufw allow 18443`, and ufw lists a rule that cannot possibly match
+    # because DNAT rewrote the port before DOCKER-USER ever saw the packet.
+    # That is this project's own failure mode reappearing one layer up.
+    docker rm -f remaptest >/dev/null 2>&1 || true
+    docker run -d --name remaptest --restart always -p 18443:443 python:3-alpine \
+        python -m http.server 443 >/dev/null 2>&1
+    sleep 5
+    reinstall
+
+    # The wrong rule alone: it must say so, and name the right port.
+    sudo ufw allow 18443/tcp >/dev/null 2>&1
+    run sudo "$REPO/ufw-docker" status
+    echo "$output" | grep -q 'CANNOT match a container'
+    echo "$output" | grep -q 'remaptest publishes 18443 -> 443/tcp'
+    echo "$output" | grep -q 'ufw allow 443/tcp'
+
+    # With the correct rule ALSO present it must go quiet -- a warning that
+    # cannot be silenced by doing the right thing is noise, and noise gets
+    # ignored along with everything else.
+    sudo ufw allow 443/tcp >/dev/null 2>&1
+    run sudo "$REPO/ufw-docker" status
+    ! echo "$output" | grep -q 'CANNOT match a container'
+
+    sudo ufw --force delete allow 18443/tcp >/dev/null 2>&1 || true
+    sudo ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+    docker rm -f remaptest >/dev/null 2>&1 || true
+    reinstall
+}
+
 @test "containers subcommand lists addresses and flags dynamic ones" {
     run sudo "$REPO/ufw-docker" containers
     [ "$status" -eq 0 ]
