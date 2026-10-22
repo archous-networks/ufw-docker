@@ -28,10 +28,23 @@ ufw's own logging chain is populated by a later pass. Declaring it in `after.rul
 we must, to reference it) would **flush it** and silence ufw's own logging entirely. A
 self-contained `ufw-docker-logging-deny` has no such dependency.
 
-### Known divergence
+### It follows `ufw logging`, but only at install time
 
-`ufw logging off` does **not** silence it — our chain carries its own `LOG` rule. Tracked
-in [`TODO.md`](../TODO.md) as C2.
+Our chain has its own `LOG` rule, so nothing about `ufw logging off` reaches it
+automatically. `install` therefore reads ufw's setting and writes the stanza to match:
+logging on → the `LOG` rule is there; logging off → it is replaced by a comment saying so.
+
+**The two drift the moment you change ufw's setting without re-running `install`.** That
+is the honest limit of a static stanza, so `status` compares them and says which way they
+have diverged:
+
+```
+ufw logging is OFF but ours is still ON — re-run install to match
+ufw logging is ON but ours is OFF — re-run install to match
+```
+
+Both directions are covered by a test. Re-run `ufw-docker install` after any
+`ufw logging on|off`.
 
 ## Everything else
 
@@ -40,7 +53,30 @@ in [`TODO.md`](../TODO.md) as C2.
 | self-heal decisions | `journalctl -t ufw-docker-selfheal` |
 | what a self-heal repair did | `/var/log/ufw-docker-selfheal.log` |
 | rescue snapshots of a broken firewall | `/var/backups/ufw-rescue-<timestamp>/` |
-| `install` / `remove` / `status` | stdout only — no audit trail yet (`TODO.md` C1) |
+| `install` / `remove` / `rescue` | `journalctl -t ufw-docker` — see below |
+
+## The audit trail
+
+Every state-changing run writes one line to syslog, tagged `ufw-docker`:
+
+```bash
+sudo journalctl -t ufw-docker
+```
+
+```
+install starting (version 0.9.0, v4='172.17.0.0/16 172.18.251.0/25 ')
+install complete and verified (version 0.9.0)
+remove invoked (--force)
+RESCUE invoked () — the firewall was in a state somebody had to recover from
+rescue finished rc=0 (snapshot /var/backups/ufw-rescue-20261022005726)
+```
+
+This exists so "who wired this host, and when" has an answer. A `rescue` line is the one
+worth alerting on: it means somebody had to recover a firewall that had gone wrong.
+
+`status`, `containers` and `install --dry-run` write nothing — they change nothing.
+
+Deliberately best-effort: a host without `logger` loses the trail rather than the run.
 
 ## Counters
 

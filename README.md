@@ -64,7 +64,8 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [The `before.init` hook](docs/before-init.md) | why `ufw reload` breaks without it |
 | [The self-heal service](docs/self-heal.md) | boot-time repair, what it checks, opting out |
 | [`rescue`](docs/rescue.md) | break-glass: what it does to your SSH exposure |
-| [Logging](docs/logging.md) | `[UFW DOCKER BLOCK]`, and what is recorded where |
+| [Day-to-day operation](docs/operations.md) | `--dry-run`, `status --rules`, versions, backups, when to re-run `install` |
+| [Logging](docs/logging.md) | `[UFW DOCKER BLOCK]`, the audit trail, and what is recorded where |
 | [Rule scoping](docs/scoping.md) | which rules reach the host, which reach containers |
 | [Per-container rules](docs/per-container.md) | targeting one container rather than a port |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
@@ -79,11 +80,19 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | | |
 |---|---|
 | `sudo ufw-docker install` | wire it up. Safe to re-run; that is how you pick up new subnets or a new version |
+| `sudo ufw-docker install --dry-run` | print the exact stanza it would write — changes nothing |
 | `sudo ufw-docker install --no-selfheal` | …without the boot-repair unit |
 | `sudo ufw-docker status` | what is wired and whether it is healthy. **Exit 1 = needs attention** |
+| `sudo ufw-docker status --rules` | …and the rules containers are actually judged by |
+| `sudo ufw-docker containers` | container addresses, for per-container rules |
 | `sudo ufw-docker remove` | preview the undo — changes nothing |
 | `sudo ufw-docker remove --force` | actually undo it |
+| `sudo ufw-docker remove --force --include-backups` | …and delete the backups too |
 | `sudo ufw-docker rescue` | get back in after a bad state |
+| `ufw-docker --version` | the version; the installed stanza records the one that wired the host |
+
+Both `install` and `remove` preview before they change anything, and `install` parses the
+stanza it generated before writing a byte of it.
 
 Then use ufw exactly as you always have:
 

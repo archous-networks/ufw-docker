@@ -87,6 +87,45 @@ Suitable for cron:
 */30 * * * * root /usr/local/sbin/ufw-docker status >/dev/null || logger -t ufw-docker "needs attention"
 ```
 
+## Which rules are actually deciding this?
+
+```bash
+sudo ufw-docker status --rules
+```
+
+Lists `ufw-user-forward` then `ufw-user-input` — the two chains, in the order consulted,
+that every packet heading into a container is judged by. A rule with no destination
+governs the host *and* containers; `-d <container ip>` governs that container alone; the
+ports are container ports. → [operations.md](operations.md), [scoping.md](scoping.md)
+
+## Who wired this host, and when?
+
+```bash
+sudo journalctl -t ufw-docker
+```
+
+One line per state-changing run. A `RESCUE invoked` line means somebody had to recover a
+firewall that had gone wrong. → [logging.md](logging.md#the-audit-trail)
+
+## I want to see what `install` would do before it does it
+
+```bash
+sudo ufw-docker install --dry-run
+```
+
+Prints the exact stanza and changes nothing. → [operations.md](operations.md)
+
+## My container blocks are not being logged
+
+Check whether ufw's own logging is on — ours is written to match it at install time, and
+the two drift if you change one without re-running the other. `status` says which way:
+
+```
+ufw logging is ON but ours is OFF — re-run install to match
+```
+
+→ [logging.md](logging.md)
+
 ## Undoing everything
 
 ```bash

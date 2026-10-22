@@ -16,7 +16,8 @@ rule chains into Docker's `DOCKER-USER` hook.
 | `ufw reload` breaking, chain-deletion errors | [docs/before-init.md](docs/before-init.md) |
 | boot behaviour, the systemd unit | [docs/self-heal.md](docs/self-heal.md) |
 | `rescue`, SSH handling, nft fallback | [docs/rescue.md](docs/rescue.md) |
-| log output, `[UFW DOCKER BLOCK]` | [docs/logging.md](docs/logging.md) |
+| log output, `[UFW DOCKER BLOCK]`, the syslog audit trail | [docs/logging.md](docs/logging.md) |
+| `--dry-run`, `status --rules`, versioning, backups | [docs/operations.md](docs/operations.md) |
 | host vs container rule scope | [docs/scoping.md](docs/scoping.md) |
 | targeting a single container | [docs/per-container.md](docs/per-container.md) |
 | "why doesn't rule X work" | [docs/caveats.md](docs/caveats.md) |
@@ -78,3 +79,6 @@ installed.
 | bats + a helper that exits non-zero | a bare `helper args` statement fails the test under errexit. `netns-probe.sh get` always exits 0 for this reason |
 | destination IP is the only discriminator | no dst → rule hits host AND containers; dst=host-ip → host only; dst=container-ip → that container only. Measured. |
 | IPv6 without daemon `ip6tables` | Docker adds its own `raw`/PREROUTING DROP ahead of FORWARD, so our v6 stanza is correct but never consulted |
+| `iptables-restore --test` | catches **syntax** (`--bogus` → rc=2); does **not** catch a jump to a nonexistent chain (`-j NOSUCHCHAIN` → rc=0) on 1.8.9/nf_tables. Both pinned by a test |
+| `iptables-restore` is in `/usr/sbin` | not on a plain user's `PATH`. A `command -v` guard that looks fine interactively passes vacuously; the tool only ever runs this as root |
+| `ufw logging off` | does not reach our own `LOG` rule. `install` reads the setting and bakes it in; `status` reports the drift |

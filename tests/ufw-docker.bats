@@ -415,6 +415,122 @@ teardown_file() {
     echo "$output" | grep -qE '(static|dynamic)'
 }
 
+@test "install --dry-run changes absolutely nothing" {
+    # The whole value of a dry run is that it is inert. Asserting on the output
+    # alone would pass even if it had written the file, so this compares the
+    # state on both sides instead.
+    local before_rules before_chain before_init
+    before_rules=$(sudo md5sum /etc/ufw/after.rules | awk '{print $1}')
+    before_chain=$(sudo iptables -S DOCKER-USER)
+    before_init=$(sudo md5sum /etc/ufw/before.init 2>/dev/null | awk '{print $1}')
+
+    run sudo "$REPO/ufw-docker" install --dry-run
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'DRY RUN'
+    echo "$output" | grep -q 'would append to /etc/ufw/after.rules'
+    echo "$output" | grep -q 'nothing was changed'
+
+    [ "$(sudo md5sum /etc/ufw/after.rules | awk '{print $1}')" = "$before_rules" ]
+    [ "$(sudo iptables -S DOCKER-USER)" = "$before_chain" ]
+    [ "$(sudo md5sum /etc/ufw/before.init 2>/dev/null | awk '{print $1}')" = "$before_init" ]
+}
+
+@test "install parses the stanza before writing it" {
+    run sudo "$REPO/ufw-docker" install --dry-run
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'stanza parses'
+}
+
+@test "iptables-restore --test actually rejects a malformed rule" {
+    # Pins the mechanism the pre-write check depends on. If a future iptables
+    # stopped failing on bad syntax, the check above would silently become a
+    # no-op that still prints "stanza parses".
+    run sudo bash -c 'printf "*filter\n:TESTCHAIN - [0:0]\n-A TESTCHAIN --bogus\nCOMMIT\n" | iptables-restore --test'
+    [ "$status" -ne 0 ]
+
+    # And the documented blind spot: a jump to a chain that does not exist is
+    # NOT caught. Asserted so the limitation is a fact under test rather than a
+    # comment that can quietly go stale.
+    run sudo bash -c 'printf "*filter\n:TESTCHAIN - [0:0]\n-A TESTCHAIN -j NOSUCHCHAIN\nCOMMIT\n" | iptables-restore --test'
+    [ "$status" -eq 0 ]
+}
+
+@test "--version reports a version, and the stanza carries the same one" {
+    run sudo "$REPO/ufw-docker" --version
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -qE '^ufw-docker [0-9]+\.[0-9]+\.[0-9]+$'
+    local v; v=$(echo "$output" | awk '{print $2}')
+    sudo grep -q "Managed by ufw-docker $v" /etc/ufw/after.rules
+}
+
+@test "status --rules lists the chains containers are judged by" {
+    run sudo "$REPO/ufw-docker" status --rules
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'rules containers are judged by'
+    echo "$output" | grep -q 'ufw-user-forward'
+    echo "$output" | grep -q 'ufw-user-input'
+    # The SSH rule is in ufw-user-input, so it must appear in the listing.
+    echo "$output" | grep -q 'dport 22'
+}
+
+@test "our logging follows ufw's, and status reports a divergence" {
+    sudo ufw logging off >/dev/null 2>&1
+
+    # Installed stanza still logs; ufw no longer does. status must say so
+    # rather than leave the operator to find out from an empty log.
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'ufw logging is OFF but ours is still ON'
+
+    # A fresh stanza matches the new setting.
+    run sudo "$REPO/ufw-docker" install --dry-run
+    echo "$output" | grep -q 'ufw logging is OFF, so ours is too'
+    ! echo "$output" | grep -q 'UFW DOCKER BLOCK'
+
+    sudo ufw logging on >/dev/null 2>&1
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    run sudo "$REPO/ufw-docker" status
+    echo "$output" | grep -q 'blocked container traffic is logged'
+}
+
+bakcount() { sudo find /etc/ufw -maxdepth 1 -name 'after.rules.ufw-docker-bak-*' | wc -l; }
+
+@test "remove keeps backups by default; --include-backups keeps only the fresh one" {
+    # install writes a backup, so there is something to reason about.
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    [ "$(bakcount)" -gt 0 ]
+
+    # Default: every backup survives, plus the one this remove just took.
+    sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
+    [ "$(bakcount)" -gt 1 ]
+
+    # --include-backups deletes the rest but DELIBERATELY keeps the backup taken
+    # by this run -- the moment you are undoing a firewall change is the worst
+    # moment to also destroy the only copy of what it looked like.
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    sudo "$REPO/ufw-docker" remove --force --include-backups >/dev/null 2>&1
+    [ "$(bakcount)" -eq 1 ]
+
+    # It also refuses to be destructive without --force.
+    run sudo "$REPO/ufw-docker" remove --include-backups
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q 'pass --force'
+    [ "$(bakcount)" -eq 1 ]
+
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    [ "$(jumps)" -gt 0 ]
+}
+
+@test "state changes leave an audit trail in syslog" {
+    command -v journalctl >/dev/null || skip "no journalctl on this host"
+    sudo journalctl -t ufw-docker --no-pager -n 1 >/dev/null 2>&1 || skip "journal not readable"
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+    sleep 1
+    run sudo journalctl -t ufw-docker --since "-2 min" --no-pager
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'install complete and verified'
+}
+
 @test "remove returns DOCKER-USER to stock" {
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
     [ "$(jumps)" -eq 0 ]

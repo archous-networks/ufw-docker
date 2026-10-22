@@ -8,10 +8,15 @@
 #   ufw-docker remove          preview the undo; --force to actually do it
 #   ufw-docker remove --force --include-backups
 #                              ...and delete old backups/rescue snapshots too
+#   ufw-docker install --dry-run
+#                              show exactly what install would write, and change
+#                              nothing at all
 #   ufw-docker status          report what is wired and whether it is healthy
+#   ufw-docker status --rules  ...and list the ufw rules containers are judged by
 #   ufw-docker containers      container addresses, for per-container rules
 #   ufw-docker rescue          get SSH back and rebuild ufw after a bad state
 #   ufw-docker rescue --open   emergency: firewall OFF, you are definitely back in
+#   ufw-docker --version       print the version
 
 #
 # Docker publishes ports by DNAT in PREROUTING and then FORWARDs them, while ufw
@@ -22,6 +27,8 @@
 
 set -uo pipefail
 
+VERSION="0.9.0"
+
 MARK_BEGIN="# BEGIN DOCKER-UFW"
 MARK_END="# END DOCKER-UFW"
 RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; OFF=$'\033[0m'
@@ -31,6 +38,16 @@ bad()  { printf '  %s%s%s\n' "$RED" "$*" "$OFF"; }
 say()  { printf '  %s\n' "$*"; }
 head_(){ printf '\n%s\n' "$*"; }
 die()  { bad "$*"; exit 1; }
+
+# Every state-changing action goes to syslog. Without this, "who wired this host
+# and when" has no answer -- the self-heal unit logs because systemd captures its
+# output, but the tool run by hand left nothing behind at all. Deliberately
+# best-effort: a missing `logger` must never stop a rescue.
+audit() {
+    command -v logger >/dev/null 2>&1 \
+        && logger -t ufw-docker -p daemon.notice -- "$*" 2>/dev/null
+    return 0
+}
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0 $*)"; }
 
@@ -138,8 +155,19 @@ subnets() {   # $1 = 4|6
 
 # Build the stanza for one family. The chain names differ (ufw-user-input vs
 # ufw6-user-input) and so do the rule files.
+# Is ufw's own logging on? Our DROP chain carries its own LOG rule, so without
+# this check `ufw logging off` would silence ufw and leave us logging anyway --
+# a divergence from what the operator actually asked for.
+#
+# Honest about its limit: this is read at INSTALL time and baked into the
+# stanza, so toggling ufw logging afterwards does not change ours. `status`
+# compares the two and says so rather than leaving it to be discovered.
+ufw_logging_on() {
+    ufw status verbose 2>/dev/null | grep -qiE '^Logging: +on' 
+}
+
 stanza() {   # $1 = 4|6
-    local fam="$1" chain fchain file nets
+    local fam="$1" chain fchain nets
     if [ "$fam" = "6" ]; then
         chain="ufw6-user-input";  fchain="ufw6-user-forward"
     else
@@ -149,7 +177,7 @@ stanza() {   # $1 = 4|6
     [ -n "$nets" ] || return 1
 
     printf '%s\n' "$MARK_BEGIN"
-    printf '%s\n' "# Managed by ufw-docker. Do not edit; re-run 'install'."
+    printf '%s\n' "# Managed by ufw-docker $VERSION. Do not edit; re-run 'install'."
     printf '%s\n' "*filter"
     printf '%s\n' "# after.rules is restored BEFORE user.rules, so $chain does not"
     printf '%s\n' "# exist yet. Declaring it creates it; user.rules fills it in afterwards."
@@ -168,19 +196,54 @@ stanza() {   # $1 = 4|6
     printf '%s\n' "# point of this tool; it is simply consulted second."
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j %s\n' "$s" "$fchain"; done
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j %s\n' "$s" "$chain"; done
-    printf '%s\n' "# Nothing matched: LOG, then drop."
+    printf '%s\n' "# Nothing matched: drop -- logging first, if ufw is logging."
     printf '%s\n' "# Our own chain rather than ufw's ufw-logging-deny: that one is filled in"
     printf '%s\n' "# by a later pass, so declaring it here would flush it and silence ufw's"
     printf '%s\n' "# own logging. Same 3/min limit; distinct prefix so container blocks are"
     printf '%s\n' "# distinguishable from host blocks."
-    printf -- '-A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "\n'
-    printf -- '-A ufw-docker-logging-deny -j DROP\n' 
+    if ufw_logging_on; then
+        printf -- '-A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "\n'
+    else
+        printf '%s\n' "# ufw logging is OFF, so ours is too. Re-run 'install' after 'ufw logging on'."
+    fi
+    printf -- '-A ufw-docker-logging-deny -j DROP\n'
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j ufw-docker-logging-deny\n' "$s"; done
     printf 'COMMIT\n'
     printf '%s\n' "$MARK_END"
 }
 
 strip_stanza() { sed -i "/^${MARK_BEGIN}\$/,/^${MARK_END}\$/d" "$1" 2>/dev/null; }
+
+# Parse the stanza WITHOUT applying it.
+#
+# Previously a malformed stanza was discovered by `ufw reload` failing -- by
+# which point after.rules was already on disk and ufw was half-built, and the
+# only thing between the operator and a lockout was the rollback. `--test` does
+# a full parse and applies nothing, so a bad stanza can be refused before a
+# single byte is written.
+#
+# The stanza is a complete, self-contained *filter...COMMIT block, which is
+# exactly what iptables-restore wants. The BEGIN/END markers are comments, so
+# they pass through harmlessly.
+#
+# WHAT THIS DOES NOT CATCH, measured on iptables 1.8.9 (nf_tables): a jump to a
+# chain that does not exist passes --test with rc=0.
+#
+#     -A DOCKER-USER -d 172.17.0.0/16 -j NOSUCHCHAIN   ->  rc=0
+#     -A DOCKER-USER --bogus                           ->  rc=2
+#
+# So this is a syntax check, not a link check. The unresolvable-jump case is
+# covered by construction instead: the stanza declares every chain it jumps to
+# (that is what the four ':chain - [0:0]' lines are for), so it cannot name a
+# target it did not create. Worth knowing before trusting --test with a hand-
+# edited rules file.
+validate_stanza() {   # $1 = 4|6 ; stanza text on stdin
+    local cmd=iptables-restore
+    [ "$1" = "6" ] && cmd=ip6tables-restore
+    # No validator is not a reason to block an install; it is a reason to say so.
+    command -v "$cmd" >/dev/null 2>&1 || { cat >/dev/null; return 0; }
+    "$cmd" --test 2>&1
+}
 
 # Subnets the INSTALLED stanza covers, as opposed to the ones Docker has now.
 # The two drift apart the moment someone creates a network after install, and
@@ -273,16 +336,19 @@ cmd_install() {
     require_readable
     command -v ufw >/dev/null || die "ufw is not installed"
 
-    local selfheal=1
+    local selfheal=1 dry=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --no-selfheal) selfheal=0 ;;
+            --dry-run|-n) dry=1 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
     done
 
-    head_ "ufw-docker install"
+    local banner="ufw-docker install"
+    [ "$dry" -eq 1 ] && banner="$banner (DRY RUN — nothing will be changed)"
+    head_ "$banner"
 
     local v4 v6 wrote=0
     v4="$(subnets 4)"; v6="$(subnets 6)"
@@ -290,17 +356,68 @@ cmd_install() {
     say "IPv6 Docker subnets: $(echo "$v6" | tr '\n' ' ')${v6:+}"
     [ -z "$v6" ] && say "  (none — Docker IPv6 is off; the v6 stanza is skipped)"
 
+    # Generate and PARSE both stanzas before touching anything. `remove`
+    # previews by default and `install` did not, which was an inconsistent
+    # contract on the more dangerous of the two.
+    local s4="" s6="" verr
+    if s4="$(stanza 4)"; then
+        if ! verr="$(printf '%s\n' "$s4" | validate_stanza 4)"; then
+            bad "the generated IPv4 stanza does NOT parse — refusing to write it"
+            printf '%s\n' "$verr" | sed 's/^/      /'
+            die "nothing was changed"
+        fi
+        ok "IPv4 stanza parses (iptables-restore --test)"
+    fi
+    if [ -n "$v6" ] && [ -f /etc/ufw/after6.rules ] && s6="$(stanza 6)"; then
+        if ! verr="$(printf '%s\n' "$s6" | validate_stanza 6)"; then
+            bad "the generated IPv6 stanza does NOT parse — refusing to write it"
+            printf '%s\n' "$verr" | sed 's/^/      /'
+            die "nothing was changed"
+        fi
+        ok "IPv6 stanza parses (ip6tables-restore --test)"
+    fi
+
+    if [ "$dry" -eq 1 ]; then
+        head_ "would append to /etc/ufw/after.rules"
+        printf '%s\n' "$s4" | sed 's/^/      /'
+        if [ -n "$s6" ]; then
+            head_ "would append to /etc/ufw/after6.rules"
+            printf '%s\n' "$s6" | sed 's/^/      /'
+        fi
+        head_ "would also"
+        if [ -x /etc/ufw/before.init ] && grep -q 'ufw-docker' /etc/ufw/before.init 2>/dev/null; then
+            say "leave /etc/ufw/before.init alone (already ours)"
+        else
+            say "write /etc/ufw/before.init  (required: without it the SECOND"
+            say "  'ufw reload' after install breaks the firewall)"
+        fi
+        [ "$selfheal" -eq 1 ] \
+            && say "install and enable ufw-docker-selfheal.service" \
+            || say "NOT install the self-heal service (--no-selfheal)"
+        say "back up the rules file(s), then run 'ufw reload'"
+        say "verify, and roll the stanza back out again if ufw came up unhealthy"
+        head_ "result"
+        ok "dry run only — nothing was changed"
+        return 0
+    fi
+
+    audit "install starting (version $VERSION, v4='$(echo "$v4" | tr '\n' ' ')')"
+
     install_hook || die "cannot proceed without the before.init hook — see above"
     ok "before.init hook installed (required for reload safety)"
 
     cp -a /etc/ufw/after.rules  "/etc/ufw/after.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
     strip_stanza /etc/ufw/after.rules
-    if stanza 4 >> /etc/ufw/after.rules; then ok "IPv4 stanza written to after.rules"; wrote=1; fi
+    if [ -n "$s4" ]; then
+        printf '%s\n' "$s4" >> /etc/ufw/after.rules
+        ok "IPv4 stanza written to after.rules"; wrote=1
+    fi
 
-    if [ -n "$v6" ] && [ -f /etc/ufw/after6.rules ]; then
+    if [ -n "$s6" ]; then
         cp -a /etc/ufw/after6.rules "/etc/ufw/after6.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
         strip_stanza /etc/ufw/after6.rules
-        if stanza 6 >> /etc/ufw/after6.rules; then ok "IPv6 stanza written to after6.rules"; wrote=1; fi
+        printf '%s\n' "$s6" >> /etc/ufw/after6.rules
+        ok "IPv6 stanza written to after6.rules"; wrote=1
     fi
 
     [ "$wrote" -eq 1 ] || die "no Docker subnets found — nothing to wire"
@@ -335,6 +452,7 @@ cmd_install() {
         || bad_state=1
 
     if [ "$bad_state" -eq 1 ]; then
+        audit "install FAILED verification — rolling the stanza back out"
         bad "the firewall is NOT healthy after applying — rolling back"
         strip_stanza /etc/ufw/after.rules
         strip_stanza /etc/ufw/after6.rules
@@ -347,11 +465,13 @@ cmd_install() {
         return 1
     fi
 
+    audit "install complete and verified (version $VERSION)"
     cmd_status
 }
 
 cmd_remove() {
     require_root remove
+    audit "remove invoked ($*)"
     require_docker remove
     require_readable
 
@@ -548,6 +668,16 @@ cmd_containers() {
 cmd_status() {
     require_docker status
     require_readable
+
+    local show_rules=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --rules) show_rules=1 ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+
     head_ "ufw-docker status"
     local rc=0
 
@@ -574,13 +704,41 @@ cmd_status() {
         return $rc
     fi
 
+    # Which version wired this host. The stanza carries it, so this answers the
+    # question even when /usr/local/sbin/ufw-docker has since been replaced --
+    # which is the case that matters, since a stanza written by an older version
+    # is exactly what a confusing bug report looks like.
+    local wired_v
+    wired_v="$(grep -oE 'Managed by ufw-docker [0-9][^.]*\.[0-9]+\.[0-9]+' /etc/ufw/after.rules 2>/dev/null | awk '{print $4}' | head -1)"
+    if [ -n "$wired_v" ] && [ "$wired_v" != "$VERSION" ]; then
+        warn "wired by ufw-docker $wired_v, but this binary is $VERSION — re-run install"
+    else
+        say "version $VERSION${wired_v:+ (stanza matches)}"
+    fi
+
     [ -x /etc/ufw/before.init ] && grep -q 'ufw-docker' /etc/ufw/before.init 2>/dev/null \
         && ok "before.init hook installed" \
         || { bad "before.init hook MISSING — 'ufw reload' WILL break the firewall"; rc=1; }
 
-    iptables -S ufw-docker-logging-deny >/dev/null 2>&1 \
-        && ok "blocked container traffic is logged ([UFW DOCKER BLOCK])" \
-        || warn "no logging chain — blocked container traffic will be silent"
+    # Does our logging agree with ufw's? The stanza bakes in whatever ufw's
+    # setting was at install time, so the two drift the moment somebody runs
+    # `ufw logging on|off` without re-running install. Silent drift in a logging
+    # setting is how an audit trail quietly stops existing.
+    local we_log=0
+    grep -q -- '--log-prefix "\[UFW DOCKER BLOCK\] "' /etc/ufw/after.rules 2>/dev/null && we_log=1
+    if ufw_logging_on; then
+        if [ "$we_log" -eq 1 ]; then
+            ok "blocked container traffic is logged ([UFW DOCKER BLOCK])"
+        else
+            warn "ufw logging is ON but ours is OFF — re-run install to match"
+        fi
+    else
+        if [ "$we_log" -eq 1 ]; then
+            warn "ufw logging is OFF but ours is still ON — re-run install to match"
+        else
+            say "logging off, matching ufw (blocked container traffic is silent)"
+        fi
+    fi
 
     local jf; jf=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-forward')
     [ "$jf" -gt 0 ] && ok "\`ufw route\` rules are honoured ($jf jumps into ufw-user-forward)" \
@@ -614,6 +772,27 @@ cmd_status() {
     nstat=$(container_rows | grep -c 'static' || true)
     [ "${ntot:-0}" -gt 0 ] && say "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
 
+    # C3: "are we wired?" is not the question an operator actually has. The
+    # question is "which rules decide what reaches my containers?" -- and the
+    # answer is these two chains, consulted in this order, for traffic whose
+    # destination is a container address. Off by default because it is long.
+    if [ "$show_rules" -eq 1 ]; then
+        head_ "rules containers are judged by, in order"
+        say "ufw-user-forward  (\`ufw route ...\`, consulted FIRST):"
+        local fwd; fwd="$(iptables -S ufw-user-forward 2>/dev/null | grep -v '^-N')"
+        if [ -n "$fwd" ]; then printf '%s\n' "$fwd" | sed 's/^/        /'
+        else say "        (none)"; fi
+        say "ufw-user-input    (plain \`ufw allow|deny ...\`, consulted SECOND):"
+        local inp; inp="$(iptables -S ufw-user-input 2>/dev/null | grep -v '^-N')"
+        if [ -n "$inp" ]; then printf '%s\n' "$inp" | sed 's/^/        /'
+        else say "        (none)"; fi
+        say ""
+        say "Reading these: a rule with NO destination governs the host AND every"
+        say "container. A rule with -d <container ip> governs only that container."
+        say "Ports are CONTAINER ports, not published ones. See docs/scoping.md."
+        head_ "wiring"
+    fi
+
     local v6nets; v6nets="$(subnets 6)"
     local j6; j6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c 'ufw6-user-input')
     if [ -n "$v6nets" ]; then
@@ -636,6 +815,7 @@ cmd_status() {
 # syntax error getting past `bash -n` and CI. One file cannot be half-installed.
 cmd_rescue() {
     require_root rescue
+    audit "RESCUE invoked ($*) — the firewall was in a state somebody had to recover from"
     local MODE="restore"
     [ "${1:-}" = "--open" ] && MODE="open"
 
@@ -858,6 +1038,7 @@ cmd_rescue() {
         say "if you are still locked out, run: ufw-docker rescue --open"
     fi
     say "snapshot of the broken state kept at: $BACKUP"
+    audit "rescue finished rc=$RC (snapshot $BACKUP)"
     prune_backups /var/backups/ufw-rescue-
     return $RC
 
@@ -870,5 +1051,10 @@ case "${1:-}" in
     status)  shift; cmd_status "$@" ;;
     selfheal) shift; cmd_selfheal "$@" ;;
     containers) shift; cmd_containers "$@" ;;
-    *) sed -n '2,14p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit 1 ;;
+    --version|-V|version) printf 'ufw-docker %s\n' "$VERSION" ;;
+    # Usage is the header comment, printed up to the first blank line. Ranged by
+    # marker rather than by line number: a hardcoded '2,14p' silently truncates
+    # the moment a subcommand is added, which it did.
+    --help|-h|help) sed -n '2,/^$/p' "$0" | sed 's/^#\{0,1\} \{0,1\}//' ;;
+    *) sed -n '2,/^$/p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit 1 ;;
 esac
