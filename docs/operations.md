@@ -78,6 +78,66 @@ See [Rule scoping](scoping.md) for the measured basis of the first two and
 Off by default because it is long: a host with a real rule set prints a lot, and `status`
 is also what runs at the end of every `install`.
 
+## Monitoring: `status --json`
+
+The exit code is all monitoring used to get — "something is wrong", never *what*.
+Anything richer meant scraping coloured prose, which changed wording several times in a
+single day.
+
+```bash
+ufw-docker status --json
+```
+
+```json
+{
+  "version": "0.9.0",
+  "healthy": true,
+  "installed": true,
+  "supported": true,
+  "preflight_failed": [],
+  "installed_unsupported": "",
+  "ufw_dir": "/etc/ufw",
+  "ufw_paths_derived": true,
+  "checks": [
+    {"key": "wired-v4", "level": "ok", "message": "IPv4 wired (3 jumps into ufw-user-input)"}
+  ]
+}
+```
+
+Each check carries a stable `key`, so an alert can name the condition it cares about
+rather than matching on a sentence:
+
+```bash
+# everything currently wrong, by name
+ufw-docker status --json | jq -r '.checks[] | select(.level=="bad") | "\(.key): \(.message)"'
+
+# the two that mean "filtering silently is not happening"
+ufw-docker status --json | jq -e '.supported and (.checks[]|select(.key=="wired-v4").level=="ok")'
+```
+
+`level` is one of `ok`, `warn`, `bad`, `info`. **`bad` is what sets the exit code**;
+`warn` is a thing to know, not a thing to page on.
+
+Two fields deserve attention:
+
+- **`supported`** — whether this host passes the preflight *right now*. A host can stop
+  being supported without anyone touching this tool, by switching the iptables backend.
+- **`installed_unsupported`** — non-empty if somebody installed with
+  `--unsupported --force`, listing which checks were failing at the time. It is read
+  from the stanza, so it survives the binary being replaced.
+
+Together they encode the grading rule: if a current failure was *already accepted* at
+install time, `status` warns and still exits 0. If it was not, something changed
+underneath the install and `status` exits 1.
+
+### Why the output is built before it is printed
+
+`status` collects every check into one list and then renders it, as text or as JSON,
+rather than printing as it goes. That is not tidiness: two copies of a check drift, and
+this project has already shipped three assertions that passed for the wrong reason.
+One source of truth, two views. It also means check messages carry no colour codes —
+colour is added at render time — which is what makes them safe to put in JSON.
+
 ## Which version wired this host
 
 ```bash

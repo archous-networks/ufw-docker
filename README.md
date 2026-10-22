@@ -86,6 +86,8 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | `sudo ufw-docker install --no-selfheal` | …without the boot-repair unit |
 | `sudo ufw-docker status` | what is wired and whether it is healthy. **Exit 1 = needs attention** |
 | `sudo ufw-docker status --rules` | …and the rules containers are actually judged by |
+| `sudo ufw-docker status --json` | the same report, machine-readable, for monitoring |
+| `sudo ufw-docker install --unsupported --force` | install anyway on an environment we have **not** proven |
 | `sudo ufw-docker containers` | container addresses, for per-container rules |
 | `sudo ufw-docker remove` | preview the undo — changes nothing |
 | `sudo ufw-docker remove --force` | actually undo it |
@@ -110,6 +112,31 @@ sudo ufw route allow to any port 8089 proto tcp    # also honoured
 ```
 */30 * * * * root /usr/local/sbin/ufw-docker status >/dev/null || logger -t ufw-docker "needs attention"
 ```
+
+…and `--json` gives monitoring something better than an exit code:
+
+```bash
+ufw-docker status --json | jq -r 'select(.healthy|not) | .checks[] | select(.level=="bad") | .message'
+```
+
+## It refuses environments it has not been proven on
+
+`install` runs a preflight and **refuses** rather than installing where this tool has
+never been verified: a non-nf_tables iptables backend, rules present in *both* iptables
+backends, Docker Swarm, rootless Docker, or ufw's files not where ufw says they are.
+
+The refusal exists because the failure it prevents is **silent** — `install` would
+succeed, `status` would report everything wired, and nothing would be filtered.
+
+To proceed anyway you must pass **both** `--unsupported` and `--force`; one flag is
+something you can paste from a forum post without reading it. Doing so is recorded in
+the installed stanza and reported by every `status` run afterwards, because the person
+reading `status` is rarely the person who typed `--force`.
+
+The preflight also runs on **every `status`**, not just at install — a host that is
+supported today can have its backend switched tomorrow. If that happens *without*
+anyone having accepted it, `status` goes red; if it was accepted at install time, it
+warns but stays green, so the exit code remains worth reading.
 
 ---
 

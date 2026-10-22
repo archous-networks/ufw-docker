@@ -150,8 +150,15 @@ jobs:
         run: sudo touch /etc/ufw-docker-tests-allowed
 
       - name: Run the suite
-        # The suite itself takes ~2 minutes of wall clock. Anything close to
-        # this limit means something is hanging, not that the tests are slow.
+        # MEASURED, not guessed: ~4.5 min per nft leg for 44 tests (runs
+        # 39863384004 and later). The old comment here said "~2 minutes", which
+        # had quietly stopped being true -- and the whole point of this note is
+        # to tell the next person whether a slow run means a hang.
+        #
+        # Most of the time is `install`, which the suite runs ~20 times. It
+        # costs ~1s on a runner with one container and ~8s on the development
+        # host, which has fifteen -- so a local run taking 10+ minutes is the
+        # environment, not a regression.
         timeout-minutes: 12
         env:
           # The runner's own primary address — what the netns probe targets.

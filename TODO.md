@@ -12,11 +12,11 @@ Evidence tags: **[verified]** reproduced here · **[suspected]** reasoned, not r
 
 Not a rule, but these have real dependencies on each other:
 
-1. **X1 + D4 + D5 together.** All three restructure `cmd_status`, and doing that three
-   times is the waste. X1 is also what makes "unsupported" a refusal rather than a
-   sentence in a doc.
+1. ~~**X1 + D4 + D5 together.**~~ **Done** — see *Implemented* below.
 2. **A11** — the legacy CI leg is currently failing and Debian 10 is in the estate, so
-   this is the most load-bearing unknown.
+   this is the most load-bearing unknown. **Now the next thing**, and X1 raised its
+   stakes: the preflight currently refuses the legacy backend outright, so until that
+   leg is green, every Debian 10 host is a host this tool declines to install on.
 3. **E10 stage 1** — the support matrix, which X1 reads and CI generates legs from.
 4. **B6, B7** — the two recovery-path defects. B6 contains a live bug.
 5. **F1 + F2** — release and checksums, once the above makes `v1.0.0` mean something.
@@ -28,11 +28,8 @@ Not a rule, but these have real dependencies on each other:
 
 | # | | | |
 |---|---|---|---|
-| **X1** | **Supported-environment preflight that REFUSES.** Nothing enforces our "untested" caveats today, so a customer on an unsupported setup gets the worst outcome: `install` succeeds, `status` reports everything wired, nothing is filtered. Checks: iptables backend is nft; **no mixed backends** (rules in both subsystems — both are evaluated, a `DROP` in either wins); Swarm inactive; Docker not rootless; ufw paths resolve (see D5). Runs in `install` **and** `status`, because a host that is fine today can have its backend switched tomorrow. `--dry-run` reports it. `--unsupported` **alone refuses** and lists each failed check, requiring `--force` as well — same pattern as `--include-backups`. Loudness must be **persistent**: a banner at install, a `# INSTALLED IN UNSUPPORTED MODE: <checks>` line in the stanza, a line in **every** `status` run, and a syslog audit entry. A host that took the flag must never quietly pass for supported. *No ufw-backend check is needed — upstream ufw has no native nftables backend.* | [verified] | S1 |
 | **A11** | **iptables-legacy is unproven, and Debian 10 is in the estate** — so this is a real deployment target, not an edge case. The CI leg exists and **currently fails**: every "should be open" assertion fails while every "should be blocked" one passes. Hypothesis, not yet confirmed: nft rules created at boot coexist with the legacy rules we add, both are evaluated, and a `DROP` in either wins. Fix the leg with `nft flush ruleset` after the switch. Until it is green we cannot say whether legacy works. Already confirmed: legacy **rejects** `-j NOSUCHCHAIN` where nft accepts it. | [verified] | S2 |
 | **E10** | **Supported-platform matrix, feeding the preflight and CI.** Lives **inside `ufw-docker`** as a heredoc — the single-file property means the preflight cannot read an external file. Field order mirrors `tools/ufw-docker-survey` so a pasted survey line can be matched against it. Columns: `label \| distro \| ver \| ufw \| backend \| docker \| verified-by \| status`. Three consumers: the preflight matches the live host; CI generates matrix legs from `status=supported` rows; a `tests/lint-supported.sh` fails on drift between the table and the docs. **Rule: a row may claim `supported` only where a green CI leg proves it** — a surveyed host matching no row is `unverified`. Use opaque `site-NN` labels; the mapping lives outside this repo. **Stage 1** (table, preflight wiring, lint, fix the legacy leg) is cheap. **Stage 2** (real Debian 10/11/12 legs) is not: GitHub hosts no Debian runners and the suite needs real kernel netfilter, systemd and a Docker daemon, so it means privileged DinD, VMs, or self-hosted runners. | [verified] | S2 |
-| **D4** | **`status --json`.** The exit code is all monitoring gets today — "something is wrong", never what. Anything richer means scraping coloured prose, which changed wording several times in a single day. `--json` is also the natural home for the preflight verdict and its failed checks. **Build with X1**: `cmd_status` prints as it checks and must be restructured to collect-then-render. | | S3 |
-| **D5** | **Derive ufw's paths instead of hardcoding them.** ufw has no CLI flag for this, but its Python module carries packager-patched constants: `python3 -c 'import ufw.common as c; print(c.config_dir, c.share_dir, c.state_dir, c.prefix_dir)'` → `/etc /usr/share/ufw /lib/ufw /usr`. All four derived paths verified to resolve here. Derive → fall back to Debian defaults if unavailable → **verify each path exists** → refuse as unsupported otherwise. ~10 lines; folds into X1. Gotchas: `config_dir` is `/etc`, **not** `/etc/ufw`; and it is ufw's internal module, justified only because it **fails loudly** where a wrong hardcoded path fails silently. | [verified] | S3 |
 | **B6** | **`rescue` must stop inventing an SSH rule.** If `user.rules` has none, that usually means ufw never permitted SSH — so a blanket `ACCEPT` grants access that never existed rather than restoring anything, and `rescue --open` already covers the deliberate "get me in regardless" case. New behaviour: replay from `user.rules` → else replay from the newest `/var/backups/ufw-rescue-*` snapshot → else **invent nothing** and point at `--open`. Plus `status` must flag any blanket SSH `ACCEPT` in `INPUT` that ufw did not create, for hosts that already have one. **Live bug:** detection matches `--dport <port>` only, so an operator allowing SSH by interface (`ufw allow in on wg0`) reads as "no SSH rule" and that host gets port 22 opened to the world today. | [verified] | S2 |
 | **X5** | **Three test ports still fail the test-port rule.** The rule, now written into `tests/rules-lib.bash`: *every port in `TEST_PORTS` is a port the suite will delete a rule for, so it must be a port nothing real listens on.* **9100** (node_exporter), **9200** (Elasticsearch HTTP) and **9300** (Elasticsearch transport) fail it. Nothing in this estate runs them, so there is no live breakage — but 8089, 443 and container-port 80 were all *also* fine until the day they were not, and each cost a debugging round trip. Move `collc`'s container port off 9100, `v6svc` off 9200, and the host listener off 9300. Cheap and mechanical; the only care needed is keeping `v6svc` published **1:1**, since the remap trap depends on it. | [verified] | S3 |
 | **B7** | **SSH port detection can miss, silently.** Add `systemctl show ssh.socket -p ListenStream` to the chain — socket activation is the default on Ubuntu 22.10+, and `sshd -T` can report 22 while the socket unit listens elsewhere. The more important half: make the bare-22 fallback **loud**. "Could not determine the SSH port, assuming 22" rather than presenting a guess as fact. | [suspected] | S2 |
@@ -141,6 +138,36 @@ Not a rule, but these have real dependencies on each other:
   third instance of one mistake — a test port chosen without asking whether a real service
   uses it — which is why the rule is now written down in `tests/rules-lib.bash` and why X5
   exists for the three that remain.
+
+- **X1 — the supported-environment preflight, as a refusal.** Five checks: iptables
+  backend is nf_tables; rules are not present in *both* backends (the kernel evaluates
+  both and a `DROP` in either wins, which is the hardest failure here to see from
+  outside); Swarm inactive; Docker not rootless; ufw's files where ufw says they are.
+  `install` **refuses**, because the failure it guards is silent — install succeeds,
+  `status` reports everything wired, nothing is filtered. `--unsupported` **alone still
+  refuses**; it takes `--force` as well, since one flag is something you can paste from
+  a forum post without reading it. Loudness is persistent and has four channels: an
+  install banner, a `# INSTALLED IN UNSUPPORTED MODE: <keys>` line baked into the
+  stanza, a line in **every** `status`, and a syslog entry.
+
+  **The grading rule was the interesting part, and it came out of a failing test.**
+  `install` ends by calling `cmd_status`, so a *successful* forced install exited 1 —
+  making `--force` useless in automation. An exit code that is permanently 1 is an exit
+  code nobody reads, and then the real fault arrives unnoticed. So: a preflight failure
+  already accepted at install time **warns and stays green**; one that is *not* accepted
+  means something changed underneath the install and **goes red**. That distinction is
+  what keeps the exit code worth gating on.
+- **D4 — `status --json`,** which forced `cmd_status` to collect-then-render. Stable
+  per-check `key`s so an alert names a condition instead of matching a sentence, plus
+  `supported`, `preflight_failed` and `installed_unsupported` at the top level. A side
+  benefit of the restructure: messages carry no colour, because colour is applied at
+  render time, which is what makes them safe to serialise.
+- **D5 — ufw's paths are derived, not hardcoded.** From `ufw.common`'s packager-patched
+  constants, run under **ufw's own interpreter** rather than a bare `python3`: ufw is a
+  Python program and its shebang names the one interpreter certain to import its
+  modules. Derive → fall back to the Debian defaults → **verify the files exist** →
+  fail the preflight otherwise. Note `config_dir` is `/etc`, not `/etc/ufw`. ~40
+  hardcoded literals replaced by five variables.
 
 ## Fixed while compiling this list
 

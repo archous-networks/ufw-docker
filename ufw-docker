@@ -11,8 +11,13 @@
 #   ufw-docker install --dry-run
 #                              show exactly what install would write, and change
 #                              nothing at all
+#   ufw-docker install --unsupported --force
+#                              install on an environment we have NOT proven.
+#                              Both flags are required, and the fact is recorded
+#                              in the stanza and reported by every `status`.
 #   ufw-docker status          report what is wired and whether it is healthy
 #   ufw-docker status --rules  ...and list the ufw rules containers are judged by
+#   ufw-docker status --json   the same report, machine-readable, for monitoring
 #   ufw-docker containers      container addresses, for per-container rules
 #   ufw-docker rescue          get SSH back and rebuild ufw after a bad state
 #   ufw-docker rescue --open   emergency: firewall OFF, you are definitely back in
@@ -31,6 +36,189 @@ VERSION="0.9.0"
 
 MARK_BEGIN="# BEGIN DOCKER-UFW"
 MARK_END="# END DOCKER-UFW"
+
+# ── where ufw keeps its files ──────────────────────────────────────────────
+# Debian defaults, overridden by whatever this ufw was actually packaged with.
+# A wrong hardcoded path fails SILENTLY -- we write a stanza nothing ever reads
+# and report success -- which is the single worst failure this tool has.
+UFW_DIR=/etc/ufw
+AFTER4="$UFW_DIR/after.rules"
+AFTER6="$UFW_DIR/after6.rules"
+USER4="$UFW_DIR/user.rules"
+BEFORE_INIT="$UFW_DIR/before.init"
+
+# ufw is a Python program, and its shebang names the interpreter that is
+# guaranteed to be able to import its modules. Using a bare `python3` instead
+# would be guessing: a host can have several, and only the one ufw itself runs
+# under is certain to see `ufw.common`.
+ufw_python() {
+    local ufwbin sb
+    ufwbin="$(command -v ufw 2>/dev/null)" || return 1
+    [ -n "$ufwbin" ] || return 1
+    sb="$(head -1 "$ufwbin" 2>/dev/null)"
+    case "$sb" in
+        '#!'*python*) printf '%s' "${sb#\#!}" | awk '{print $1}' ;;
+        *) return 1 ;;
+    esac
+}
+
+# ufw exposes no CLI flag for its own paths, but its Python module carries the
+# packager-patched constants. Derive -> fall back to the Debian defaults ->
+# VERIFY the files exist. The verification is the point: deriving a wrong path
+# and trusting it is no better than hardcoding a wrong one.
+#
+# NOTE config_dir is `/etc`, NOT `/etc/ufw` -- ufw appends the "ufw" component
+# itself. Getting that wrong yields /etc/after.rules, which does not exist, so
+# the existence check below catches it rather than letting it through.
+UFW_PATHS_DERIVED=0
+derive_ufw_paths() {
+    local py cfg
+    if py="$(ufw_python)" && [ -n "$py" ]; then
+        cfg="$("$py" -c 'import ufw.common as c; print(c.config_dir)' 2>/dev/null)"
+        if [ -n "$cfg" ] && [ -d "$cfg/ufw" ]; then
+            UFW_DIR="$cfg/ufw"
+            UFW_PATHS_DERIVED=1
+        fi
+    fi
+    AFTER4="$UFW_DIR/after.rules"
+    AFTER6="$UFW_DIR/after6.rules"
+    USER4="$UFW_DIR/user.rules"
+    BEFORE_INIT="$UFW_DIR/before.init"
+}
+
+# Which of ufw's files we require, and whether they are all there. Used by the
+# preflight; separate from derive_ufw_paths so the paths can be reported even
+# when they do not resolve.
+ufw_paths_ok() {
+    [ -d "$UFW_DIR" ] && [ -f "$AFTER4" ] && [ -f "$USER4" ]
+}
+
+
+# ── is this environment one we have actually proven? ───────────────────────
+# Nothing enforced our "untested" caveats, so a host outside them got the worst
+# possible outcome: `install` succeeds, `status` reports everything wired, and
+# nothing is filtered. A caveat in a document does not protect anybody.
+#
+# Every check below answers "have we PROVEN this works here?", not "does this
+# look dangerous?". That distinction matters -- see A7 in TODO.md, where
+# --network host containers are correctly NOT a preflight failure because they
+# are understood, merely not governed by us.
+PF_FAILED=""      # space-separated keys
+PF_DETAIL=""      # one "key|explanation|what to do" per line
+
+pf_fail() {   # $1=key  $2=explanation  $3=remedy
+    PF_FAILED="${PF_FAILED}${PF_FAILED:+ }$1"
+    PF_DETAIL="${PF_DETAIL}$1|$2|$3"$'\n'
+}
+
+# Rules, not chains. Both backends always have the built-in chains, so counting
+# chains reports "mixed" on every host. Only `-A` lines mean somebody is
+# actually filtering there.
+backend_rules() {   # $1 = iptables-legacy | iptables-nft
+    command -v "$1" >/dev/null 2>&1 || { printf '0'; return; }
+    # `grep -c` PRINTS 0 and EXITS 1 when there is no match, so a `|| printf 0`
+    # fallback emits "0\n0" and every arithmetic test downstream breaks. Capture
+    # first, then default. (The survey script had this exact bug with
+    # `systemctl is-enabled`.)
+    local n
+    n="$("$1" -S 2>/dev/null | grep -c '^-A')" || true
+    printf '%s' "${n:-0}"
+}
+
+preflight() {
+    PF_FAILED=""; PF_DETAIL=""
+
+    # 1. The backend. Everything this project has verified ran on nf_tables,
+    #    and at least one measured behaviour differs between the two:
+    #    iptables-restore --test accepts `-j NOSUCHCHAIN` under nf_tables and
+    #    rejects it under legacy. The legacy CI leg is not green yet (A11), so
+    #    legacy is unproven -- which is exactly what this refuses on.
+    local backend
+    backend="$(iptables --version 2>/dev/null | grep -oE '\(nf_tables\)|\(legacy\)' | tr -d '()')"
+    [ "$backend" = nf_tables ] || pf_fail backend \
+        "iptables backend is '${backend:-unknown}', and only nf_tables is proven" \
+        "switch with update-alternatives, or see docs/troubleshooting.md"
+
+    # 2. Mixed backends. The kernel evaluates BOTH, and a DROP in either wins --
+    #    so our stanza can be perfectly correct in one while the other silently
+    #    drops the traffic. This is the single hardest failure here to diagnose
+    #    from the outside, because `status` looks entirely healthy.
+    local nleg nnft
+    nleg="$(backend_rules iptables-legacy)"
+    nnft="$(backend_rules iptables-nft)"
+    if [ "${nleg:-0}" -gt 0 ] && [ "${nnft:-0}" -gt 0 ]; then
+        pf_fail mixed-backends \
+            "rules exist in BOTH iptables backends (legacy=$nleg, nft=$nnft); both are evaluated and a DROP in either wins" \
+            "reboot after switching backends, or flush the one you are not using"
+    fi
+
+    # 3. Swarm. Not run anywhere at Archous, so genuinely untested rather than
+    #    known-broken -- but Swarm publishes ports through its own ingress mesh,
+    #    which is a different path from the one this tool governs.
+    local sw
+    sw="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)"
+    [ -z "$sw" ] || [ "$sw" = inactive ] || pf_fail swarm \
+        "Docker Swarm is '$sw'; ingress-mesh publishing is a path this tool does not govern" \
+        "not supported — see docs/caveats.md"
+
+    # 4. Rootless Docker. Publishes via a userspace proxy rather than the
+    #    kernel DNAT path DOCKER-USER sits on, so our stanza would be wired
+    #    into a chain the traffic never reaches.
+    local secopt rootdir
+    secopt="$(docker info --format '{{range .SecurityOptions}}{{.}} {{end}}' 2>/dev/null)"
+    rootdir="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"
+    case "$secopt$rootdir" in
+        *rootless*) pf_fail rootless \
+            "Docker is running rootless; published ports do not traverse DOCKER-USER" \
+            "not supported — run a rootful daemon, or see docs/caveats.md" ;;
+    esac
+
+    # 5. ufw's own files. If these are not where we think, we write a stanza
+    #    nothing reads and report success -- failing silently, which is worse
+    #    than failing loudly.
+    local how="Debian default — derivation from ufw.common failed"
+    [ "$UFW_PATHS_DERIVED" -eq 1 ] && how="derived from ufw.common"
+    ufw_paths_ok || pf_fail ufw-paths \
+        "ufw's rules files are not where expected (looked in $UFW_DIR; $how)" \
+        "unusual ufw packaging; please report with 'ufw-docker status --json'"
+
+    [ -z "$PF_FAILED" ]
+}
+
+# Render the failures. Used by install (before refusing) and by status.
+pf_report() {
+    local key why fix
+    while IFS='|' read -r key why fix; do
+        [ -n "$key" ] || continue
+        bad "  $key: $why"
+        say "      $fix"
+    done <<EOPF
+$PF_DETAIL
+EOPF
+    return 0
+}
+
+# Is every current preflight failure one the operator already accepted?
+# $1 = current failed keys, $2 = keys recorded in the stanza at install time.
+pf_all_accepted() {
+    local k
+    [ -n "$2" ] || return 1
+    for k in $1; do
+        case " $2 " in *" $k "*) ;; *) return 1 ;; esac
+    done
+    return 0
+}
+
+# Was this host wired while failing the preflight? The stanza carries the
+# answer, so it survives the binary being replaced -- and so `status` can keep
+# saying so on a host nobody remembers forcing.
+# Set by install only when --unsupported --force was accepted; baked into
+# the stanza so the fact outlives the shell that did it.
+UNSUP_MARK=""
+MARK_UNSUP="# INSTALLED IN UNSUPPORTED MODE:"
+installed_unsupported() {
+    grep -oE "$MARK_UNSUP.*" "$AFTER4" 2>/dev/null | head -1 | sed "s/$MARK_UNSUP *//"
+}
 RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; OFF=$'\033[0m'
 ok()   { printf '  %s%s%s\n' "$GRN" "$*" "$OFF"; }
 warn() { printf '  %s%s%s\n' "$YLW" "$*" "$OFF"; }
@@ -74,8 +262,8 @@ require_docker() {
 
 # Readable config, checked separately so the message names the real obstacle.
 require_readable() {
-    [ -r /etc/ufw/after.rules ] && [ -r /etc/ufw/user.rules ] && return 0
-    bad "cannot read /etc/ufw as $(id -un) — re-run with sudo"
+    [ -r $AFTER4 ] && [ -r $USER4 ] && return 0
+    bad "cannot read $UFW_DIR as $(id -un) — re-run with sudo"
     exit 1
 }
 
@@ -178,6 +366,7 @@ stanza() {   # $1 = 4|6
 
     printf '%s\n' "$MARK_BEGIN"
     printf '%s\n' "# Managed by ufw-docker $VERSION. Do not edit; re-run 'install'."
+    [ -n "$UNSUP_MARK" ] && printf '%s %s\n' "$MARK_UNSUP" "$UNSUP_MARK"
     printf '%s\n' "*filter"
     printf '%s\n' "# after.rules is restored BEFORE user.rules, so $chain does not"
     printf '%s\n' "# exist yet. Declaring it creates it; user.rules fills it in afterwards."
@@ -262,7 +451,7 @@ stanza_subnets() {   # $1 = rules file
 
 # The hook that makes `ufw reload` survivable -- see the long note inside it.
 install_hook() {
-    local f=/etc/ufw/before.init
+    local f=$BEFORE_INIT
     local stock=/usr/share/ufw/before.init
 
     # Refuse to clobber a hook the operator wrote.
@@ -279,7 +468,7 @@ install_hook() {
         if [ -f "$stock" ] && cmp -s "$f" "$stock"; then
             :
         else
-            bad "/etc/ufw/before.init has been customised; refusing to overwrite it"
+            bad "$BEFORE_INIT has been customised; refusing to overwrite it"
             say ""
             say "  This tool needs DOCKER-USER emptied before ufw tears its chains down,"
             say "  or 'ufw reload' leaves the firewall half-built and drops your SSH rule."
@@ -341,11 +530,13 @@ cmd_install() {
     require_readable
     command -v ufw >/dev/null || die "ufw is not installed"
 
-    local selfheal=1 dry=0
+    local selfheal=1 dry=0 unsup=0 force=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --no-selfheal) selfheal=0 ;;
             --dry-run|-n) dry=1 ;;
+            --unsupported) unsup=1 ;;
+            --force) force=1 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
@@ -354,6 +545,48 @@ cmd_install() {
     local banner="ufw-docker install"
     [ "$dry" -eq 1 ] && banner="$banner (DRY RUN — nothing will be changed)"
     head_ "$banner"
+
+    # ── X1: refuse an environment we have not proven ───────────────────────
+    # Deliberately a REFUSAL and not a warning. The failure mode this guards
+    # is silent: install succeeds, status reports everything wired, and
+    # nothing is actually filtered. A warning scrolls past; a refusal does not.
+    if ! preflight; then
+        head_ "UNSUPPORTED ENVIRONMENT"
+        bad "this host fails checks the tool has only ever been proven under:"
+        pf_report
+        if [ "$dry" -eq 1 ]; then
+            say ""
+            warn "a real install would REFUSE here (--dry-run continues so you can see the plan)"
+        else
+            say ""
+            say "Installing here can leave Docker ports UNFILTERED while \`status\`"
+            say "reports everything as wired. That is why this refuses."
+            if [ "$unsup" -eq 0 ]; then
+                say ""
+                say "To proceed anyway, knowing the above:"
+                say "    ufw-docker install --unsupported --force"
+                audit "install REFUSED — unsupported environment ($PF_FAILED)"
+                exit 1
+            fi
+            # --unsupported ALONE still refuses. Two flags, because one flag is
+            # something you can paste from a forum post without reading it.
+            if [ "$force" -eq 0 ]; then
+                say ""
+                say "--unsupported alone is not enough. Add --force to confirm you"
+                say "have read the above and accept that filtering may not work:"
+                say "    ufw-docker install --unsupported --force"
+                audit "install REFUSED — --unsupported given without --force ($PF_FAILED)"
+                exit 1
+            fi
+            UNSUP_MARK="$PF_FAILED"
+            say ""
+            warn "PROCEEDING ANYWAY — --unsupported --force was given."
+            warn "This host is NOT a proven configuration. Filtering may silently"
+            warn "not work. This is recorded in the stanza and reported by every"
+            warn "'ufw-docker status' run from now on."
+            audit "install PROCEEDING IN UNSUPPORTED MODE ($PF_FAILED)"
+        fi
+    fi
 
     local v4 v6 wrote=0
     v4="$(subnets 4)"; v6="$(subnets 6)"
@@ -373,7 +606,7 @@ cmd_install() {
         fi
         ok "IPv4 stanza parses (iptables-restore --test)"
     fi
-    if [ -n "$v6" ] && [ -f /etc/ufw/after6.rules ] && s6="$(stanza 6)"; then
+    if [ -n "$v6" ] && [ -f $AFTER6 ] && s6="$(stanza 6)"; then
         if ! verr="$(printf '%s\n' "$s6" | validate_stanza 6)"; then
             bad "the generated IPv6 stanza does NOT parse — refusing to write it"
             printf '%s\n' "$verr" | sed 's/^/      /'
@@ -383,17 +616,17 @@ cmd_install() {
     fi
 
     if [ "$dry" -eq 1 ]; then
-        head_ "would append to /etc/ufw/after.rules"
+        head_ "would append to $AFTER4"
         printf '%s\n' "$s4" | sed 's/^/      /'
         if [ -n "$s6" ]; then
-            head_ "would append to /etc/ufw/after6.rules"
+            head_ "would append to $AFTER6"
             printf '%s\n' "$s6" | sed 's/^/      /'
         fi
         head_ "would also"
-        if [ -x /etc/ufw/before.init ] && grep -q 'ufw-docker' /etc/ufw/before.init 2>/dev/null; then
-            say "leave /etc/ufw/before.init alone (already ours)"
+        if [ -x $BEFORE_INIT ] && grep -q 'ufw-docker' $BEFORE_INIT 2>/dev/null; then
+            say "leave $BEFORE_INIT alone (already ours)"
         else
-            say "write /etc/ufw/before.init  (required: without it the SECOND"
+            say "write $BEFORE_INIT  (required: without it the SECOND"
             say "  'ufw reload' after install breaks the firewall)"
         fi
         [ "$selfheal" -eq 1 ] \
@@ -411,24 +644,24 @@ cmd_install() {
     install_hook || die "cannot proceed without the before.init hook — see above"
     ok "before.init hook installed (required for reload safety)"
 
-    cp -a /etc/ufw/after.rules  "/etc/ufw/after.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
-    strip_stanza /etc/ufw/after.rules
+    cp -a $AFTER4  "$AFTER4.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
+    strip_stanza $AFTER4
     if [ -n "$s4" ]; then
-        printf '%s\n' "$s4" >> /etc/ufw/after.rules
+        printf '%s\n' "$s4" >> $AFTER4
         ok "IPv4 stanza written to after.rules"; wrote=1
     fi
 
     if [ -n "$s6" ]; then
-        cp -a /etc/ufw/after6.rules "/etc/ufw/after6.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
-        strip_stanza /etc/ufw/after6.rules
-        printf '%s\n' "$s6" >> /etc/ufw/after6.rules
+        cp -a $AFTER6 "$AFTER6.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
+        strip_stanza $AFTER6
+        printf '%s\n' "$s6" >> $AFTER6
         ok "IPv6 stanza written to after6.rules"; wrote=1
     fi
 
     [ "$wrote" -eq 1 ] || die "no Docker subnets found — nothing to wire"
 
-    prune_backups /etc/ufw/after.rules.ufw-docker-bak-
-    prune_backups /etc/ufw/after6.rules.ufw-docker-bak-
+    prune_backups $AFTER4.ufw-docker-bak-
+    prune_backups $AFTER6.ufw-docker-bak-
 
     if [ "$selfheal" -eq 1 ]; then
         install_selfheal
@@ -453,14 +686,14 @@ cmd_install() {
     ufw status 2>/dev/null | grep -q 'Status: active' || bad_state=1
     [ "$(iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging')" -ge 9 ] || bad_state=1
     [ "$(iptables -S ufw-user-input 2>/dev/null | grep -c -- '--dport')" -gt 0 ] \
-        || [ "$(grep -c -- '-A ufw-user-input' /etc/ufw/user.rules 2>/dev/null)" -eq 0 ] \
+        || [ "$(grep -c -- '-A ufw-user-input' $USER4 2>/dev/null)" -eq 0 ] \
         || bad_state=1
 
     if [ "$bad_state" -eq 1 ]; then
         audit "install FAILED verification — rolling the stanza back out"
         bad "the firewall is NOT healthy after applying — rolling back"
-        strip_stanza /etc/ufw/after.rules
-        strip_stanza /etc/ufw/after6.rules
+        strip_stanza $AFTER4
+        strip_stanza $AFTER6
         ufw reload >/dev/null 2>&1
         if ufw status 2>/dev/null | grep -q 'Status: active'; then
             ok "rolled back; ufw is active again with your rules"
@@ -509,11 +742,11 @@ cmd_remove() {
     say "  - every DOCKER-USER rule, leaving Docker's own single RETURN"
     say ""
     local nbak nsnap
-    nbak=$(ls -1 /etc/ufw/after*.rules.ufw-docker-bak-* 2>/dev/null | wc -l)
+    nbak=$(ls -1 $UFW_DIR/after*.rules.ufw-docker-bak-* 2>/dev/null | wc -l)
     nsnap=$(ls -1d /var/backups/ufw-rescue-* 2>/dev/null | wc -l)
 
     if [ "$wipe" -eq 1 ]; then
-        [ "${nbak:-0}"  -gt 0 ] && say "  - $nbak existing after.rules backup(s) in /etc/ufw"
+        [ "${nbak:-0}"  -gt 0 ] && say "  - $nbak existing after.rules backup(s) in $UFW_DIR"
         [ "${nsnap:-0}" -gt 0 ] && say "  - $nsnap rescue snapshot(s) in /var/backups"
     fi
     say ""
@@ -546,21 +779,21 @@ cmd_remove() {
 
     # Back up BEFORE modifying, exactly as install does. Without this, a bad
     # strip would leave no way back to the working after.rules.
-    local keep; keep="/etc/ufw/after.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
-    cp -a /etc/ufw/after.rules "$keep"
+    local keep; keep="$AFTER4.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
+    cp -a $AFTER4 "$keep"
     say "backed up after.rules -> $(basename "$keep")"
 
-    strip_stanza /etc/ufw/after.rules  && ok "IPv4 stanza removed"
-    strip_stanza /etc/ufw/after6.rules && ok "IPv6 stanza removed"
+    strip_stanza $AFTER4  && ok "IPv4 stanza removed"
+    strip_stanza $AFTER6 && ok "IPv6 stanza removed"
     # Restore the original if we have one; otherwise still strip OUR hook rather
     # than leaving it behind. Relying on a backup existing meant that on a host
     # with no original before.init, our hook survived `remove` uninvited.
-    if [ -f /etc/ufw/before.init.ufw-docker-backup ]; then
-        mv /etc/ufw/before.init.ufw-docker-backup /etc/ufw/before.init
-        chmod 0640 /etc/ufw/before.init
+    if [ -f $BEFORE_INIT.ufw-docker-backup ]; then
+        mv $BEFORE_INIT.ufw-docker-backup $BEFORE_INIT
+        chmod 0640 $BEFORE_INIT
         ok "before.init restored to its original"
-    elif grep -q 'ufw-docker' /etc/ufw/before.init 2>/dev/null; then
-        rm -f /etc/ufw/before.init
+    elif grep -q 'ufw-docker' $BEFORE_INIT 2>/dev/null; then
+        rm -f $BEFORE_INIT
         ok "before.init hook removed (there was no original to restore)"
     fi
 
@@ -576,7 +809,7 @@ cmd_remove() {
     if [ "$wipe" -eq 1 ]; then
         # Everything except the backup this run just took.
         local n=0
-        for f in /etc/ufw/after*.rules.ufw-docker-bak-*; do
+        for f in $UFW_DIR/after*.rules.ufw-docker-bak-*; do
             [ -e "$f" ] || continue
             [ "$f" = "$keep" ] && continue
             rm -f "$f" && n=$((n + 1))
@@ -616,7 +849,7 @@ cmd_selfheal() {
     #    LOOKS fine -- ufw active, rules listed, nothing in any log. That is
     #    exactly what a future Docker flushing DOCKER-USER on startup would
     #    produce. A reload re-applies after.rules; no need for a full rescue.
-    if grep -q "$MARK_BEGIN" /etc/ufw/after.rules 2>/dev/null \
+    if grep -q "$MARK_BEGIN" $AFTER4 2>/dev/null \
        && [ "$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input')" -eq 0 ]; then
         logger -t ufw-docker-selfheal "stanza installed but DOCKER-USER unwired - reloading ufw"
         ufw reload >>/var/log/ufw-docker-selfheal.log 2>&1
@@ -631,7 +864,7 @@ cmd_selfheal() {
     # re-applying it on every boot is a loop, and an unfiltered host that says
     # so beats one that flaps.
     if [ "$repaired" -eq 1 ] \
-       && ! grep -q "$MARK_BEGIN" /etc/ufw/after.rules 2>/dev/null; then
+       && ! grep -q "$MARK_BEGIN" $AFTER4 2>/dev/null; then
         logger -t ufw-docker-selfheal \
             "RECOVERED but UNWIRED: ufw rules no longer affect Docker ports - run 'ufw-docker install'"
     fi
@@ -721,149 +954,265 @@ cmd_containers() {
     return 0
 }
 
+# ── status: collect, then render ───────────────────────────────────────────
+# `status` used to print as it checked. That made --json impossible without
+# writing every check twice, and two copies of a check drift -- this file has
+# already shipped three assertions that passed for the wrong reason. Checks now
+# append to one array and the renderers read it, so text and JSON cannot
+# disagree: one source of truth, two views.
+#
+# A useful side effect: messages carry no colour, because colour is applied at
+# render time. That is what makes them safe to put in JSON.
+ST_KEY=(); ST_LEVEL=(); ST_MSG=(); ST_EXTRA=()
+
+st() {   # $1=key  $2=ok|warn|bad|info|head  $3=message  [$4=indented detail]
+    ST_KEY+=("$1"); ST_LEVEL+=("$2"); ST_MSG+=("$3"); ST_EXTRA+=("${4:-}")
+}
+
+strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+json_str() {   # one JSON string literal, correctly escaped
+    local v="$1"
+    v="${v//\\/\\\\}"; v="${v//\"/\\\"}"
+    v="${v//$'\n'/\\n}"; v="${v//$'\t'/\\t}"; v="${v//$'\r'/\\r}"
+    printf '"%s"' "$v"
+}
+
+render_text() {
+    local i n="${#ST_KEY[@]}"
+    for (( i=0; i<n; i++ )); do
+        case "${ST_LEVEL[$i]}" in
+            ok)   ok   "${ST_MSG[$i]}" ;;
+            warn) warn "${ST_MSG[$i]}" ;;
+            bad)  bad  "${ST_MSG[$i]}" ;;
+            head) head_ "${ST_MSG[$i]}" ;;
+            *)    say  "${ST_MSG[$i]}" ;;
+        esac
+        [ -n "${ST_EXTRA[$i]}" ] && printf '%s\n' "${ST_EXTRA[$i]}" | sed 's/^/        /'
+    done
+    return 0
+}
+
+render_json() {   # $1 = overall rc
+    local i n="${#ST_KEY[@]}" sep=""
+    printf '{\n'
+    printf '  "version": %s,\n'    "$(json_str "$VERSION")"
+    printf '  "healthy": %s,\n'    "$([ "$1" -eq 0 ] && printf true || printf false)"
+    printf '  "installed": %s,\n'  "$([ "$ST_INSTALLED" -eq 1 ] && printf true || printf false)"
+    printf '  "supported": %s,\n'  "$([ -z "$PF_FAILED" ] && printf true || printf false)"
+    printf '  "preflight_failed": ['
+    for i in $PF_FAILED; do printf '%s%s' "$sep" "$(json_str "$i")"; sep=", "; done
+    printf '],\n'
+    printf '  "installed_unsupported": %s,\n' "$(json_str "$ST_UNSUP")"
+    printf '  "ufw_dir": %s,\n'    "$(json_str "$UFW_DIR")"
+    printf '  "ufw_paths_derived": %s,\n' "$([ "$UFW_PATHS_DERIVED" -eq 1 ] && printf true || printf false)"
+    printf '  "checks": [\n'
+    sep=""
+    for (( i=0; i<n; i++ )); do
+        [ "${ST_LEVEL[$i]}" = head ] && continue   # a text-layout device, not a finding
+        printf '%s    {"key": %s, "level": %s, "message": %s' \
+            "$sep" "$(json_str "${ST_KEY[$i]}")" "$(json_str "${ST_LEVEL[$i]}")" \
+            "$(json_str "${ST_MSG[$i]}")"
+        if [ -n "${ST_EXTRA[$i]}" ]; then
+            printf ', "detail": %s' "$(json_str "$(printf '%s' "${ST_EXTRA[$i]}" | strip_ansi)")"
+        fi
+        printf '}'
+        # A REAL newline: printf '%s' does not interpret an escape in its
+        # argument, so sep=",\n" emits a literal backslash-n and the document
+        # stops being JSON.
+        sep=$',\n'
+
+    done
+    printf '\n  ]\n}\n'
+    return 0
+}
+
+ST_INSTALLED=0
+ST_UNSUP=""
+
 cmd_status() {
     require_docker status
     require_readable
 
-    local show_rules=0
+    local show_rules=0 as_json=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --rules) show_rules=1 ;;
+            --json)  as_json=1 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
     done
 
-    head_ "ufw-docker status"
+    ST_KEY=(); ST_LEVEL=(); ST_MSG=(); ST_EXTRA=()
+    ST_INSTALLED=0; ST_UNSUP=""
     local rc=0
 
-    local act; act=$(ufw status 2>/dev/null | grep -c 'Status: active')
-    [ "$act" -eq 1 ] && ok "ufw active" || { bad "ufw is NOT active"; rc=1; }
+    # ── X1, on EVERY run, not only at install ──────────────────────────────
+    # A host that is supported today can have its iptables backend switched
+    # tomorrow, and nothing would otherwise say so. The stanza would still be
+    # present and `status` would still report "wired".
+    #
+    # Whether that is a FAULT depends on whether anyone agreed to it:
+    #
+    #   accepted at install (--unsupported --force)  -> a known risk, warn
+    #   NOT accepted                                 -> something changed
+    #                                                   underneath us, rc=1
+    #
+    # Grading an accepted host red forever would make its exit code useless --
+    # and an exit code that is always 1 is an exit code nobody reads, which
+    # costs the ability to detect the real fault when it arrives.
+    ST_UNSUP="$(installed_unsupported)"
+    if preflight; then
+        st supported ok "environment is a supported one"
+    elif pf_all_accepted "$PF_FAILED" "$ST_UNSUP"; then
+        st supported warn "UNSUPPORTED ENVIRONMENT ($PF_FAILED) — accepted at install time with --force:" \
+            "$(printf '%s' "$PF_DETAIL" | awk -F'|' 'NF{printf "%s: %s\n  %s\n", $1, $2, $3}')"
+    else
+        st supported bad "UNSUPPORTED ENVIRONMENT — this tool is not proven here:" \
+            "$(printf '%s' "$PF_DETAIL" | awk -F'|' 'NF{printf "%s: %s\n  %s\n", $1, $2, $3}')"
+        rc=1
+    fi
 
-    local logc; logc=$(iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging')
-    [ "$logc" -ge 9 ] && ok "ufw chains complete ($logc logging chains)" \
-        || { bad "ufw is half-built ($logc logging chains) — run ufw-rescue"; rc=1; }
+    local act; act=$(ufw status 2>/dev/null | grep -c 'Status: active') || true
+    [ "${act:-0}" -eq 1 ] && st ufw-active ok "ufw active" \
+        || { st ufw-active bad "ufw is NOT active"; rc=1; }
 
-    local sshr; sshr=$(iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22')
-    [ "$sshr" -gt 0 ] && ok "SSH rule present" \
-        || { bad "NO SSH rule in ufw-user-input — run ufw-rescue NOW"; rc=1; }
+    local logc; logc=$(iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging') || true
+    [ "${logc:-0}" -ge 9 ] && st ufw-chains ok "ufw chains complete ($logc logging chains)" \
+        || { st ufw-chains bad "ufw is half-built ($logc logging chains) — run ufw-docker rescue"; rc=1; }
+
+    local sshr; sshr=$(iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22') || true
+    [ "${sshr:-0}" -gt 0 ] && st ssh-rule ok "SSH rule present" \
+        || { st ssh-rule bad "NO SSH rule in ufw-user-input — run ufw-docker rescue NOW"; rc=1; }
 
     # "Not installed" is a perfectly valid state -- on a host that never ran
     # install, or straight after remove. Reporting the absent hook as a fault
     # there made `remove` exit non-zero, which is wrong and made the tool look
     # broken when it had just done exactly what was asked.
-    local installed=0
-    grep -q "$MARK_BEGIN" /etc/ufw/after.rules 2>/dev/null && installed=1
+    grep -q "$MARK_BEGIN" "$AFTER4" 2>/dev/null && ST_INSTALLED=1
 
-    if [ "$installed" -eq 0 ]; then
-        say "ufw-docker: NOT installed (ufw rules do not affect Docker ports)"
+    if [ "$ST_INSTALLED" -eq 0 ]; then
+        st installed info "ufw-docker: NOT installed (ufw rules do not affect Docker ports)"
+        if [ "$as_json" -eq 1 ]; then render_json "$rc"; else head_ "ufw-docker status"; render_text; fi
         return $rc
     fi
 
+    # Was this host wired while FAILING the preflight? Reported every run,
+    # forever, because the person reading this is usually not the person who
+    # typed --force.
+    [ -n "$ST_UNSUP" ] && st installed-unsupported warn \
+        "INSTALLED IN UNSUPPORTED MODE ($ST_UNSUP) — --force was used; filtering may silently not work"
+
     # Which version wired this host. The stanza carries it, so this answers the
-    # question even when /usr/local/sbin/ufw-docker has since been replaced --
-    # which is the case that matters, since a stanza written by an older version
-    # is exactly what a confusing bug report looks like.
+    # question even when the binary has since been replaced -- which is the case
+    # that matters, since a stanza written by an older version is exactly what a
+    # confusing bug report looks like.
     local wired_v
-    wired_v="$(grep -oE 'Managed by ufw-docker [0-9][^.]*\.[0-9]+\.[0-9]+' /etc/ufw/after.rules 2>/dev/null | awk '{print $4}' | head -1)"
+    wired_v="$(grep -oE 'Managed by ufw-docker [0-9][^.]*\.[0-9]+\.[0-9]+' "$AFTER4" 2>/dev/null | awk '{print $4}' | head -1)"
     if [ -n "$wired_v" ] && [ "$wired_v" != "$VERSION" ]; then
-        warn "wired by ufw-docker $wired_v, but this binary is $VERSION — re-run install"
+        st version warn "wired by ufw-docker $wired_v, but this binary is $VERSION — re-run install"
     else
-        say "version $VERSION${wired_v:+ (stanza matches)}"
+        st version info "version $VERSION${wired_v:+ (stanza matches)}"
     fi
 
-    [ -x /etc/ufw/before.init ] && grep -q 'ufw-docker' /etc/ufw/before.init 2>/dev/null \
-        && ok "before.init hook installed" \
-        || { bad "before.init hook MISSING — 'ufw reload' WILL break the firewall"; rc=1; }
+    if [ -x "$BEFORE_INIT" ] && grep -q 'ufw-docker' "$BEFORE_INIT" 2>/dev/null; then
+        st before-init ok "before.init hook installed"
+    else
+        st before-init bad "before.init hook MISSING — 'ufw reload' WILL break the firewall"; rc=1
+    fi
 
     # Does our logging agree with ufw's? The stanza bakes in whatever ufw's
     # setting was at install time, so the two drift the moment somebody runs
     # `ufw logging on|off` without re-running install. Silent drift in a logging
     # setting is how an audit trail quietly stops existing.
     local we_log=0
-    grep -q -- '--log-prefix "\[UFW DOCKER BLOCK\] "' /etc/ufw/after.rules 2>/dev/null && we_log=1
+    grep -q -- '--log-prefix "\[UFW DOCKER BLOCK\] "' "$AFTER4" 2>/dev/null && we_log=1
     if ufw_logging_on; then
-        if [ "$we_log" -eq 1 ]; then
-            ok "blocked container traffic is logged ([UFW DOCKER BLOCK])"
-        else
-            warn "ufw logging is ON but ours is OFF — re-run install to match"
-        fi
+        [ "$we_log" -eq 1 ] \
+            && st logging ok "blocked container traffic is logged ([UFW DOCKER BLOCK])" \
+            || st logging warn "ufw logging is ON but ours is OFF — re-run install to match"
     else
-        if [ "$we_log" -eq 1 ]; then
-            warn "ufw logging is OFF but ours is still ON — re-run install to match"
-        else
-            say "logging off, matching ufw (blocked container traffic is silent)"
-        fi
+        [ "$we_log" -eq 1 ] \
+            && st logging warn "ufw logging is OFF but ours is still ON — re-run install to match" \
+            || st logging info "logging off, matching ufw (blocked container traffic is silent)"
     fi
 
-    local jf; jf=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-forward')
-    [ "$jf" -gt 0 ] && ok "\`ufw route\` rules are honoured ($jf jumps into ufw-user-forward)" \
-        || warn "\`ufw route\` rules are NOT honoured — re-run install"
+    local jf; jf=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-forward') || true
+    [ "${jf:-0}" -gt 0 ] && st route-rules ok "\`ufw route\` rules are honoured ($jf jumps into ufw-user-forward)" \
+        || st route-rules warn "\`ufw route\` rules are NOT honoured — re-run install"
 
-    local j4; j4=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input')
-    [ "$j4" -gt 0 ] && ok "IPv4 wired ($j4 jumps into ufw-user-input)" \
-        || { bad "stanza present but IPv4 NOT wired — run 'install' or 'ufw reload'"; rc=1; }
+    local j4; j4=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input') || true
+    [ "${j4:-0}" -gt 0 ] && st wired-v4 ok "IPv4 wired ($j4 jumps into ufw-user-input)" \
+        || { st wired-v4 bad "stanza present but IPv4 NOT wired — run 'install' or 'ufw reload'"; rc=1; }
 
     # Drift check. This is the failure nobody would otherwise see.
-    local want have drift
+    local want have drift stale
     want="$(subnets 4 | sort -u)"
-    have="$(stanza_subnets /etc/ufw/after.rules)"
+    have="$(stanza_subnets "$AFTER4")"
     drift="$(comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$have") 2>/dev/null)"
     if [ -n "$drift" ]; then
-        bad "SUBNET DRIFT — Docker networks not covered by the installed stanza:"
-        printf '%s\n' "$drift" | sed 's/^/        /'
-        say  "    traffic to these is filtered by nothing. Re-run: ufw-docker install"
+        st subnet-drift bad "SUBNET DRIFT — Docker networks not covered by the installed stanza:" \
+            "$(printf '%s\n' "$drift"; printf 'traffic to these is filtered by nothing. Re-run: ufw-docker install\n')"
         rc=1
     else
-        ok "all Docker IPv4 subnets are covered"
+        st subnet-drift ok "all Docker IPv4 subnets are covered"
     fi
-    local stale
     stale="$(comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$have") 2>/dev/null | grep -v ':' || true)"
-    [ -n "$stale" ] && warn "stanza covers subnets Docker no longer has (harmless): $(echo "$stale" | tr '\n' ' ')"
+    [ -n "$stale" ] && st subnet-stale warn \
+        "stanza covers subnets Docker no longer has (harmless): $(echo "$stale" | tr '\n' ' ')"
 
     # A count only -- the full list floods `status` on a host with many
     # containers (15 on the development box). `ufw-docker containers` lists them.
     local ntot nstat
     ntot=$(docker ps -q 2>/dev/null | wc -l)
-    nstat=$(container_rows | grep -c 'static' || true)
-    [ "${ntot:-0}" -gt 0 ] && say "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
+    nstat=$(container_rows | grep -c 'static') || true
+    [ "${ntot:-0}" -gt 0 ] && st containers info \
+        "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
 
     # Loud, not fatal: the rule may legitimately be for a host service on that
     # same port. Does not set rc -- a confusing rule is the operator's to judge.
-    check_remapped_rules || true
+    local remap; remap="$(check_remapped_rules 2>&1 | strip_ansi || true)"
+    [ -n "$remap" ] && st remapped-rules warn \
+        "ufw rules that CANNOT match a container, because the port is remapped:" \
+        "$(printf '%s' "$remap" | sed -n '2,$p')"
 
     # C3: "are we wired?" is not the question an operator actually has. The
     # question is "which rules decide what reaches my containers?" -- and the
     # answer is these two chains, consulted in this order, for traffic whose
     # destination is a container address. Off by default because it is long.
     if [ "$show_rules" -eq 1 ]; then
-        head_ "rules containers are judged by, in order"
-        say "ufw-user-forward  (\`ufw route ...\`, consulted FIRST):"
-        local fwd; fwd="$(iptables -S ufw-user-forward 2>/dev/null | grep -v '^-N')"
-        if [ -n "$fwd" ]; then printf '%s\n' "$fwd" | sed 's/^/        /'
-        else say "        (none)"; fi
-        say "ufw-user-input    (plain \`ufw allow|deny ...\`, consulted SECOND):"
-        local inp; inp="$(iptables -S ufw-user-input 2>/dev/null | grep -v '^-N')"
-        if [ -n "$inp" ]; then printf '%s\n' "$inp" | sed 's/^/        /'
-        else say "        (none)"; fi
-        say ""
-        say "Reading these: a rule with NO destination governs the host AND every"
-        say "container. A rule with -d <container ip> governs only that container."
-        say "Ports are CONTAINER ports, not published ones. See docs/scoping.md."
-        head_ "wiring"
+        local fwd inp
+        fwd="$(iptables -S ufw-user-forward 2>/dev/null | grep -v '^-N')"
+        inp="$(iptables -S ufw-user-input 2>/dev/null | grep -v '^-N')"
+        st _hdr head "rules containers are judged by, in order"
+        st rules-forward info "ufw-user-forward  (\`ufw route ...\`, consulted FIRST):" "${fwd:-(none)}"
+        st rules-input   info "ufw-user-input    (plain \`ufw allow|deny ...\`, consulted SECOND):" "${inp:-(none)}"
+        st rules-note info "" \
+"Reading these: a rule with NO destination governs the host AND every
+container. A rule with -d <container ip> governs only that container.
+Ports are CONTAINER ports, not published ones. See docs/scoping.md."
+        st _hdr2 head "wiring"
     fi
 
-    local v6nets; v6nets="$(subnets 6)"
-    local j6; j6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c 'ufw6-user-input')
+    local v6nets j6
+    v6nets="$(subnets 6)"
+    j6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c 'ufw6-user-input') || true
     if [ -n "$v6nets" ]; then
-        [ "$j6" -gt 0 ] && ok "IPv6 wired ($j6 jumps into ufw6-user-input)" \
-            || { bad "Docker has IPv6 networks but IPv6 is NOT wired — v6 is unfiltered"; rc=1; }
+        [ "${j6:-0}" -gt 0 ] && st wired-v6 ok "IPv6 wired ($j6 jumps into ufw6-user-input)" \
+            || { st wired-v6 bad "Docker has IPv6 networks but IPv6 is NOT wired — v6 is unfiltered"; rc=1; }
     else
-        say "IPv6: Docker has no v6 networks; nothing to wire"
+        st wired-v6 info "IPv6: Docker has no v6 networks; nothing to wire"
+    fi
+
+    if [ "$as_json" -eq 1 ]; then
+        render_json "$rc"
+    else
+        head_ "ufw-docker status"
+        render_text
     fi
     return $rc
 }
-
 
 # ── rescue ─────────────────────────────────────────────────────────────────
 # Deliberately different discipline from the rest of this file: NO `set -e`
@@ -887,9 +1236,9 @@ cmd_rescue() {
     say "forensic snapshot: $BACKUP"
     iptables-save  > "$BACKUP/iptables.v4"  2>/dev/null
     ip6tables-save > "$BACKUP/iptables.v6"  2>/dev/null
-    cp -a /etc/ufw/after.rules  "$BACKUP/" 2>/dev/null
-    cp -a /etc/ufw/after6.rules "$BACKUP/" 2>/dev/null
-    cp -a /etc/ufw/user.rules   "$BACKUP/" 2>/dev/null
+    cp -a $AFTER4  "$BACKUP/" 2>/dev/null
+    cp -a $AFTER6 "$BACKUP/" 2>/dev/null
+    cp -a $USER4   "$BACKUP/" 2>/dev/null
 
     # ── 1. SSH FIRST ───────────────────────────────────────────────────────────
     # Before touching anything else. A blanket accept at the top of INPUT works no
@@ -919,7 +1268,7 @@ cmd_rescue() {
     for port in $SSH_PORTS; do
         # The operator's own rules for this port, exactly as ufw stored them.
         rules="$(grep -E -- "^-A ufw-user-input .*--dport ${port}( |$)" \
-                 /etc/ufw/user.rules 2>/dev/null)"
+                 $USER4 2>/dev/null)"
         if [ -n "$rules" ]; then
             echo "$rules" | while IFS= read -r r; do
                 # shellcheck disable=SC2086
@@ -949,7 +1298,7 @@ cmd_rescue() {
 
     # ── 2. remove our Docker stanza ────────────────────────────────────────────
     head_ "2. removing the DOCKER-UFW stanza"
-    for f in /etc/ufw/after.rules /etc/ufw/after6.rules; do
+    for f in $AFTER4 $AFTER6; do
         [ -f "$f" ] || continue
         if grep -qF 'BEGIN DOCKER-UFW' "$f" 2>/dev/null; then
             sed -i '/# BEGIN DOCKER-UFW/,/# END DOCKER-UFW/d' "$f"
@@ -1103,6 +1452,9 @@ cmd_rescue() {
     return $RC
 
 }
+
+# Before anything reads or writes one of ufw's files.
+derive_ufw_paths
 
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;

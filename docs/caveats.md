@@ -104,6 +104,19 @@ SUBNET DRIFT — Docker networks not covered by the installed stanza:
 
 Worth running `status` from cron for exactly this reason.
 
+## The untested cases below are now REFUSED, not merely documented
+
+Everything in this file used to be a caveat you had to read. Swarm, rootless Docker and
+a non-nf_tables backend are now **preflight failures**: `install` refuses, and `status`
+reports them on every run. A caveat in a document protects nobody who has not read it.
+
+`--unsupported --force` overrides it, loudly and permanently — see the README.
+
+Note what is deliberately *not* a preflight failure: `--network host` containers. They
+are understood, correctly unaffected, and governed by plain ufw `INPUT` rules. Calling
+that "unsupported" would spend the word on something harmless, and then it would not be
+read in the cases where it means real danger.
+
 ## Swarm is NOT supported — do not assume it works
 
 **Untested, deliberately, and not on the roadmap.** This is a statement of scope, not a

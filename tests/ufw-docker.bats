@@ -9,6 +9,12 @@
 REPO="${BATS_TEST_DIRNAME}/.."
 HOST_IP="${HOST_IP:?set HOST_IP to the primary address of this host}"
 
+# Derived the same way the tool derives it (D5), so these tests keep working on
+# a host whose ufw is packaged somewhere other than /etc/ufw. The older tests
+# below still hardcode the Debian path; that is a known inconsistency, not a
+# statement that the path is fixed.
+AFTER4="$(python3 -c 'import ufw.common as c; print(c.config_dir + "/ufw/after.rules")' 2>/dev/null || echo /etc/ufw/after.rules)"
+
 probe()  { sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" get "$1" "${2:-http}"; }
 health() { sudo iptables -S ufw-user-input 2>/dev/null; }
 logchains() { sudo iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging'; }
@@ -929,6 +935,124 @@ v6nets() {
     clr6
     docker rm -f v6svc >/dev/null 2>&1 || true
     reinstall
+}
+
+# ── X1 / D4 / D5: the supported-environment preflight ─────────────────────
+#
+# A stub that makes `iptables --version` report the legacy backend while every
+# other iptables call passes through untouched. That is the honest way to test
+# a refusal: switching the host's real backend mid-suite would strand rules in
+# the other subsystem, which is the very thing X1 exists to detect.
+unsup_env() {
+    local d="$BATS_FILE_TMPDIR/stub"
+    mkdir -p "$d"
+    cat > "$d/iptables" <<'STUB'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "iptables v1.8.9 (legacy)"; exit 0; }
+exec /usr/sbin/iptables "$@"
+STUB
+    chmod +x "$d/iptables"
+    printf '%s' "PATH=$d:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
+@test "install REFUSES an unsupported environment, and changes nothing" {
+    local before after
+    before="$(sudo md5sum "$AFTER4" | awk '{print $1}')"
+
+    run sudo env "$(unsup_env)" "$REPO/ufw-docker" install
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q 'UNSUPPORTED ENVIRONMENT'
+    echo "$output" | grep -q "only nf_tables is proven"
+    # It must say how to proceed, or the refusal is just a wall.
+    echo "$output" | grep -q -- '--unsupported --force'
+
+    after="$(sudo md5sum "$AFTER4" | awk '{print $1}')"
+    [ "$before" = "$after" ]        # a refusal that edited the file is not a refusal
+}
+
+@test "--unsupported ALONE still refuses; it takes both flags" {
+    # One flag is something you can paste from a forum post without reading it.
+    run sudo env "$(unsup_env)" "$REPO/ufw-docker" install --unsupported
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q 'alone is not enough'
+    sudo grep -q 'INSTALLED IN UNSUPPORTED MODE' "$AFTER4" && false || true
+}
+
+@test "--unsupported --force installs, and says so FOREVER afterwards" {
+    run sudo env "$(unsup_env)" "$REPO/ufw-docker" install --unsupported --force
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'PROCEEDING ANYWAY'
+
+    # Recorded in the stanza, so it outlives the shell that typed --force.
+    sudo grep -q 'INSTALLED IN UNSUPPORTED MODE: backend' "$AFTER4"
+
+    # And reported by status even though the environment now PASSES the
+    # preflight -- the person reading status is rarely the person who forced it.
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'INSTALLED IN UNSUPPORTED MODE'
+
+    # The grading rule, which is the subtle part. On the SAME unsupported
+    # environment, an accepted host WARNS and still exits 0 -- because an exit
+    # code that is permanently 1 is an exit code nobody reads, and then the
+    # real fault arrives unnoticed. The not-accepted case is asserted
+    # separately below and must still be rc=1.
+    run sudo env "$(unsup_env)" "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'accepted at install time'
+
+    # A clean reinstall clears it.
+    reinstall
+    run sudo "$REPO/ufw-docker" status
+    ! echo "$output" | grep -q 'INSTALLED IN UNSUPPORTED MODE'
+}
+
+@test "status --json is valid JSON and reports the preflight verdict" {
+    run sudo "$REPO/ufw-docker" status --json
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | python3 -m json.tool >/dev/null
+
+    printf '%s' "$output" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+assert d["supported"] is True, d["supported"]
+assert d["installed"] is True, d["installed"]
+assert d["preflight_failed"] == [], d["preflight_failed"]
+assert d["ufw_paths_derived"] is True, "D5: paths should derive from ufw.common"
+assert any(c["key"] == "wired-v4" for c in d["checks"]), "missing wired-v4"
+assert all("\033" not in c["message"] for c in d["checks"]), "colour leaked into JSON"
+'
+}
+
+@test "status --json reports an unsupported environment as machine-readable" {
+    # NOT accepted: this host was installed cleanly and the backend changed
+    # underneath it, which is a fault rather than a known risk.
+    reinstall
+    run sudo env "$(unsup_env)" "$REPO/ufw-docker" status --json
+    [ "$status" -eq 1 ]            # non-zero is what monitoring gates on
+    printf '%s' "$output" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+assert d["healthy"] is False
+assert d["supported"] is False
+assert d["preflight_failed"] == ["backend"], d["preflight_failed"]
+'
+}
+
+@test "D5: ufw paths are derived from ufw itself, not hardcoded" {
+    # The value of deriving is that a wrong path fails LOUDLY. Prove the
+    # derivation actually ran and landed somewhere real, rather than silently
+    # falling back to the Debian default and happening to be right.
+    run sudo "$REPO/ufw-docker" status --json
+    [ "$status" -eq 0 ]
+    local dir
+    dir="$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ufw_dir"])')"
+    [ -d "$dir" ]
+    [ -f "$dir/after.rules" ]
+    # and it agrees with what ufw's own module says
+    local want
+    want="$(python3 -c 'import ufw.common as c; print(c.config_dir + "/ufw")')"
+    [ "$dir" = "$want" ]
 }
 
 @test "remove returns DOCKER-USER to stock" {
