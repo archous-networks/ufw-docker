@@ -224,7 +224,8 @@ v4-only setup that looks complete is worse than none.
 ## Requirements
 
 Debian/Ubuntu with `ufw`, Docker, `iptables`, and root. Tested on Debian 12 with
-ufw 0.36.2, Docker 28.x, nftables-backed iptables 1.8.9.
+ufw 0.36.2, Docker 28.x, nftables-backed iptables 1.8.9 — including across a real reboot,
+where ufw starts before Docker and the wiring survives intact.
 
 ## Testing
 

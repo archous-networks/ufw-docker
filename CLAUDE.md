@@ -81,7 +81,7 @@ id and changes when a network is recreated. Source/destination subnet is stable.
 | `ufw disable` → `enable` | ✅ | |
 | `docker compose up --force-recreate` | ✅ | |
 | `systemctl restart docker` | ✅ | Docker creates `DOCKER-USER` only if absent; it does not flush it |
-| host reboot | **untested** | see below |
+| host reboot | ✅ | verified 2026-10-21; see *Reboot* below |
 
 **Reboot is the remaining gap.** `ufw-docker-selfheal.service` was written as a net —
 it waits 20s after boot, checks for an SSH rule in `ufw-user-input`, and runs `ufw-docker rescue`
@@ -317,7 +317,9 @@ inside it.** If you want to read the unit, read `install_selfheal()`.
 
 ## Still open
 
-- **Reboot/boot-ordering**, above.
+- **The self-heal unit has never actually repaired anything at boot.** Its detection ran
+  and reported `ufw healthy at boot`, and `rescue` itself is well exercised by hand — but
+  the two have never been joined up in anger, because the boot has not yet gone wrong.
 - **Functional IPv6.** The v6 stanza is verified to generate and apply (`IPv6 wired (1
   jumps into ufw6-user-input)`), but the dev host has no global IPv6, so no v6 packet has
   ever been filtered by it. Needs a v6-capable host.
