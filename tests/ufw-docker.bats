@@ -167,9 +167,28 @@ stop_host_listeners() {
 # It prints to FD 3, not stderr. bats captures a test's stdout and stderr and
 # --tap does not replay them, so the first version of this helper ran in CI and
 # its diagnostics went nowhere. FD 3 is bats' pass-through to the terminal.
+# What backend is this host ACTUALLY on? Several tests assert properties that
+# only hold on an environment the preflight calls supported, and CI
+# deliberately runs one leg on iptables-legacy to find out whether it works.
+host_backend() {
+    iptables --version 2>/dev/null | grep -oE '\(nf_tables\)|\(legacy\)' | tr -d '()'
+}
+host_supported() { [ "$(host_backend)" = nf_tables ]; }
+
 reinstall() {
-    local out rc
-    out=$(sudo "$REPO/ufw-docker" install 2>&1); rc=$?
+    local out rc force=""
+    # X1 refuses to install on an environment it has not been proven on, which
+    # is correct -- and which would stop the legacy CI leg before it could tell
+    # us ANYTHING about whether legacy works. The leg exists precisely to
+    # answer that, so here, and only here, we take the documented override.
+    #
+    # This is not a way around the preflight. It is how the preflight earns the
+    # right to stop refusing: when this leg is green, legacy becomes a proven
+    # environment and the override stops being needed. Until then the refusal
+    # is the correct production behaviour and the tests above assert it.
+    host_supported || force="--unsupported --force"
+    # shellcheck disable=SC2086
+    out=$(sudo "$REPO/ufw-docker" install $force 2>&1); rc=$?
     if [ $rc -ne 0 ]; then
         {
             echo "--- install exited $rc ---"
@@ -1001,13 +1020,18 @@ STUB
     [ "$status" -eq 0 ]
     echo "$output" | grep -q 'accepted at install time'
 
-    # A clean reinstall clears it.
+    # A clean reinstall clears it -- but only where a clean install is possible.
+    # On the legacy leg reinstall must itself pass --unsupported --force, so the
+    # marker correctly stays.
     reinstall
-    run sudo "$REPO/ufw-docker" status
-    ! echo "$output" | grep -q 'INSTALLED IN UNSUPPORTED MODE'
+    if host_supported; then
+        run sudo "$REPO/ufw-docker" status
+        ! echo "$output" | grep -q 'INSTALLED IN UNSUPPORTED MODE'
+    fi
 }
 
 @test "status --json is valid JSON and reports the preflight verdict" {
+    host_supported || skip "host backend is $(host_backend); this asserts the supported case"
     run sudo "$REPO/ufw-docker" status --json
     [ "$status" -eq 0 ]
     printf '%s' "$output" | python3 -m json.tool >/dev/null
@@ -1026,7 +1050,9 @@ assert all("\033" not in c["message"] for c in d["checks"]), "colour leaked into
 
 @test "status --json reports an unsupported environment as machine-readable" {
     # NOT accepted: this host was installed cleanly and the backend changed
-    # underneath it, which is a fault rather than a known risk.
+    # underneath it, which is a fault rather than a known risk. That premise
+    # needs a clean install, which the legacy leg cannot give us.
+    host_supported || skip "host backend is $(host_backend); needs a clean (unforced) install"
     reinstall
     run sudo env "$(unsup_env)" "$REPO/ufw-docker" status --json
     [ "$status" -eq 1 ]            # non-zero is what monitoring gates on
@@ -1040,6 +1066,7 @@ assert d["preflight_failed"] == ["backend"], d["preflight_failed"]
 }
 
 @test "D5: ufw paths are derived from ufw itself, not hardcoded" {
+    host_supported || skip "host backend is $(host_backend); this asserts the supported case"
     # The value of deriving is that a wrong path fails LOUDLY. Prove the
     # derivation actually ran and landed somewhere real, rather than silently
     # falling back to the Debian default and happening to be right.

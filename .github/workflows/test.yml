@@ -93,14 +93,30 @@ jobs:
         # see tests/ufw-docker.bats.
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq iptables
+          sudo apt-get install -y -qq iptables nftables
           if [ "${{ matrix.iptables }}" = legacy ]; then
             sudo update-alternatives --set iptables  /usr/sbin/iptables-legacy
             sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+
+            # A11: the switch alone is NOT enough, and this is what the leg has
+            # been failing on. The runner boots with Docker's chains already in
+            # the nft subsystem. Changing the alternative only changes which
+            # binary WE then talk to -- it does not remove what is already
+            # there, and the kernel evaluates BOTH. A DROP in the nft ruleset
+            # therefore still wins over an ACCEPT we add via legacy, which is
+            # exactly the observed symptom: every "should be OPEN" assertion
+            # failed while every "should be BLOCKED" one passed.
+            #
+            # This is the same hazard X1's mixed-backend check refuses on a
+            # real host; here we deliberately create a clean single-backend
+            # host instead.
+            sudo nft flush ruleset || true
             sudo systemctl restart docker
             sleep 10
           fi
           iptables --version
+          echo "--- legacy rules ---"; sudo iptables-legacy -S 2>/dev/null | grep -c '^-A' || true
+          echo "--- nft rules ---";    sudo iptables-nft    -S 2>/dev/null | grep -c '^-A' || true
           sudo iptables -S | head -5
 
       - name: Enable IPv6 in the Docker daemon
