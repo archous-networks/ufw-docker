@@ -43,7 +43,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh
+        run: shellcheck -S warning ufw-docker tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh
 
   bats:
     runs-on: ubuntu-latest
@@ -52,17 +52,56 @@ jobs:
     # explained the failure. The teardown is now bounded too (see run.sh).
     timeout-minutes: 25
     strategy:
-      # Both legs are real deployments, and they exercise DIFFERENT code.
-      # ip6tables OFF is the common production case: Docker installs its own
-      # raw/PREROUTING DROP ahead of FORWARD, so our v6 stanza is written but
-      # never consulted. ip6tables ON is the case where the v6 stanza actually
-      # decides. Testing only one of them would leave half the tool unproven.
+      # Explicit legs rather than a full cross product, so each one is here on
+      # purpose and the cost is visible.
+      #
+      #   ipv6 OFF / nft     the common production case. Docker installs its own
+      #                      raw/PREROUTING DROP ahead of FORWARD, so the v6
+      #                      stanza is written but never consulted.
+      #   ipv6 ON  / nft     the case where the v6 stanza actually decides.
+      #   ipv6 OFF / legacy  the real xtables backend, which Debian 10/11 and
+      #                      older Ubuntu default to and which update-alternatives
+      #                      can still select on 12. Everything this project has
+      #                      ever verified ran on nf_tables, and at least one
+      #                      measured behaviour differs between them (see below).
+      #
+      # The backend is orthogonal to IPv6, so one legacy leg proves the backend
+      # and pairing it with the simpler v6-off config isolates the variable.
       fail-fast: false
       matrix:
-        docker_ipv6: [false, true]
-    name: bats (docker ipv6=${{ matrix.docker_ipv6 }})
+        include:
+          - docker_ipv6: false
+            iptables: nft
+          - docker_ipv6: true
+            iptables: nft
+          - docker_ipv6: false
+            iptables: legacy
+    name: bats (ipv6=${{ matrix.docker_ipv6 }}, iptables=${{ matrix.iptables }})
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select the iptables backend
+        # FIRST, before ufw is enabled and before Docker builds any chains --
+        # switching afterwards would leave rules stranded in the other backend.
+        # Docker is restarted so it recreates DOCKER-USER and friends under the
+        # selected one.
+        #
+        # Known difference this leg is expected to expose: `iptables-restore
+        # --test` accepts `-j NOSUCHCHAIN` with rc=0 under nf_tables and is
+        # expected to REJECT it under legacy. One test asserts the nft
+        # behaviour, so if it fails here that is the finding, not a defect --
+        # see tests/ufw-docker.bats.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iptables
+          if [ "${{ matrix.iptables }}" = legacy ]; then
+            sudo update-alternatives --set iptables  /usr/sbin/iptables-legacy
+            sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+            sudo systemctl restart docker
+            sleep 10
+          fi
+          iptables --version
+          sudo iptables -S | head -5
 
       - name: Enable IPv6 in the Docker daemon
         if: matrix.docker_ipv6

@@ -85,6 +85,6 @@ installed.
 | IPv6 without daemon `ip6tables` | Docker adds its own `raw`/PREROUTING DROP ahead of FORWARD, so our v6 stanza is correct but never consulted |
 | IPv6 WITH daemon `ip6tables` | that DROP disappears and the v6 stanza governs. allow/deny/source/destination all behave exactly as v4. Measured; CI runs both legs |
 | a v6 probe of a v4-only listener | TCP RST → `000`, identical to "correctly blocked". `python -m http.server` needs `--bind ::` |
-| `iptables-restore --test` | catches **syntax** (`--bogus` → rc=2); does **not** catch a jump to a nonexistent chain (`-j NOSUCHCHAIN` → rc=0) on 1.8.9/nf_tables. Both pinned by a test |
+| `iptables-restore --test` | catches **syntax** (`--bogus` → rc=2) on both backends; a jump to a nonexistent chain is **accepted** (rc=0) under nf_tables and **rejected** under legacy. Backend-dependent, asserted per backend by a test |
 | `iptables-restore` is in `/usr/sbin` | not on a plain user's `PATH`. A `command -v` guard that looks fine interactively passes vacuously; the tool only ever runs this as root |
 | `ufw logging off` | does not reach our own `LOG` rule. `install` reads the setting and bakes it in; `status` reports the drift |

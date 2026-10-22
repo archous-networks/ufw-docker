@@ -32,14 +32,18 @@ This used to be found the hard way: `ufw reload` would fail, by which point `aft
 was already on disk and ufw was half-built, with only the rollback between the operator
 and a lockout.
 
-**What `--test` catches, measured on iptables 1.8.9 (nf_tables):**
+**What `--test` catches, and it depends on the backend:**
 
-| rule | result |
-|---|---|
-| `-A TESTCHAIN --bogus` | ✅ rejected, rc=2 |
-| `-A TESTCHAIN -j NOSUCHCHAIN` | ⚠️ **accepted**, rc=0 |
+| rule | iptables-nft 1.8.9 | iptables-legacy |
+|---|---|---|
+| `-A TESTCHAIN --bogus` | ✅ rejected, rc=2 | ✅ rejected |
+| `-A TESTCHAIN -j NOSUCHCHAIN` | ⚠️ **accepted**, rc=0 | ✅ rejected |
 
-So it is a syntax check, not a link check. The unresolvable-jump case is covered by
+The nft row is measured on this project's development host; the legacy row is asserted by
+the `iptables=legacy` CI leg. Under legacy the pre-write check is simply strictly
+stronger.
+
+So under nf_tables it is a syntax check, not a link check. The unresolvable-jump case is covered by
 construction instead — the stanza declares every chain it jumps to, so it cannot name a
 target it did not create. Both rows are pinned by a test, so the day a future iptables
 changes its mind about either, the suite says so rather than the check quietly becoming a

@@ -705,11 +705,24 @@ teardown_file() {
     run sudo bash -c 'printf "*filter\n:TESTCHAIN - [0:0]\n-A TESTCHAIN --bogus\nCOMMIT\n" | iptables-restore --test'
     [ "$status" -ne 0 ]
 
-    # And the documented blind spot: a jump to a chain that does not exist is
-    # NOT caught. Asserted so the limitation is a fact under test rather than a
-    # comment that can quietly go stale.
+    # The blind spot, which is BACKEND-DEPENDENT. A jump to a chain that does
+    # not exist passes --test under nf_tables (rc=0) and is rejected under
+    # legacy xtables. Asserted per backend rather than hardcoding one, so the
+    # difference is a recorded property instead of something the legacy CI leg
+    # trips over.
+    #
+    # Either way the stanza is safe by construction: it declares every chain it
+    # jumps to. Under legacy the pre-write check is simply strictly stronger.
+    local backend=nft
+    sudo iptables --version 2>/dev/null | grep -q legacy && backend=legacy
+    echo "# iptables backend: $backend" >&3
+
     run sudo bash -c 'printf "*filter\n:TESTCHAIN - [0:0]\n-A TESTCHAIN -j NOSUCHCHAIN\nCOMMIT\n" | iptables-restore --test'
-    [ "$status" -eq 0 ]
+    if [ "$backend" = legacy ]; then
+        [ "$status" -ne 0 ]
+    else
+        [ "$status" -eq 0 ]
+    fi
 }
 
 @test "--version reports a version, and the stanza carries the same one" {

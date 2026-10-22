@@ -9,7 +9,7 @@
 # error back. It surfaced weeks later, by accident, while adding an unrelated
 # subcommand. `bash -n` and shellcheck both pass on that code.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 FILE=${1:-ufw-docker}
 rc=0
 
