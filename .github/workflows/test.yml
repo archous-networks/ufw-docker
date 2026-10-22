@@ -113,6 +113,9 @@ jobs:
           sudo ufw status verbose
 
       - name: Run the suite
+        # The suite itself takes ~2 minutes of wall clock. Anything close to
+        # this limit means something is hanging, not that the tests are slow.
+        timeout-minutes: 12
         env:
           # The runner's own primary address — what the netns probe targets.
           HOST_IP: ""
@@ -131,4 +134,11 @@ jobs:
 
       - name: Always leave the runner sane
         if: always()
-        run: sudo /usr/local/sbin/ufw-docker rescue || true
+        # BOUNDED. This is the third rescue a failing run reaches (bats
+        # teardown_file, then run.sh's trap, then here). All three were
+        # unbounded, and a run whose firewall was genuinely broken spent the
+        # rest of the job's time budget in them -- the suite itself finished in
+        # about two minutes, then the job sat for thirteen more and was
+        # cancelled, taking the diagnostics with it.
+        timeout-minutes: 5
+        run: sudo timeout 180 /usr/local/sbin/ufw-docker rescue || true

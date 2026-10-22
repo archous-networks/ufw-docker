@@ -31,6 +31,40 @@ ensure_service() {
     return 1
 }
 
+# Start a listener on the HOST (not in a container), safely.
+#
+# THE `3>&-` IS LOAD-BEARING AND IS NOT TIDINESS. bats blocks on exit until
+# every process holding its fd 3 has gone. A background process started without
+# closing fd 3 inherits it, and bats then waits for that process to end --
+# forever, for a `python -m http.server`.
+#
+# Measured, because it cost two cancelled CI jobs:
+#
+#     sleep 25 >/dev/null 2>&1 &        -> bats exits after 25s
+#     sleep 25 >/dev/null 2>&1 3>&- &   -> bats exits immediately
+#
+# Redirecting stdout and stderr is NOT enough; both listeners here already did
+# that. In CI a test failed before its `kill` line, the orphan held fd 3, and
+# the job sat at the "Run the suite" step until the timeout cancelled it --
+# which also threw away the diagnostics that would have explained the original
+# failure. The PID file is the second line of defence: teardown kills anything
+# a failed test did not.
+start_host_listener() {   # $1 = port
+    python3 -m http.server "$1" --bind 0.0.0.0 >/dev/null 2>&1 3>&- &
+    echo $! >> "$BATS_FILE_TMPDIR/hostpids"
+    sleep 2
+}
+
+stop_host_listeners() {
+    local pid
+    [ -f "$BATS_FILE_TMPDIR/hostpids" ] || return 0
+    while read -r pid; do
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    done < "$BATS_FILE_TMPDIR/hostpids"
+    : > "$BATS_FILE_TMPDIR/hostpids"
+    return 0
+}
+
 # Re-install, and SAY WHY if it fails.
 #
 # Every one of these was `reinstall` as a
@@ -41,6 +75,10 @@ ensure_service() {
 #
 # install's exit code is cmd_status's, so a non-zero result means the firewall
 # is genuinely unhealthy -- exactly the thing worth printing.
+#
+# It prints to FD 3, not stderr. bats captures a test's stdout and stderr and
+# --tap does not replay them, so the first version of this helper ran in CI and
+# its diagnostics went nowhere. FD 3 is bats' pass-through to the terminal.
 reinstall() {
     local out rc
     out=$(sudo "$REPO/ufw-docker" install 2>&1); rc=$?
@@ -51,7 +89,7 @@ reinstall() {
             echo "--- ufw status ---";      sudo ufw status verbose 2>&1 || true
             echo "--- DOCKER-USER ---";     sudo iptables -S DOCKER-USER 2>&1 || true
             echo "--- ufw-user-input ---";  sudo iptables -S ufw-user-input 2>&1 || true
-        } >&2
+        } >&3
         return $rc
     fi
     return 0
@@ -79,6 +117,26 @@ setup_file() {
     sudo ufw status 2>/dev/null | tail -n +4 | sort > "$BATS_FILE_TMPDIR/rules-before"
 }
 
+# Fail the test that BREAKS the SSH rule, not the five downstream tests that
+# merely observe it missing. Test 14 deleted it and eleven later tests failed;
+# the log blamed all of them and none of them was the cause. This names it.
+teardown() {
+    # FIRST, unconditionally: a test that failed early never reached its own
+    # cleanup, and one orphan holding fd 3 hangs the whole run on exit.
+    stop_host_listeners
+
+    if [ "$(ssh_rule)" -eq 0 ]; then
+        {
+            echo "### THIS TEST LEFT THE HOST WITH NO SSH RULE IN ufw-user-input ###"
+            echo "### everything after it will fail for this reason, not its own ###"
+            sudo ufw status verbose 2>&1 || true
+            grep -- '-A ufw-user-input' /etc/ufw/user.rules 2>/dev/null || echo "(none in user.rules either)"
+        } >&3
+        return 1
+    fi
+    return 0
+}
+
 teardown_file() {
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1 || true
     # Remove the blanket SSH allow ONLY if we added it. Leaving one behind would
@@ -89,7 +147,11 @@ teardown_file() {
     fi
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" down || true
     # Non-negotiable: never leave a broken firewall behind.
-    sudo "$REPO/ufw-docker" rescue >/dev/null 2>&1 || true
+    # BOUNDED, like the one in run.sh. This one was missed: a run that ended
+    # with a broken firewall hit rescue TWICE (here, then again in run.sh's
+    # trap), and an unbounded one here ate the job's remaining time before the
+    # bounded one was ever reached.
+    sudo timeout 180 "$REPO/ufw-docker" rescue >/dev/null 2>&1 || true
 
     # And never leave it DIFFERENT, either. A suite that verifies a firewall
     # tool must not change the operator's rules; a blanket `22/tcp ALLOW
@@ -97,8 +159,10 @@ teardown_file() {
     if [ -f "$BATS_FILE_TMPDIR/rules-before" ]; then
         sudo ufw status 2>/dev/null | tail -n +4 | sort > "$BATS_FILE_TMPDIR/rules-after"
         if ! diff -q "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" >/dev/null 2>&1; then
-            echo "### WARNING: this run CHANGED the host's ufw rules ###" >&2
-            diff "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" >&2 || true
+            {
+                echo "### WARNING: this run CHANGED the host's ufw rules ###"
+                diff "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" || true
+            } >&3
         fi
     fi
 }
@@ -220,20 +284,38 @@ teardown_file() {
 
 @test "host-level INPUT filtering still works independently" {
     # The whole point: wiring FORWARD in must not change host behaviour.
-    sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
-    sudo ufw reload >/dev/null 2>&1
-    run sudo ip netns exec ufwprobe timeout 4 bash -c "exec 3<>/dev/tcp/${HOST_IP}/22"
-    [ "$status" -ne 0 ]      # refused: no allow rule for this source
+    #
+    # THIS TEST USED TO USE PORT 22, AND THAT WAS A BUG THAT COST TWO CI RUNS.
+    # It ran `ufw delete allow 22/tcp` unconditionally and restored it only if
+    # setup_file had added it. In CI the workflow adds `allow 22/tcp` BEFORE the
+    # suite, so setup_file recorded "not ours", the delete succeeded, and the
+    # rule was gone for the rest of the run -- after which `status` reported no
+    # SSH rule, every `install` exited non-zero, install's own health check
+    # rolled the stanza back out, and eleven downstream tests failed for a
+    # reason none of them had anything to do with.
+    #
+    # It was invisible locally only by luck: this host's rule is
+    # `allow from <ip> to any port 22`, which `ufw delete allow 22/tcp` does not
+    # match, so the delete quietly did nothing.
+    #
+    # A firewall suite has no business deleting the SSH rule of the box it is
+    # running on to prove a point any port can prove. It uses its own port now.
+    local port=9300
+    start_host_listener "$port"
 
-    # Restore ONLY if setup_file put a blanket rule there. Re-adding it
-    # unconditionally left `22/tcp ALLOW Anywhere` on a host whose SSH was
-    # deliberately restricted to one source -- the suite widening the very
-    # exposure it is meant to verify.
-    if [ "$(cat "$BATS_FILE_TMPDIR/we-added-ssh" 2>/dev/null)" = yes ]; then
-        sudo ufw allow 22/tcp >/dev/null 2>&1
-    else
-        sudo ufw reload >/dev/null 2>&1
-    fi
+    sudo ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
+    sudo ufw reload >/dev/null 2>&1
+    [ "$(probe $port)" = "000" ]          # host port, no rule -> blocked
+
+    sudo ufw allow "$port/tcp" >/dev/null 2>&1
+    sudo ufw reload >/dev/null 2>&1
+    [ "$(probe $port)" != "000" ]         # ...and an INPUT allow opens it
+
+    sudo ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
+    sudo ufw reload >/dev/null 2>&1
+    [ "$(probe $port)" = "000" ]          # ...and removing it closes it again
+
+    stop_host_listeners
 }
 
 @test "ufw route rules are honoured" {
@@ -401,8 +483,7 @@ teardown_file() {
     docker network create --subnet 172.23.0.0/24 collnet >/dev/null 2>&1 || skip "172.23.0.0/24 in use"
     docker run -d --name collc --network collnet --ip 172.23.0.10 -p 19100:9100 \
         python:3-alpine python -m http.server 9100 >/dev/null 2>&1
-    python3 -m http.server 9100 --bind 0.0.0.0 >/dev/null 2>&1 &
-    local hostpid=$!
+    start_host_listener 9100
     sleep 5
     reinstall
 
@@ -428,7 +509,7 @@ teardown_file() {
     [ "$(probe 19100)" != "000" ]
 
     clr
-    kill "$hostpid" 2>/dev/null || true
+    stop_host_listeners
     docker rm -f collc >/dev/null 2>&1 || true
     docker network rm collnet >/dev/null 2>&1 || true
     reinstall

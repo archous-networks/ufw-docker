@@ -131,3 +131,61 @@ not care which of the host's addresses the client aimed at.
 > to start with an invalid `fixed-cidr-v6` — then systemd's restart limit keeps refusing
 > even after the config is fixed, which reads like a second, different failure. It is
 > not: `systemctl reset-failed docker.service` and start again.
+
+
+## Two bats traps that cost CI runs
+
+Both were diagnosed from CI logs and then reproduced locally. Worth knowing before
+adding a test.
+
+### A background process must close fd 3, or bats hangs
+
+bats blocks on exit until every process holding its **fd 3** has exited. A background
+process inherits it, so a long-lived one hangs the whole run — after the last test has
+already reported.
+
+Measured:
+
+```
+sleep 25 >/dev/null 2>&1 &        ->  bats exits after 25s
+sleep 25 >/dev/null 2>&1 3>&- &   ->  bats exits immediately
+```
+
+**Redirecting stdout and stderr is not enough.** Both host listeners in this suite
+already did that and still hung the run.
+
+In CI the symptom was: all 35 TAP lines printed, then the job sat at *Run the suite* for
+the full 25-minute timeout and was cancelled — which also threw away the post-failure
+diagnostics that would have explained the original failure. The trigger was a test
+failing *before* its `kill` line, leaving `python -m http.server` running forever.
+
+Use `start_host_listener` / `stop_host_listeners`, which close fd 3 and record the PID so
+`teardown` can kill anything a failed test did not.
+
+### Diagnostics must go to fd 3, or you will never see them
+
+The mirror image. bats captures a test's stdout and stderr, and `--tap` does not replay
+them. A helper that printed its diagnostics to stderr on failure ran in CI and produced
+**nothing** in the log. Print to `>&3`, which bats passes through to the terminal.
+
+## Never delete the host's SSH rule to prove a point
+
+Test 14 once ran `ufw delete allow 22/tcp` and restored it only if `setup_file` had been
+the one to add it. That is two different questions conflated into one:
+
+- *did we add it?* — governs whether re-adding it would **widen** the operator's exposure
+- *did we delete it?* — governs whether we have to **put it back**
+
+In CI the workflow adds `allow 22/tcp` before the suite, so the first answer was "no",
+the delete still succeeded, and the rule was gone for the rest of the run. Downstream,
+`status` reported no SSH rule, every `install` exited non-zero, `install`'s own health
+check rolled the stanza back out, and eleven tests failed for a reason none of them had
+anything to do with.
+
+It was invisible locally by luck: the dev host's rule is `allow from <ip> to any port 22`,
+which `ufw delete allow 22/tcp` does not match, so the delete quietly did nothing.
+
+**A firewall suite has no business deleting the SSH rule of the box it runs on** to prove
+something any port can prove. It uses its own port now, and a per-test `teardown` fails
+the test that leaves `ufw-user-input` without an SSH rule — so the cause is named rather
+than its victims.

@@ -78,6 +78,8 @@ installed.
 | Docker daemon restart | `DOCKER-USER` preserved; 100 samples at 0.5s across a restart, never empty |
 | `iptables -S <absent chain>` | prints `... is incompatible, use 'nft' tool` — the **same** message as a genuinely incompatible chain. Never key on that string alone. |
 | bats + a helper that exits non-zero | a bare `helper args` statement fails the test under errexit. `netns-probe.sh get` always exits 0 for this reason |
+| bats + a background process | it inherits **fd 3** and bats blocks on exit until it dies. `>/dev/null 2>&1` is NOT enough — add `3>&-`. Measured: 25s vs 0s. Hung two CI jobs to their timeout |
+| bats + diagnostics on failure | a test's stdout/stderr is captured and `--tap` never replays it. Print to `>&3` or you see nothing |
 | destination IP is the only discriminator | no dst → rule hits host AND containers; dst=host-ip → host only; dst=container-ip → that container only. Measured. |
 | IPv6 without daemon `ip6tables` | Docker adds its own `raw`/PREROUTING DROP ahead of FORWARD, so our v6 stanza is correct but never consulted |
 | IPv6 WITH daemon `ip6tables` | that DROP disappears and the v6 stanza governs. allow/deny/source/destination all behave exactly as v4. Measured; CI runs both legs |

@@ -39,6 +39,10 @@ cleanup() {
     local rc=$?
     echo
     echo "--- restoring the firewall (runs on any exit, including Ctrl-C) ---"
+    # Timestamped: when this phase stalls, the log should say so plainly rather
+    # than simply stopping. A healthy firewall rescues in seconds; a broken one
+    # takes the full teardown-and-rebuild path, which is where the time goes.
+    echo "    [$(date -u +%H:%M:%S)] rescue starting"
     # BOUNDED. A CI run once failed late and then sat in this teardown for 13
     # minutes until the job timeout cancelled it -- which threw away the
     # post-failure diagnostics that would have explained the failure. A rescue
@@ -48,6 +52,7 @@ cleanup() {
         timeout 20 ufw status verbose 2>&1 | sed 's/^/    /' >&2 || true
         timeout 20 iptables -S ufw-user-input 2>&1 | sed 's/^/    /' >&2 || true
     fi
+    echo "    [$(date -u +%H:%M:%S)] rescue finished"
     rmdir "$LOCK" 2>/dev/null
     exit $rc
 }
