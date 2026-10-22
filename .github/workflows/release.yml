@@ -1,0 +1,107 @@
+name: release
+
+# WHY RELEASES EXIST HERE AT ALL
+#
+# The README used to tell people to curl `ufw-docker` from the tip of main.
+# That means a customer installing during a push gets an arbitrary
+# intermediate commit -- possibly one between "stanza written" and "stanza
+# verified" -- on a tool that rewrites their firewall. A release is a fixed
+# set of bytes that cannot change under them.
+#
+# Dev branches solve the developer's problem. Releases solve the user's. This
+# is the user's.
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build a release for (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write     # needed to create the release and upload assets
+
+jobs:
+  # THE SAME gates main runs, called rather than copied. A release pipeline
+  # with its own slightly-different checks eventually ships something main
+  # would have rejected.
+  gates:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: gates          # <- the artifact cannot exist unless every leg was green
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: The tag and VERSION must agree
+        # Checked here as well as in the gates, because this is the job that
+        # names the artifact. `status` reads the version out of the installed
+        # stanza to tell an operator which version wired their host; shipping
+        # v1.0.0 containing 0.9.0 makes that report lie.
+        env:
+          GITHUB_REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: tests/lint-version.sh
+
+      - name: Checksums
+        # F2. The install is `curl ... | sudo install`, so the operator is
+        # trusting bytes they have not read. A checksum does not establish
+        # provenance -- only a signature would -- but it does let them verify
+        # that what they fetched is what we published, and it costs nothing.
+        run: |
+          sha256sum ufw-docker > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > NOTES.md <<EOF
+          ## Install
+
+          \`\`\`bash
+          curl -fsSL https://github.com/$REPO/releases/download/$TAG/ufw-docker \\
+            | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-docker
+          sudo ufw-docker install
+          \`\`\`
+
+          ### Verify first
+
+          You are piping a script into \`sudo\` that rewrites your firewall. That is
+          exactly the pattern to be suspicious of.
+
+          \`\`\`bash
+          curl -fsSLO https://github.com/$REPO/releases/download/$TAG/ufw-docker
+          curl -fsSLO https://github.com/$REPO/releases/download/$TAG/SHA256SUMS
+          sha256sum -c SHA256SUMS
+          less ufw-docker
+          \`\`\`
+
+          A checksum proves you got the bytes we published. It does **not** prove who
+          published them — only a signature would, and there is not one yet.
+
+          ### Before you install
+
+          Every CI leg was green for this tag, including iptables-legacy.
+          \`install\` **refuses** platforms nothing has proven it on — see
+          [docs/supported.md](https://github.com/$REPO/blob/$TAG/docs/supported.md),
+          or run \`ufw-docker platforms\`.
+          EOF
+          sed -i 's/^          //' NOTES.md
+          cat NOTES.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file NOTES.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file NOTES.md
+          fi
+          gh release upload "$TAG" ufw-docker SHA256SUMS --clobber

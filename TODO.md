@@ -15,7 +15,8 @@ Not a rule, but these have real dependencies on each other:
 1. ~~**X1 + D4 + D5 together.**~~ **Done** — see *Implemented* below.
 2. ~~**A11**~~ and ~~**E10 stage 1**~~ — **Done**, see *Implemented* below.
 3. ~~**B6, B7**~~ — **Done**, see *Implemented* below.
-4. **F1 + F2** — release and checksums, once the above makes `v1.0.0` mean something.
+4. ~~**F1 + F2**~~ — **Done**, see *Implemented* below. The machinery exists; **cutting
+   the actual `v1.0.0` tag is a decision, not a task**, and is left to the maintainer.
 5. **D3 last** — per-subcommand help, after the new flags exist, or it gets written twice.
 
 ---
@@ -27,8 +28,6 @@ Not a rule, but these have real dependencies on each other:
 | **X5** | **Three test ports still fail the test-port rule.** The rule, now written into `tests/rules-lib.bash`: *every port in `TEST_PORTS` is a port the suite will delete a rule for, so it must be a port nothing real listens on.* **9100** (node_exporter), **9200** (Elasticsearch HTTP) and **9300** (Elasticsearch transport) fail it. Nothing in this estate runs them, so there is no live breakage — but 8089, 443 and container-port 80 were all *also* fine until the day they were not, and each cost a debugging round trip. Move `collc`'s container port off 9100, `v6svc` off 9200, and the host listener off 9300. Cheap and mechanical; the only care needed is keeping `v6svc` published **1:1**, since the remap trap depends on it. | [verified] | S3 |
 | **H1** | **The nft-incompatible chain condition is handled but not understood.** `rescue` step 3b fires reliably at the end of a full run and has never escaped into a failure — but a fix we do not understand is a fix we cannot rely on, and the first version of its detection was wrong in a way that would have run a destructive teardown on a healthy host. Reproduce minimally (interleave `iptables -F`/`-X` on a ufw chain with a `ufw reload`), find the mechanism in the nft compatibility layer, document it. Free experiment: if 3b never fires on the legacy leg, that localises it to iptables-nft. | [unknown] | S2 |
 | **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced — the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the cold-boot path: all of that is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Needs one deliberate reboot into breakage. | [verified] | S2 |
-| **F1** | **Tags and releases.** `main` is the only thing anyone can fetch, so a customer curling mid-push gets an arbitrary intermediate state. Point the README at `releases/latest/download/ufw-docker` (stable, never an intermediate commit) and document the pinned `releases/download/vX.Y.Z/` form. Release workflow: on tag, run CI, attach the artifact **only on green**. Lint: `VERSION` must equal the tag. Branch protection on `main` requiring green CI rather than a dev branch — dev branches solve the developer problem, releases solve the user problem. Sequence **after** X1 and A11 so `v1.0.0` means "refuses on anything unproven". | [verified] | S2 |
-| **F2** | **No checksum or signature.** Publish `SHA256SUMS` with each release and document verifying before install. Rides along with F1 at almost no extra cost. | [verified] | S2 |
 | **A7** | **`--network host` containers are unaffected, and nothing says so.** Correct behaviour — they traverse `INPUT`, so plain ufw rules govern them — but it is the opposite of what a user of this tool will assume, and they have **no address of their own**, so `-d <ip>` can never target them and `containers` shows nothing to target. Same presentation discipline as X1 (detected, named in `containers` and `status`, documented alongside) but **deliberately different vocabulary**: *"not governed by ufw-docker — host network, plain ufw INPUT rules apply"*, **not** "unsupported". It does not trip the preflight. Reserving "unsupported" for genuinely dangerous cases is what keeps the word worth reading. | [verified] | S3 |
 | **C5** | **Chain counters are not surfaced.** `status --counters` (or fold into `--rules`) showing `DOCKER-USER` packet/byte counts with a one-line interpretation. Value: **"wired but counters flat"** is the cheapest visible signal of the wired-but-filtering-nothing family. Do **not** warn on flat counters — a quiet host is legitimate; show the number and let the operator read it. Update `logging.md`, which currently tells you to run raw `iptables -L -v -n` yourself. | [verified] | S3 |
 | **B5** | **`remove` leaves the binary, undocumented.** Keep that behaviour — reinstall is the likely next step and `rescue` must stay available exactly when you have just unwound the firewall — but **say so** in the preview and the done message, since the preview exists to answer "what remains?". Add `--purge` to also remove the binary, requiring `--force`, orthogonal to `--include-backups` so they compose. **Implementation note:** bash reads a script incrementally, so deleting `$0` mid-run can make it read garbage. Do the `rm` from an `EXIT` trap. | [verified] | S3 |
@@ -235,6 +234,29 @@ Not a rule, but these have real dependencies on each other:
   wrong port and leaves the real one shut. `rescue` prints which source it used, and the
   fallback to 22 is announced as a **GUESS** rather than presented as a finding. The
   detector is shared with `status`, so both ask the same question.
+
+- **F1 + F2 — releases, and verifying a download.** The README told people to curl
+  `ufw-docker` from the tip of `main`, so a customer installing during a push got an
+  arbitrary intermediate commit — possibly one between "stanza written" and "stanza
+  verified" — on a tool that rewrites their firewall, with nothing to indicate anything
+  was wrong.
+
+  `.github/workflows/release.yml` publishes on a `v*` tag, and its publish job `needs:`
+  the full matrix, so **the artifact cannot exist unless every leg was green**. It
+  *calls* `test.yml` rather than repeating its steps: a release pipeline with its own
+  slightly-different checks is one that eventually ships what `main` would have
+  rejected. `tests/lint-version.sh` gates the three copies of the version — the tag,
+  `VERSION`, and the version baked into the stanza that `status` reads back.
+
+  `SHA256SUMS` ships alongside, and the docs are explicit about what it is *not*: it
+  proves you got the bytes we published, not who published them. Anyone who could
+  replace the artifact could replace the checksum beside it. That needs a signature,
+  and there is not one yet. A checksum presented as provenance is worse than none,
+  because it looks like it answered the question it did not.
+
+  **Not done, deliberately:** no tag has been cut. `VERSION` is still `0.9.0`. Choosing
+  when `v1.0.0` happens is the maintainer's call, and `lint-version.sh` will refuse a
+  tag that disagrees with the file.
 
 ## Fixed while compiling this list
 

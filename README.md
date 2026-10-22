@@ -3,12 +3,17 @@
 Make plain `ufw allow` and `ufw deny` actually govern **Docker-published ports**.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-docker \
+curl -fsSL https://github.com/archous-networks/ufw-docker/releases/latest/download/ufw-docker \
   | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-docker
 
 sudo ufw-docker install
 sudo ufw deny 8089/tcp      # ...and this now genuinely closes it
 ```
+
+That URL is a **release**, not the tip of `main`. Installing from `main` means whatever
+commit happened to be there when you ran it — possibly one mid-push — on a tool that
+rewrites your firewall. Pin a version with
+`releases/download/v1.0.0/ufw-docker`. → [releases.md](docs/releases.md)
 
 One file. No new commands to learn — you keep using `ufw`.
 
@@ -69,6 +74,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [Rule scoping](docs/scoping.md) | which rules reach the host, which reach containers |
 | [Per-container rules](docs/per-container.md) | targeting one container rather than a port |
 | [Where a WAF fits](docs/waf.md) | why an edge WAF is not a substitute, and why this tool is what makes one worth having |
+| [Releases and verifying a download](docs/releases.md) | why not to install from `main`, pinning a version, checksums |
 | **[Supported platforms](docs/supported.md)** | what this is proven on, how a row earns `supported`, and the override |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
@@ -150,11 +156,18 @@ warns but stays green, so the exit code remains worth reading.
 ## Before you start
 
 > **You are piping a script into `sudo`.** Convenient, and exactly the pattern to be
-> suspicious of for something that rewrites your firewall. Read it first — plain shell,
-> no dependencies:
+> suspicious of for something that rewrites your firewall. Read it first, and check you
+> got the bytes we published — plain shell, no dependencies:
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-docker | less
+> cd "$(mktemp -d)"
+> base=https://github.com/archous-networks/ufw-docker/releases/latest/download
+> curl -fsSLO $base/ufw-docker
+> curl -fsSLO $base/SHA256SUMS
+> sha256sum -c SHA256SUMS      # must say: ufw-docker: OK
+> less ufw-docker
 > ```
+> A checksum proves you got what we published. It does **not** prove who published it —
+> only a signature would, and there is not one yet.
 
 If anything goes wrong, from the console:
 

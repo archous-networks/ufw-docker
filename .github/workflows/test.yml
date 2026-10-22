@@ -42,6 +42,13 @@ jobs:
         # refactor, which bash -n and shellcheck both pass. It has happened.
         run: tests/lint-functions.sh
 
+      - name: version metadata is consistent
+        # On a tag build this also asserts the tag and VERSION agree. On main
+        # it checks the half that is always checkable: that the stanza still
+        # records $VERSION, which `status` reads back to tell an operator
+        # which version wired their host.
+        run: tests/lint-version.sh
+
       - name: the SSH-permission matcher finds every form of permission
         # `rescue` decides whether to touch SSH from this matcher. It used to
         # look for `--dport <port>` only, so a host whose SSH was allowed by
@@ -63,7 +70,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh
+        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/lint-version.sh
 
   bats:
     runs-on: ubuntu-latest
