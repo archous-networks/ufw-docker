@@ -16,12 +16,49 @@
 # built from, so "weird" answers are the valuable ones -- do not tidy them up.
 set -u
 
+# ufw, iptables and nft live in /usr/sbin, which is NOT on a plain user's PATH.
+# Without this a bare `command -v ufw` fails and the survey reports "ufw NOT
+# INSTALLED" on a host where ufw is installed, running and enabled. The same
+# trap has now bitten this project three times.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"; export PATH
+
 have() { command -v "$1" >/dev/null 2>&1; }
 hdr()  { printf '\n== %s\n' "$*"; }
 kv()   { printf '  %-28s %s\n' "$1" "${2:-(unknown)}"; }
 
 printf 'ufw-docker survey  —  %s  —  %s\n' "$(hostname 2>/dev/null)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-[ "$(id -u)" -eq 0 ] || printf '\n!! not root: iptables and Docker sections will be incomplete\n'
+
+# REFUSES without root, rather than running and being WRONG.
+#
+# This used to print a one-line "sections will be incomplete" caveat and carry
+# on. Incomplete would have been fine. What it actually produced was four
+# confident falsehoods on a perfectly healthy host, because every one of these
+# reads is root-only and the code treated "cannot read" as "not there":
+#
+#     version      NOT INSTALLED                              (ufw 0.36.2, active)
+#     iptables     NOT FOUND                                  (v1.8.9, nf_tables)
+#     stanza       (none)                                     (installed, 0.9.0)
+#     before.init  CUSTOMISED BY OPERATOR — install would refuse   (it is ours)
+#
+# This output is pasted back and turned into the supported-platform matrix, so
+# a wrong answer is worse than no answer: it becomes a row nobody re-checks.
+# The tool only reads, so sudo costs the operator nothing.
+if [ "$(id -u)" -ne 0 ]; then
+    cat >&2 <<EOF
+
+  This survey needs root, and REFUSES rather than guess.
+
+  Not for safety -- it only reads, and changes nothing. It is because
+  /etc/ufw/*.rules, before.init, the iptables tables and the Docker socket
+  are all root-only, and a survey that cannot read them does not report
+  "unknown". It reports "not installed", which is a different claim and a
+  false one. These answers get pasted into our platform matrix.
+
+      sudo $0
+
+EOF
+    exit 1
+fi
 
 hdr "OS"
 if [ -r /etc/os-release ]; then

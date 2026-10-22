@@ -13,14 +13,10 @@ Evidence tags: **[verified]** reproduced here · **[suspected]** reasoned, not r
 Not a rule, but these have real dependencies on each other:
 
 1. ~~**X1 + D4 + D5 together.**~~ **Done** — see *Implemented* below.
-2. **A11** — the legacy CI leg is currently failing and Debian 10 is in the estate, so
-   this is the most load-bearing unknown. **Now the next thing**, and X1 raised its
-   stakes: the preflight currently refuses the legacy backend outright, so until that
-   leg is green, every Debian 10 host is a host this tool declines to install on.
-3. **E10 stage 1** — the support matrix, which X1 reads and CI generates legs from.
-4. **B6, B7** — the two recovery-path defects. B6 contains a live bug.
-5. **F1 + F2** — release and checksums, once the above makes `v1.0.0` mean something.
-6. **D3 last** — per-subcommand help, after the new flags exist, or it gets written twice.
+2. ~~**A11**~~ and ~~**E10 stage 1**~~ — **Done**, see *Implemented* below.
+3. **B6, B7** — the two recovery-path defects. B6 contains a live bug. **Next.**
+4. **F1 + F2** — release and checksums, once the above makes `v1.0.0` mean something.
+5. **D3 last** — per-subcommand help, after the new flags exist, or it gets written twice.
 
 ---
 
@@ -28,8 +24,6 @@ Not a rule, but these have real dependencies on each other:
 
 | # | | | |
 |---|---|---|---|
-| **A11** | **iptables-legacy is unproven, and Debian 10 is in the estate** — so this is a real deployment target, not an edge case. The CI leg exists and **currently fails**: every "should be open" assertion fails while every "should be blocked" one passes. Hypothesis, not yet confirmed: nft rules created at boot coexist with the legacy rules we add, both are evaluated, and a `DROP` in either wins. Fix the leg with `nft flush ruleset` after the switch. Until it is green we cannot say whether legacy works. Already confirmed: legacy **rejects** `-j NOSUCHCHAIN` where nft accepts it. | [verified] | S2 |
-| **E10** | **Supported-platform matrix, feeding the preflight and CI.** Lives **inside `ufw-docker`** as a heredoc — the single-file property means the preflight cannot read an external file. Field order mirrors `tools/ufw-docker-survey` so a pasted survey line can be matched against it. Columns: `label \| distro \| ver \| ufw \| backend \| docker \| verified-by \| status`. Three consumers: the preflight matches the live host; CI generates matrix legs from `status=supported` rows; a `tests/lint-supported.sh` fails on drift between the table and the docs. **Rule: a row may claim `supported` only where a green CI leg proves it** — a surveyed host matching no row is `unverified`. Use opaque `site-NN` labels; the mapping lives outside this repo. **Stage 1** (table, preflight wiring, lint, fix the legacy leg) is cheap. **Stage 2** (real Debian 10/11/12 legs) is not: GitHub hosts no Debian runners and the suite needs real kernel netfilter, systemd and a Docker daemon, so it means privileged DinD, VMs, or self-hosted runners. | [verified] | S2 |
 | **B6** | **`rescue` must stop inventing an SSH rule.** If `user.rules` has none, that usually means ufw never permitted SSH — so a blanket `ACCEPT` grants access that never existed rather than restoring anything, and `rescue --open` already covers the deliberate "get me in regardless" case. New behaviour: replay from `user.rules` → else replay from the newest `/var/backups/ufw-rescue-*` snapshot → else **invent nothing** and point at `--open`. Plus `status` must flag any blanket SSH `ACCEPT` in `INPUT` that ufw did not create, for hosts that already have one. **Live bug:** detection matches `--dport <port>` only, so an operator allowing SSH by interface (`ufw allow in on wg0`) reads as "no SSH rule" and that host gets port 22 opened to the world today. | [verified] | S2 |
 | **X5** | **Three test ports still fail the test-port rule.** The rule, now written into `tests/rules-lib.bash`: *every port in `TEST_PORTS` is a port the suite will delete a rule for, so it must be a port nothing real listens on.* **9100** (node_exporter), **9200** (Elasticsearch HTTP) and **9300** (Elasticsearch transport) fail it. Nothing in this estate runs them, so there is no live breakage — but 8089, 443 and container-port 80 were all *also* fine until the day they were not, and each cost a debugging round trip. Move `collc`'s container port off 9100, `v6svc` off 9200, and the host listener off 9300. Cheap and mechanical; the only care needed is keeping `v6svc` published **1:1**, since the remap trap depends on it. | [verified] | S3 |
 | **B7** | **SSH port detection can miss, silently.** Add `systemctl show ssh.socket -p ListenStream` to the chain — socket activation is the default on Ubuntu 22.10+, and `sshd -T` can report 22 while the socket unit listens elsewhere. The more important half: make the bare-22 fallback **loud**. "Could not determine the SSH port, assuming 22" rather than presenting a guess as fact. | [suspected] | S2 |
@@ -168,6 +162,47 @@ Not a rule, but these have real dependencies on each other:
   modules. Derive → fall back to the Debian defaults → **verify the files exist** →
   fail the preflight otherwise. Note `config_dir` is `/etc`, not `/etc/ufw`. ~40
   hardcoded literals replaced by five variables.
+
+- **A11 — iptables-legacy works, and the leg that said otherwise was never testing it.**
+  The runner boots with Docker's chains already in the nft subsystem, and
+  `update-alternatives --set iptables iptables-legacy` only changes which binary *we*
+  then talk to. The kernel evaluates both, so a leftover nft `DROP` beat the legacy
+  `ACCEPT` we added — which is exactly why every "should be OPEN" assertion failed
+  while every "should be BLOCKED" one passed, and why tests 1/10/18/38 kept proving the
+  stanza was written correctly the whole time. `nft flush ruleset` after the switch
+  gives a genuinely single-backend host: the leg now reports legacy=12 rules, nft=0, and
+  **44/44 green** (run 39868550084). Legacy is now a `supported` row with that run named
+  as its evidence.
+
+  Two things found on the way. A failing test left `before.init` customised and turned
+  one failure into six, so that test now hands its backup to `teardown` *before* breaking
+  anything — `teardown` always runs, while a failed assertion abandons the test at its
+  line. And ufw's own rate-limiting LOG rule went missing mid-run, which the
+  operator-rule invariant flagged; it was downstream of that same cascade and vanished
+  once the cascade did. Worth recording that the right move there was to fix the known
+  cause and re-measure rather than reason out a fix for the symptom.
+- **E10 stage 1 — the supported-platform matrix.** A heredoc inside `ufw-docker`, because
+  the preflight must read it on a host that downloaded only that file. Matching is on
+  distro + major version + iptables backend; ufw and Docker versions are recorded but
+  deliberately not matched on, since gating on them would make every routine upgrade a
+  refusal. Three consumers: the preflight, `ufw-docker platforms`, and
+  `tests/lint-supported.sh`, which fails the build when the heredoc and
+  `docs/supported.md` disagree — proven to fire in both directions, including the
+  dangerous one where the docs claim `supported` for something nothing proved.
+
+  **It also removed a second source of truth.** X1 had shipped with a hardcoded
+  "backend must be nf_tables" check *and* a backend column in the matrix. Those
+  disagreed the instant the legacy leg went green. The matrix owns it now. The same
+  mistake had appeared in the suite, where `host_supported()` re-implemented the rule
+  instead of asking the tool; it asks now.
+- **The survey refused to be wrong.** `tools/ufw-docker-survey` run without root
+  reported `ufw NOT INSTALLED`, `iptables NOT FOUND`, `stanza (none)` and `before.init
+  CUSTOMISED BY OPERATOR` — four confident falsehoods on a completely healthy host,
+  because every one of those reads is root-only and the code treated "cannot read" as
+  "not there". It now refuses without root and explains why. This output is pasted into
+  the platform matrix, so a wrong answer becomes a row nobody re-checks. Also fixed the
+  `/usr/sbin` PATH assumption that caused two of the four — the third time that trap
+  has bitten this project.
 
 ## Fixed while compiling this list
 

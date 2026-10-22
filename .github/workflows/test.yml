@@ -38,12 +38,21 @@ jobs:
         # refactor, which bash -n and shellcheck both pass. It has happened.
         run: tests/lint-functions.sh
 
+      - name: the platform matrix and the docs agree
+        # Two copies of the matrix exist on purpose -- the heredoc in
+        # `ufw-docker`, because the preflight must read it on a host that
+        # downloaded only that file, and docs/supported.md, because that is
+        # what people read. Two copies drift. A docs row claiming `supported`
+        # for something nothing has proven is the dangerous direction, so this
+        # gates rather than warns. Pure text: no root, no Docker, no firewall.
+        run: tests/lint-supported.sh
+
       - name: shellcheck
         # Gating, not advisory. It was `|| true`, which meant it could never fail
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh
+        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh
 
   bats:
     runs-on: ubuntu-latest

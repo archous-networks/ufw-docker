@@ -180,7 +180,14 @@ stop_host_listeners() {
 host_backend() {
     iptables --version 2>/dev/null | grep -oE '\(nf_tables\)|\(legacy\)' | tr -d '()'
 }
-host_supported() { [ "$(host_backend)" = nf_tables ]; }
+# ASK THE TOOL. An earlier version of this duplicated the rule ("backend is
+# nf_tables"), and the moment the preflight grew a platform-matrix check the
+# two disagreed: the suite would believe the host supported while `install`
+# refused it, and every reinstall would fail. One source of truth.
+host_supported() {
+    sudo "$REPO/ufw-docker" status --json 2>/dev/null \
+        | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("supported") else 1)' 2>/dev/null
+}
 
 reinstall() {
     local out rc force=""
@@ -980,19 +987,30 @@ v6nets() {
 
 # ── X1 / D4 / D5: the supported-environment preflight ─────────────────────
 #
-# A stub that makes `iptables --version` report the legacy backend while every
-# other iptables call passes through untouched. That is the honest way to test
-# a refusal: switching the host's real backend mid-suite would strand rules in
-# the other subsystem, which is the very thing X1 exists to detect.
+# A stub that makes the preflight fail, by reporting Docker Swarm as active.
+# Every other docker call passes straight through.
+#
+# It used to stub the iptables BACKEND instead, and that broke the moment the
+# legacy CI leg went green: legacy became a supported platform, so claiming to
+# be legacy no longer made the environment unsupported and these tests started
+# asserting against a host that passed. Swarm is the right lever because it is
+# orthogonal to the platform matrix -- no row will ever make Swarm supported.
+#
+# Stubbing is the honest way to test a refusal. Actually switching the host's
+# backend mid-suite would strand rules in the other subsystem, which is the
+# very thing X1's mixed-backend check exists to catch.
 unsup_env() {
-    local d="$BATS_FILE_TMPDIR/stub"
+    local d="$BATS_FILE_TMPDIR/stub" real
+    real="$(command -v docker)"
     mkdir -p "$d"
-    cat > "$d/iptables" <<'STUB'
+    cat > "$d/docker" <<STUB
 #!/bin/sh
-[ "$1" = "--version" ] && { echo "iptables v1.8.9 (legacy)"; exit 0; }
-exec /usr/sbin/iptables "$@"
+case "\$*" in
+  *Swarm.LocalNodeState*) echo active; exit 0 ;;
+esac
+exec $real "\$@"
 STUB
-    chmod +x "$d/iptables"
+    chmod +x "$d/docker"
     printf '%s' "PATH=$d:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
@@ -1004,7 +1022,7 @@ STUB
     run sudo env "$(unsup_env)" "$REPO/ufw-docker" install
     [ "$status" -eq 1 ]
     echo "$output" | grep -q 'UNSUPPORTED ENVIRONMENT'
-    echo "$output" | grep -q "only nf_tables is proven"
+    echo "$output" | grep -q 'swarm' 
     # It must say how to proceed, or the refusal is just a wall.
     echo "$output" | grep -q -- '--unsupported --force'
 
@@ -1028,7 +1046,7 @@ STUB
     echo "$output" | grep -q 'PROCEEDING ANYWAY'
 
     # Recorded in the stanza, so it outlives the shell that typed --force.
-    sudo grep -q 'INSTALLED IN UNSUPPORTED MODE: backend' "$AFTER4"
+    sudo grep -q 'INSTALLED IN UNSUPPORTED MODE: swarm' "$AFTER4"
 
     # And reported by status even though the environment now PASSES the
     # preflight -- the person reading status is rarely the person who forced it.
@@ -1086,7 +1104,7 @@ import json,sys
 d = json.load(sys.stdin)
 assert d["healthy"] is False
 assert d["supported"] is False
-assert d["preflight_failed"] == ["backend"], d["preflight_failed"]
+assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
 '
 }
 

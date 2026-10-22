@@ -69,6 +69,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [Rule scoping](docs/scoping.md) | which rules reach the host, which reach containers |
 | [Per-container rules](docs/per-container.md) | targeting one container rather than a port |
 | [Where a WAF fits](docs/waf.md) | why an edge WAF is not a substitute, and why this tool is what makes one worth having |
+| **[Supported platforms](docs/supported.md)** | what this is proven on, how a row earns `supported`, and the override |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
 | [Testing](docs/testing.md) | the suite, the IPv6 matrix, and two ways to break your own host |
@@ -89,6 +90,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | `sudo ufw-docker status --json` | the same report, machine-readable, for monitoring |
 | `sudo ufw-docker install --unsupported --force` | install anyway on an environment we have **not** proven |
 | `sudo ufw-docker containers` | container addresses, for per-container rules |
+| `sudo ufw-docker platforms` | the platforms this is proven on, and whether this host is one |
 | `sudo ufw-docker remove` | preview the undo — changes nothing |
 | `sudo ufw-docker remove --force` | actually undo it |
 | `sudo ufw-docker remove --force --include-backups` | …and delete the backups too |
@@ -122,8 +124,13 @@ ufw-docker status --json | jq -r 'select(.healthy|not) | .checks[] | select(.lev
 ## It refuses environments it has not been proven on
 
 `install` runs a preflight and **refuses** rather than installing where this tool has
-never been verified: a non-nf_tables iptables backend, rules present in *both* iptables
-backends, Docker Swarm, rootless Docker, or ufw's files not where ufw says they are.
+never been verified. Two kinds of check:
+
+- **the platform matrix** — distro, major version and iptables backend must match a row
+  that something actually proved. See [supported.md](docs/supported.md), or run
+  `ufw-docker platforms`.
+- **mechanism checks**, regardless of platform — rules present in *both* iptables
+  backends, Docker Swarm, rootless Docker, or ufw's files not where ufw says they are.
 
 The refusal exists because the failure it prevents is **silent** — `install` would
 succeed, `status` would report everything wired, and nothing would be filtered.

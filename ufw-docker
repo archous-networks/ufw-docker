@@ -19,6 +19,8 @@
 #   ufw-docker status --rules  ...and list the ufw rules containers are judged by
 #   ufw-docker status --json   the same report, machine-readable, for monitoring
 #   ufw-docker containers      container addresses, for per-container rules
+#   ufw-docker platforms       the platforms this tool is proven on, and whether
+#                              this host is one of them
 #   ufw-docker rescue          get SSH back and rebuild ufw after a bad state
 #   ufw-docker rescue --open   emergency: firewall OFF, you are definitely back in
 #   ufw-docker --version       print the version
@@ -128,16 +130,11 @@ backend_rules() {   # $1 = iptables-legacy | iptables-nft
 preflight() {
     PF_FAILED=""; PF_DETAIL=""
 
-    # 1. The backend. Everything this project has verified ran on nf_tables,
-    #    and at least one measured behaviour differs between the two:
-    #    iptables-restore --test accepts `-j NOSUCHCHAIN` under nf_tables and
-    #    rejects it under legacy. The legacy CI leg is not green yet (A11), so
-    #    legacy is unproven -- which is exactly what this refuses on.
-    local backend
-    backend="$(iptables --version 2>/dev/null | grep -oE '\(nf_tables\)|\(legacy\)' | tr -d '()')"
-    [ "$backend" = nf_tables ] || pf_fail backend \
-        "iptables backend is '${backend:-unknown}', and only nf_tables is proven" \
-        "switch with update-alternatives, or see docs/troubleshooting.md"
+    # 1. (There is deliberately no standalone "backend must be nf_tables"
+    #    check. The backend is a COLUMN in the platform matrix below, so a
+    #    hardcoded check here would be a second source of truth for the same
+    #    question -- and the two would disagree the moment a legacy row was
+    #    proven, which is exactly what happened. The matrix owns it.)
 
     # 2. Mixed backends. The kernel evaluates BOTH, and a DROP in either wins --
     #    so our stanza can be perfectly correct in one while the other silently
@@ -173,7 +170,16 @@ preflight() {
             "not supported — run a rootful daemon, or see docs/caveats.md" ;;
     esac
 
-    # 5. ufw's own files. If these are not where we think, we write a stanza
+    # 5. Is this platform one anything has actually proven? Deliberately last,
+    #    because the four checks above name a MECHANISM that is known to break,
+    #    while this one only says "nobody has tried this combination". Both
+    #    refuse, but the failures above are the ones worth reading first.
+    local mstat; mstat="$(matrix_status)"
+    [ "$mstat" = supported ] || pf_fail platform \
+        "no proven platform matches this host ($(host_matrix_key)); nearest verdict: $mstat" \
+        "run 'ufw-docker platforms' to see the matrix, and tools/ufw-docker-survey to add a row"
+
+    # 6. ufw's own files. If these are not where we think, we write a stanza
     #    nothing reads and report success -- failing silently, which is worse
     #    than failing loudly.
     local how="Debian default — derivation from ufw.common failed"
@@ -196,6 +202,87 @@ pf_report() {
 $PF_DETAIL
 EOPF
     return 0
+}
+
+# ── the supported-platform matrix ──────────────────────────────────────────
+# Lives HERE, in the single shipped file, because the preflight must be able to
+# read it on a host that has only ever downloaded `ufw-docker` -- an external
+# data file would be the one thing missing exactly when it is needed.
+#
+# Field order mirrors tools/ufw-docker-survey so a pasted survey line can be
+# matched against a row by eye.
+#
+# THE RULE: a row may say `supported` only where something actually proved it.
+# Not "it ought to work", not "it is the same family as one that works". The
+# verified-by column has to name the evidence, and a host matching no
+# `supported` row is `unverified` -- which the preflight refuses, with the
+# documented --unsupported --force override.
+#
+# Labels are opaque on purpose. Customer names do not belong in a public repo;
+# the site-NN mapping is kept outside it.
+#
+# Matching uses distro + major version + iptables backend. ufw and docker
+# versions are recorded but NOT matched on: they move constantly, and gating on
+# them would turn every routine upgrade into a refusal.
+supported_matrix() {
+    # label   | distro | ver | ufw    | backend   | docker | verified-by                   | status
+    cat <<'MATRIX'
+dev-00    | debian | 12  | 0.36.2 | nf_tables | 29.7.1 | full suite, every run          | supported
+site-00   | debian | 12  | 0.36.2 | nf_tables | 29.9.2 | survey; same class as dev-00   | supported
+ci-nft    | ubuntu | 24  | 0.36.x | nf_tables | ci     | CI, both IPv6 legs green       | supported
+ci-legacy | ubuntu | 24  | 0.36.x | legacy    | ci     | CI, green on run 39868550084   | supported
+MATRIX
+}
+
+# distro|majorversion|backend for THIS host.
+host_matrix_key() {
+    local id ver backend
+    # shellcheck disable=SC1091
+    [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null
+    id="${ID:-unknown}"
+    ver="${VERSION_ID:-0}"; ver="${ver%%.*}"
+    backend="$(iptables --version 2>/dev/null | grep -oE '\(nf_tables\)|\(legacy\)' | tr -d '()')"
+    printf '%s|%s|%s' "$id" "$ver" "${backend:-unknown}"
+}
+
+trim() { printf '%s' "$1" | sed 's/^ *//; s/ *$//'; }
+
+# supported | unverified | unknown  -- the best status among matching rows.
+matrix_status() {
+    local want best=unknown l d v uf b dk by st
+    want="$(host_matrix_key)"
+    while IFS='|' read -r l d v uf b dk by st; do
+        [ -n "$l" ] || continue
+        [ "$(trim "$d")|$(trim "$v")|$(trim "$b")" = "$want" ] || continue
+        case "$(trim "$st")" in
+            supported) best=supported; break ;;
+            *) [ "$best" = unknown ] && best=unverified ;;
+        esac
+    done <<EOM
+$(supported_matrix)
+EOM
+    printf '%s' "$best"
+}
+
+cmd_platforms() {
+    head_ "supported platforms (matched on distro + major version + iptables backend)"
+    printf '  %-9s %-7s %-4s %-7s %-10s %-7s %-30s %s\n' \
+        LABEL DISTRO VER UFW BACKEND DOCKER VERIFIED-BY STATUS
+    local l d v uf b dk by st
+    while IFS='|' read -r l d v uf b dk by st; do
+        [ -n "$l" ] || continue
+        printf '  %-9s %-7s %-4s %-7s %-10s %-7s %-30s %s\n' \
+            "$(trim "$l")" "$(trim "$d")" "$(trim "$v")" "$(trim "$uf")" \
+            "$(trim "$b")" "$(trim "$dk")" "$(trim "$by")" "$(trim "$st")"
+    done <<EOM
+$(supported_matrix)
+EOM
+    say ""
+    say "this host: $(host_matrix_key)  ->  $(matrix_status)"
+    say ""
+    say "A row may say 'supported' only where the verified-by column names real"
+    say "evidence. Add a row by surveying the host (tools/ufw-docker-survey) and"
+    say "getting a green CI leg for it — not by assuming a family resemblance."
 }
 
 # Is every current preflight failure one the operator already accepted?
@@ -1463,6 +1550,7 @@ case "${1:-}" in
     status)  shift; cmd_status "$@" ;;
     selfheal) shift; cmd_selfheal "$@" ;;
     containers) shift; cmd_containers "$@" ;;
+    platforms) shift; cmd_platforms "$@" ;;
     --version|-V|version) printf 'ufw-docker %s\n' "$VERSION" ;;
     # Usage is the header comment, printed up to the first blank line. Ranged by
     # marker rather than by line number: a hardcoded '2,14p' silently truncates
