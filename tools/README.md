@@ -19,6 +19,39 @@ short enough to read end to end before running, which is the point.
 Root is needed only because `iptables -S` and the Docker socket require it. Without root it
 still runs and says which sections are incomplete.
 
+### The quick fleet sweep
+
+Before running the full survey everywhere, this one paste emits a single pipe-delimited
+line per host — easy to collect across many boxes and sort:
+
+```bash
+sudo bash -c '
+. /etc/os-release 2>/dev/null
+L=$(iptables-legacy -S 2>/dev/null | grep -c "^-A"); N=$(iptables-nft -S 2>/dev/null | grep -c "^-A")
+printf "%s|kernel=%s|ufw=%s|iptables=%s|alt=%s|nft=%s|docker=%s|swarm=%s|rootless=%s|legacyrules=%s|nftrules=%s|sshport=%s\n" \
+ "${PRETTY_NAME:-unknown}" "$(uname -r)" \
+ "$(ufw --version 2>/dev/null | head -1 | awk "{print \$2}")" \
+ "$(iptables --version 2>/dev/null | awk "{print \$2, \$3}")" \
+ "$(update-alternatives --query iptables 2>/dev/null | awk "/^Value:/{print \$2}")" \
+ "$(nft --version 2>/dev/null | awk "{print \$2}")" \
+ "$(docker version --format "{{.Server.Version}}" 2>/dev/null)" \
+ "$(docker info --format "{{.Swarm.LocalNodeState}}" 2>/dev/null)" \
+ "$(docker info --format "{{range .SecurityOptions}}{{.}} {{end}}" 2>/dev/null | grep -o rootless || echo no)" \
+ "${L:-0}" "${N:-0}" \
+ "$(sshd -T 2>/dev/null | awk "/^port /{printf \"%s,\", \$2}")"
+'
+```
+
+```
+Debian GNU/Linux 12 (bookworm)|kernel=6.1.0-52-amd64|ufw=0.36.2|iptables=v1.8.9 (nf_tables)|alt=/usr/sbin/iptables-nft|nft=v1.0.6|docker=29.7.1|swarm=inactive|rootless=no|legacyrules=0|nftrules=104|sshport=22,
+```
+
+Then run the **full survey** on anything that looks unusual: a non-nft backend, both rule
+counts non-zero, a non-22 SSH port, Swarm or rootless, or an unexpected distro.
+
+> An empty `sshport=` means *could not ask*, not *no SSH* — the one-liner calls `sshd` on
+> `PATH`, which root does not always have. The full survey falls back to `/usr/sbin/sshd`.
+
 ### What it is for
 
 Building the supported-platform matrix from **real hosts** rather than from assumptions. The
