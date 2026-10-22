@@ -14,6 +14,13 @@ HOST_IP="${HOST_IP:?set HOST_IP to the primary address of this host}"
 # below still hardcode the Debian path; that is a known inconsistency, not a
 # statement that the path is fixed.
 AFTER4="$(python3 -c 'import ufw.common as c; print(c.config_dir + "/ufw/after.rules")' 2>/dev/null || echo /etc/ufw/after.rules)"
+BEFORE_INIT="$(dirname "$AFTER4")/before.init"
+
+# The install flags THIS host needs. X1 refuses environments it has not been
+# proven on, and the legacy CI leg is deliberately one of them -- so every test
+# that calls `install` directly needs the same override `reinstall` uses, or it
+# fails on the preflight long before reaching what it meant to test.
+install_args() { host_supported || printf '%s' "--unsupported --force"; }
 
 probe()  { sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" get "$1" "${2:-http}"; }
 health() { sudo iptables -S ufw-user-input 2>/dev/null; }
@@ -239,6 +246,16 @@ teardown() {
     # FIRST, unconditionally: a test that failed early never reached its own
     # cleanup, and one orphan holding fd 3 hangs the whole run on exit.
     stop_host_listeners
+
+    # A test that deliberately breaks before.init hands us its backup up front,
+    # so a failed assertion cannot leave the hook customised -- which makes
+    # every later `install` refuse and turns one failure into a cascade.
+    if [ -f "$BATS_FILE_TMPDIR/restore-before-init" ]; then
+        local saved; saved="$(cat "$BATS_FILE_TMPDIR/restore-before-init")"
+        [ -f "$saved" ] && sudo cp -a "$saved" "$BEFORE_INIT"
+        rm -f "$saved" "$BATS_FILE_TMPDIR/restore-before-init"
+        reinstall || true
+    fi
 
     local rc=0
 
@@ -581,15 +598,20 @@ teardown_file() {
 
 @test "install refuses to overwrite a customised before.init" {
     local saved; saved=$(mktemp)
-    sudo cp -a /etc/ufw/before.init "$saved"
-    printf '#!/bin/sh\n# operator hook\nexit 0\n' | sudo tee /etc/ufw/before.init >/dev/null
-    sudo chmod 0750 /etc/ufw/before.init
-    run sudo "$REPO/ufw-docker" install
+    sudo cp -a "$BEFORE_INIT" "$saved"
+    # Hand the restore to teardown BEFORE breaking anything. If an assertion
+    # below fails, bats abandons the test at that line -- and this test used to
+    # leave a customised hook behind, which made `install` refuse for the rest
+    # of the run and turned one failure into six. teardown always runs.
+    echo "$saved" > "$BATS_FILE_TMPDIR/restore-before-init"
+
+    printf '#!/bin/sh\n# operator hook\nexit 0\n' | sudo tee "$BEFORE_INIT" >/dev/null
+    sudo chmod 0750 "$BEFORE_INIT"
+    # shellcheck disable=SC2046
+    run sudo "$REPO/ufw-docker" install $(install_args)
     [ "$status" -ne 0 ]
     echo "$output" | grep -q 'customised'
-    sudo grep -q 'operator hook' /etc/ufw/before.init     # untouched
-    sudo cp -a "$saved" /etc/ufw/before.init; rm -f "$saved"
-    reinstall
+    sudo grep -q 'operator hook' "$BEFORE_INIT"     # untouched
 }
 
 @test "remove without --force changes nothing" {
@@ -975,6 +997,7 @@ STUB
 }
 
 @test "install REFUSES an unsupported environment, and changes nothing" {
+    host_supported || skip "host backend is $(host_backend); this asserts the supported -> unsupported transition"
     local before after
     before="$(sudo md5sum "$AFTER4" | awk '{print $1}')"
 
@@ -990,6 +1013,7 @@ STUB
 }
 
 @test "--unsupported ALONE still refuses; it takes both flags" {
+    host_supported || skip "host backend is $(host_backend); this asserts a refusal from a clean, supported baseline"
     # One flag is something you can paste from a forum post without reading it.
     run sudo env "$(unsup_env)" "$REPO/ufw-docker" install --unsupported
     [ "$status" -eq 1 ]
@@ -998,6 +1022,7 @@ STUB
 }
 
 @test "--unsupported --force installs, and says so FOREVER afterwards" {
+    host_supported || skip "host backend is $(host_backend); this asserts the marker appearing and then clearing"
     run sudo env "$(unsup_env)" "$REPO/ufw-docker" install --unsupported --force
     [ "$status" -eq 0 ]
     echo "$output" | grep -q 'PROCEEDING ANYWAY'
