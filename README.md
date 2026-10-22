@@ -192,6 +192,33 @@ in theory: a rescue tool should not share fate with the thing it rescues. In pra
 likelier failure is someone installing the tool and skipping the rescue — and one file
 cannot be half-installed.
 
+## Logging
+
+Blocked container traffic is logged to the kernel log with its own prefix, rate-limited
+to 3/min the same way ufw limits its own:
+
+```
+[UFW DOCKER BLOCK] IN=ens192 OUT=br-170139de947a SRC=203.0.113.9 DST=172.18.251.3 ... DPT=8089
+```
+
+```bash
+journalctl -k | grep 'UFW DOCKER BLOCK'
+```
+
+A distinct prefix from ufw's `[UFW BLOCK]` so container drops can be told apart from host
+drops at a glance.
+
+**Caveat:** this chain has its own `LOG` rule, so `ufw logging off` does **not** silence
+it. If that matters to you, say so — it is on the list.
+
+Other logging:
+
+| | |
+|---|---|
+| the self-heal unit | `journalctl -t ufw-docker-selfheal` |
+| a self-heal repair | `/var/log/ufw-docker-selfheal.log` |
+| `install` / `remove` / `status` | stdout only — no audit trail yet (see `TODO.md` C1) |
+
 ## Two things that will bite you
 
 ### Ports are matched AFTER DNAT

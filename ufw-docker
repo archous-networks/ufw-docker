@@ -127,14 +127,21 @@ stanza() {   # $1 = 4|6
     printf '%s\n' "# after.rules is restored BEFORE user.rules, so $chain does not"
     printf '%s\n' "# exist yet. Declaring it creates it; user.rules fills it in afterwards."
     printf ':%s - [0:0]\n' "$chain"
+    printf ':ufw-docker-logging-deny - [0:0]\n'
     printf ':DOCKER-USER - [0:0]\n'
     printf '%s\n' "# Container-originated traffic is Docker's business."
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -s %s -j RETURN\n' "$s"; done
     printf -- '-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n'
     printf '%s\n' "# Judge only what is heading INTO a container network."
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j %s\n' "$s" "$chain"; done
-    printf '%s\n' "# Nothing matched: mirror ufw's default deny."
-    printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j DROP\n' "$s"; done
+    printf '%s\n' "# Nothing matched: LOG, then drop."
+    printf '%s\n' "# Our own chain rather than ufw's ufw-logging-deny: that one is filled in"
+    printf '%s\n' "# by a later pass, so declaring it here would flush it and silence ufw's"
+    printf '%s\n' "# own logging. Same 3/min limit; distinct prefix so container blocks are"
+    printf '%s\n' "# distinguishable from host blocks."
+    printf -- '-A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "\n'
+    printf -- '-A ufw-docker-logging-deny -j DROP\n' 
+    printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j ufw-docker-logging-deny\n' "$s"; done
     printf 'COMMIT\n'
     printf '%s\n' "$MARK_END"
 }
@@ -144,6 +151,40 @@ strip_stanza() { sed -i "/^${MARK_BEGIN}\$/,/^${MARK_END}\$/d" "$1" 2>/dev/null;
 # The hook that makes `ufw reload` survivable -- see the long note inside it.
 install_hook() {
     local f=/etc/ufw/before.init
+    local stock=/usr/share/ufw/before.init
+
+    # Refuse to clobber a hook the operator wrote.
+    #
+    # This used to `cat >` unconditionally. A backup was taken, but anyone with
+    # their own before.init logic would have found it silently replaced and
+    # their hook simply not running -- no error, which is the worst way to lose
+    # a firewall customisation. Demonstrated on the dev host before this guard
+    # existed.
+    #
+    # ufw ships a pristine template at /usr/share/ufw/before.init; replacing an
+    # untouched copy of that is safe. Anything else belongs to the operator.
+    if [ -f "$f" ] && ! grep -q 'Managed by ufw-docker' "$f" 2>/dev/null; then
+        if [ -f "$stock" ] && cmp -s "$f" "$stock"; then
+            :
+        else
+            bad "/etc/ufw/before.init has been customised; refusing to overwrite it"
+            say ""
+            say "  This tool needs DOCKER-USER emptied before ufw tears its chains down,"
+            say "  or 'ufw reload' leaves the firewall half-built and drops your SSH rule."
+            say "  Add this to your own before.init, under the start and stop cases:"
+            say ""
+            say "      for ipt in iptables ip6tables; do"
+            say "          command -v \"\$ipt\" >/dev/null 2>&1 || continue"
+            say "          \"\$ipt\" -S DOCKER-USER >/dev/null 2>&1 || continue"
+            say "          \"\$ipt\" -F DOCKER-USER 2>/dev/null || true"
+            say "          \"\$ipt\" -A DOCKER-USER -j RETURN 2>/dev/null || true"
+            say "      done"
+            say ""
+            say "  Then re-run install. Your file has not been touched."
+            return 1
+        fi
+    fi
+
     [ -f "$f" ] && [ ! -f "$f.ufw-docker-backup" ] && cp -a "$f" "$f.ufw-docker-backup"
     cat > "$f" <<'INIT'
 #!/bin/sh
@@ -204,7 +245,8 @@ cmd_install() {
     say "IPv6 Docker subnets: $(echo "$v6" | tr '\n' ' ')${v6:+}"
     [ -z "$v6" ] && say "  (none — Docker IPv6 is off; the v6 stanza is skipped)"
 
-    install_hook; ok "before.init hook installed (required for reload safety)"
+    install_hook || die "cannot proceed without the before.init hook — see above"
+    ok "before.init hook installed (required for reload safety)"
 
     cp -a /etc/ufw/after.rules  "/etc/ufw/after.rules.ufw-docker-bak-$(date +%Y%m%d%H%M%S)"
     strip_stanza /etc/ufw/after.rules
@@ -230,7 +272,36 @@ cmd_install() {
     fi
 
     head_ "applying"
-    ufw reload 2>&1 | sed 's/^/  /'
+    if ! ufw reload 2>&1 | sed 's/^/  /'; then
+        : # ufw's exit code is unreliable through the pipe; the health check below decides
+    fi
+
+    # Verify, and ROLL BACK if we broke it.
+    #
+    # This previously ran `ufw reload` and trusted it. A malformed stanza would
+    # leave ufw half-built -- no SSH rule, chains missing -- with the tool
+    # reporting success, which is the exact failure this project exists to stop
+    # happening by accident.
+    local bad_state=0
+    ufw status 2>/dev/null | grep -q 'Status: active' || bad_state=1
+    [ "$(iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging')" -ge 9 ] || bad_state=1
+    [ "$(iptables -S ufw-user-input 2>/dev/null | grep -c -- '--dport')" -gt 0 ] \
+        || [ "$(grep -c -- '-A ufw-user-input' /etc/ufw/user.rules 2>/dev/null)" -eq 0 ] \
+        || bad_state=1
+
+    if [ "$bad_state" -eq 1 ]; then
+        bad "the firewall is NOT healthy after applying — rolling back"
+        strip_stanza /etc/ufw/after.rules
+        strip_stanza /etc/ufw/after6.rules
+        ufw reload >/dev/null 2>&1
+        if ufw status 2>/dev/null | grep -q 'Status: active'; then
+            ok "rolled back; ufw is active again with your rules"
+        else
+            bad "rollback did not restore ufw — run: ufw-docker rescue"
+        fi
+        return 1
+    fi
+
     cmd_status
 }
 
@@ -381,6 +452,10 @@ cmd_status() {
         && ok "before.init hook installed" \
         || { bad "before.init hook MISSING — 'ufw reload' WILL break the firewall"; rc=1; }
 
+    iptables -S ufw-docker-logging-deny >/dev/null 2>&1 \
+        && ok "blocked container traffic is logged ([UFW DOCKER BLOCK])" \
+        || warn "no logging chain — blocked container traffic will be silent"
+
     local j4; j4=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input')
     [ "$j4" -gt 0 ] && ok "IPv4 wired ($j4 jumps into ufw-user-input)" \
         || { bad "stanza present but IPv4 NOT wired — run 'install' or 'ufw reload'"; rc=1; }
@@ -514,10 +589,18 @@ cmd_rescue() {
     # nft level, which also means removing the base-chain jumps that reference them.
     head_ "3b. checking for nft-incompatible chains"
     if command -v nft >/dev/null 2>&1; then
-        # Match the SPECIFIC error. An absent chain also makes iptables fail, and
-        # treating that as incompatibility sent this down the nft path on a healthy
-        # host -- a rescue script must not take drastic action on a false positive.
-        if iptables -S ufw-user-input 2>&1 | grep -q 'incompatible'; then
+        # The test must be "exists in nft AND iptables cannot read it".
+        #
+        # Matching the error string is NOT sufficient, which took a round trip to
+        # learn: iptables-nft prints the identical message for a chain that does
+        # not exist at all --
+        #     $ iptables -S definitely-not-a-chain
+        #     chain `definitely-not-a-chain' ... is incompatible, use 'nft' tool.
+        # -- and an absent ufw-user-input is a perfectly ordinary state (ufw
+        # disabled, chains already torn down). Keying on the string alone sent a
+        # healthy host down this destructive path.
+        if nft list chain ip filter ufw-user-input >/dev/null 2>&1 \
+           && ! iptables -S ufw-user-input >/dev/null 2>&1; then
             warn "ufw chains are not readable by iptables; clearing them with nft"
             for base in INPUT FORWARD OUTPUT; do
                 while :; do
