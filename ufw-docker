@@ -73,13 +73,7 @@ Wants=ufw.service
 # because that is the single symptom that locks people out. A broader health
 # check would risk running a destructive rebuild over a merely unusual state.
 Type=oneshot
-ExecStart=/bin/sh -c 'sleep 20; \
-  if ! /sbin/iptables -S ufw-user-input 2>/dev/null | grep -q "dport 22"; then \
-    logger -t ufw-docker-selfheal "ufw came up without an SSH rule - running rescue"; \
-    /usr/local/sbin/ufw-docker rescue >/var/log/ufw-docker-selfheal.log 2>&1; \
-  else \
-    logger -t ufw-docker-selfheal "ufw healthy at boot"; \
-  fi'
+ExecStart=/usr/local/sbin/ufw-docker selfheal
 RemainAfterExit=yes
 
 [Install]
@@ -116,8 +110,12 @@ subnets() {   # $1 = 4|6
 # Build the stanza for one family. The chain names differ (ufw-user-input vs
 # ufw6-user-input) and so do the rule files.
 stanza() {   # $1 = 4|6
-    local fam="$1" chain file nets
-    if [ "$fam" = "6" ]; then chain="ufw6-user-input"; else chain="ufw-user-input"; fi
+    local fam="$1" chain fchain file nets
+    if [ "$fam" = "6" ]; then
+        chain="ufw6-user-input";  fchain="ufw6-user-forward"
+    else
+        chain="ufw-user-input";   fchain="ufw-user-forward"
+    fi
     nets="$(subnets "$fam")"
     [ -n "$nets" ] || return 1
 
@@ -127,12 +125,19 @@ stanza() {   # $1 = 4|6
     printf '%s\n' "# after.rules is restored BEFORE user.rules, so $chain does not"
     printf '%s\n' "# exist yet. Declaring it creates it; user.rules fills it in afterwards."
     printf ':%s - [0:0]\n' "$chain"
+    printf ':%s - [0:0]\n' "$fchain"
     printf ':ufw-docker-logging-deny - [0:0]\n'
     printf ':DOCKER-USER - [0:0]\n'
     printf '%s\n' "# Container-originated traffic is Docker's business."
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -s %s -j RETURN\n' "$s"; done
     printf -- '-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n'
     printf '%s\n' "# Judge only what is heading INTO a container network."
+    printf '%s\n' "#"
+    printf '%s\n' "# ufw route rules FIRST, then plain ufw rules. \`ufw route allow ...\` is the"
+    printf '%s\n' "# verb ufw intends for forwarded traffic, so it is the more specific"
+    printf '%s\n' "# statement and wins. Plain \`ufw allow\` still works, which is the whole"
+    printf '%s\n' "# point of this tool; it is simply consulted second."
+    printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j %s\n' "$s" "$fchain"; done
     printf '%s\n' "$nets" | while read -r s; do [ -n "$s" ] && printf -- '-A DOCKER-USER -d %s -j %s\n' "$s" "$chain"; done
     printf '%s\n' "# Nothing matched: LOG, then drop."
     printf '%s\n' "# Our own chain rather than ufw's ufw-logging-deny: that one is filled in"
@@ -147,6 +152,16 @@ stanza() {   # $1 = 4|6
 }
 
 strip_stanza() { sed -i "/^${MARK_BEGIN}\$/,/^${MARK_END}\$/d" "$1" 2>/dev/null; }
+
+# Subnets the INSTALLED stanza covers, as opposed to the ones Docker has now.
+# The two drift apart the moment someone creates a network after install, and
+# nothing else notices: traffic to a new subnet matches none of our rules, so it
+# is neither allowed by ufw nor dropped by us.
+stanza_subnets() {   # $1 = rules file
+    sed -n "/^${MARK_BEGIN}\$/,/^${MARK_END}\$/p" "$1" 2>/dev/null \
+        | grep -oE -- '-A DOCKER-USER -d [0-9a-fA-F:./]+' \
+        | awk '{print $4}' | sort -u
+}
 
 # The hook that makes `ufw reload` survivable -- see the long note inside it.
 install_hook() {
@@ -421,6 +436,53 @@ cmd_remove() {
     warn "they no longer affect Docker-published ports."
 }
 
+# What the self-heal unit runs at boot.
+#
+# A subcommand rather than a shell one-liner wedged into ExecStart: the previous
+# version was a backslash-continued blob inside a unit file, which could not be
+# read, tested or fixed like the rest of this tool.
+cmd_selfheal() {
+    require_root selfheal
+    sleep "${SELFHEAL_DELAY:-20}"
+
+    local repaired=0
+
+    # 1. The symptom that locks people out.
+    if ! iptables -S ufw-user-input 2>/dev/null | grep -q -- '--dport'; then
+        logger -t ufw-docker-selfheal "ufw has no user rules at boot - running rescue"
+        cmd_rescue >/var/log/ufw-docker-selfheal.log 2>&1
+        repaired=1
+    fi
+
+    # 2. The symptom nobody would otherwise see: the stanza is installed but our
+    #    jumps are gone, so container ports are unfiltered while everything
+    #    LOOKS fine -- ufw active, rules listed, nothing in any log. That is
+    #    exactly what a future Docker flushing DOCKER-USER on startup would
+    #    produce. A reload re-applies after.rules; no need for a full rescue.
+    if grep -q "$MARK_BEGIN" /etc/ufw/after.rules 2>/dev/null \
+       && [ "$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input')" -eq 0 ]; then
+        logger -t ufw-docker-selfheal "stanza installed but DOCKER-USER unwired - reloading ufw"
+        ufw reload >>/var/log/ufw-docker-selfheal.log 2>&1
+        repaired=1
+    fi
+
+    # After a rescue the host is reachable but UNWIRED -- rescue strips the
+    # stanza by design, because its job is a working ufw, not a wired one. Say
+    # so loudly rather than leaving a host that looks fine and filters nothing.
+    #
+    # Deliberately NOT auto-reinstalling: if the stanza is what broke ufw,
+    # re-applying it on every boot is a loop, and an unfiltered host that says
+    # so beats one that flaps.
+    if [ "$repaired" -eq 1 ] \
+       && ! grep -q "$MARK_BEGIN" /etc/ufw/after.rules 2>/dev/null; then
+        logger -t ufw-docker-selfheal \
+            "RECOVERED but UNWIRED: ufw rules no longer affect Docker ports - run 'ufw-docker install'"
+    fi
+
+    [ "$repaired" -eq 0 ] && logger -t ufw-docker-selfheal "ufw healthy at boot"
+    return 0
+}
+
 cmd_status() {
     head_ "ufw-docker status"
     local rc=0
@@ -456,9 +518,30 @@ cmd_status() {
         && ok "blocked container traffic is logged ([UFW DOCKER BLOCK])" \
         || warn "no logging chain — blocked container traffic will be silent"
 
+    local jf; jf=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-forward')
+    [ "$jf" -gt 0 ] && ok "\`ufw route\` rules are honoured ($jf jumps into ufw-user-forward)" \
+        || warn "\`ufw route\` rules are NOT honoured — re-run install"
+
     local j4; j4=$(iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input')
     [ "$j4" -gt 0 ] && ok "IPv4 wired ($j4 jumps into ufw-user-input)" \
         || { bad "stanza present but IPv4 NOT wired — run 'install' or 'ufw reload'"; rc=1; }
+
+    # Drift check. This is the failure nobody would otherwise see.
+    local want have drift
+    want="$(subnets 4 | sort -u)"
+    have="$(stanza_subnets /etc/ufw/after.rules)"
+    drift="$(comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$have") 2>/dev/null)"
+    if [ -n "$drift" ]; then
+        bad "SUBNET DRIFT — Docker networks not covered by the installed stanza:"
+        printf '%s\n' "$drift" | sed 's/^/        /'
+        say  "    traffic to these is filtered by nothing. Re-run: ufw-docker install"
+        rc=1
+    else
+        ok "all Docker IPv4 subnets are covered"
+    fi
+    local stale
+    stale="$(comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$have") 2>/dev/null | grep -v ':' || true)"
+    [ -n "$stale" ] && warn "stanza covers subnets Docker no longer has (harmless): $(echo "$stale" | tr '\n' ' ')"
 
     local v6nets; v6nets="$(subnets 6)"
     local j6; j6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c 'ufw6-user-input')
@@ -714,5 +797,6 @@ case "${1:-}" in
     rescue)  shift; cmd_rescue "$@" ;;
     remove|uninstall) shift; cmd_remove "$@" ;;
     status)  shift; cmd_status "$@" ;;
+    selfheal) shift; cmd_selfheal "$@" ;;
     *) sed -n '2,14p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit 1 ;;
 esac

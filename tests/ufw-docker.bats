@@ -155,6 +155,90 @@ teardown_file() {
     sudo ufw allow 22/tcp >/dev/null 2>&1
 }
 
+@test "ufw route rules are honoured" {
+    # Before this was wired, `ufw route allow` -- the verb ufw intends for
+    # forwarded traffic -- was ignored entirely, with no warning.
+    sudo ufw route allow to any port 8089 proto tcp >/dev/null 2>&1
+    [ "$(probe 8089)" != "000" ]
+    sudo ufw route delete allow to any port 8089 proto tcp >/dev/null 2>&1
+    sudo ufw reload >/dev/null 2>&1
+    [ "$(probe 8089)" = "000" ]
+}
+
+@test "blocked container traffic is logged" {
+    # The LOG rule is rate-limited to 3/min with a burst of 10 -- the same limit
+    # ufw uses. Earlier tests in this file generate blocks and drain that burst,
+    # so a single probe can legitimately produce no line. Poll instead: at
+    # 3/min a token frees up every 20s, so a minute is ample.
+    sudo ufw delete allow 8089/tcp >/dev/null 2>&1 || true
+    sudo ufw reload >/dev/null 2>&1
+    local mark; mark=$(date +%s)
+    local i
+    for i in $(seq 1 12); do
+        probe 8089 >/dev/null
+        sleep 5
+        if sudo journalctl -k --since "@$mark" --no-pager 2>/dev/null | grep -q 'UFW DOCKER BLOCK'; then
+            return 0
+        fi
+    done
+    echo "no [UFW DOCKER BLOCK] line in 60s" >&2
+    return 1
+}
+
+@test "subnet drift is detected" {
+    docker network create --subnet 10.78.0.0/24 drifttest >/dev/null 2>&1
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q 'SUBNET DRIFT'
+    echo "$output" | grep -q '10.78.0.0/24'
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1   # re-install clears it
+    run sudo "$REPO/ufw-docker" status
+    echo "$output" | grep -q 'all Docker IPv4 subnets are covered'
+    docker network rm drifttest >/dev/null 2>&1
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+}
+
+@test "selfheal rewires DOCKER-USER if it is found empty" {
+    # The B2 scenario: a future Docker that flushes DOCKER-USER on startup would
+    # leave container ports unfiltered while everything LOOKS fine.
+    sudo iptables -F DOCKER-USER
+    sudo iptables -A DOCKER-USER -j RETURN
+    [ "$(jumps)" -eq 0 ]
+    sudo SELFHEAL_DELAY=0 "$REPO/ufw-docker" selfheal
+    [ "$(jumps)" -gt 0 ]
+}
+
+@test "selfheal restores a missing SSH rule, restricted not blanket" {
+    sudo iptables -F ufw-user-input
+    [ "$(ssh_rule)" -eq 0 ]
+    sudo SELFHEAL_DELAY=0 "$REPO/ufw-docker" selfheal
+    [ "$(ssh_rule)" -gt 0 ]
+    # It must NOT have left a blanket ACCEPT behind in INPUT.
+    [ "$(sudo iptables -S INPUT | grep -c 'dport 22')" -eq 0 ]
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+}
+
+@test "install refuses to overwrite a customised before.init" {
+    local saved; saved=$(mktemp)
+    sudo cp -a /etc/ufw/before.init "$saved"
+    printf '#!/bin/sh\n# operator hook\nexit 0\n' | sudo tee /etc/ufw/before.init >/dev/null
+    sudo chmod 0750 /etc/ufw/before.init
+    run sudo "$REPO/ufw-docker" install
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q 'customised'
+    sudo grep -q 'operator hook' /etc/ufw/before.init     # untouched
+    sudo cp -a "$saved" /etc/ufw/before.init; rm -f "$saved"
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+}
+
+@test "remove without --force changes nothing" {
+    local before; before=$(jumps)
+    run sudo "$REPO/ufw-docker" remove
+    echo "$output" | grep -q 'WOULD REMOVE'
+    echo "$output" | grep -q 'force'
+    [ "$(jumps)" -eq "$before" ]
+}
+
 @test "remove returns DOCKER-USER to stock" {
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
     [ "$(jumps)" -eq 0 ]

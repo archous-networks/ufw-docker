@@ -25,7 +25,13 @@ case "${1:-}" in
     ip link del vprobe-h 2>/dev/null || true
     ;;
   get)   # $2 = port, $3 = scheme
-    ip netns exec $NS curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
-        "${3:-http}://${HOST_IP}:${2}/" 2>/dev/null
+    # ALWAYS exits 0. This reports a result; it does not assert one. curl exits
+    # 28 on timeout, which is the expected outcome for a blocked port -- and as
+    # a bare statement under bats' errexit that failed the test outright, which
+    # cost a debugging round trip. The caller judges the printed code.
+    code=$(ip netns exec $NS curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+        "${3:-http}://${HOST_IP}:${2}/" 2>/dev/null)
+    printf '%s' "${code:-000}"
+    exit 0
     ;;
 esac

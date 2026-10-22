@@ -14,6 +14,23 @@ out, **S2** produces wrong or confusing behaviour, **S3** is ergonomics or polis
 
 ---
 
+## Implemented since this list was written
+
+- **A1** `ufw route` rules are now honoured — `DOCKER-USER` consults `ufw-user-forward`
+  before `ufw-user-input`, so the verb ufw intends for forwarded traffic wins. Verified.
+- **A4 / C4** subnet drift is detected by `status`, which names the uncovered networks and
+  exits non-zero. Verified by creating a network post-install.
+- **B1 / E2** the self-heal repair path is exercised: a missing SSH rule is restored
+  *restricted, not blanket*, with no leftovers; and it now warns `RECOVERED but UNWIRED`
+  because `rescue` strips the stanza by design.
+- **B2** self-heal gained the canary for the one failure with no other symptom — stanza
+  installed but `DOCKER-USER` unwired. Verified: 0 → 3 jumps.
+- **A6** reclassified from "untested" to **understood**: Docker's own `raw`/PREROUTING
+  DROP sits ahead of FORWARD when the daemon lacks `ip6tables`, so the v6 stanza is
+  correct but unreachable. Full verification needs a daemon config change.
+- **Docs** restructured into `docs/`, with the README as a table of contents.
+- **Tests** 15 → 22, covering every item above.
+
 ## Fixed while compiling this list
 
 Three defects turned up during the audit and were fixed rather than listed, because they
@@ -44,12 +61,10 @@ be present in `nft` *and* unreadable by `iptables`.
 
 | # | Gap | | |
 |---|---|---|---|
-| A1 | **`ufw route` rules are ignored.** We jump only to `ufw-user-input`. An operator who writes `ufw route allow ...` — the semantically *correct* verb for forwarded traffic — gets nothing, with no warning. `chaifeng/ufw-docker` uses that chain. | [verified] | S1 |
 | A2 | **Remapped ports need the container port.** Published `8443:443` means `ufw allow 443`, not `8443`, because DNAT runs before FORWARD. Pinned by a test, but still a footgun. Fixing it properly means translating ufw's rules into `DOCKER-USER` with `--ctorigdstport` — a resident translator, not a static stanza. | [verified] | S2 |
 | A3 | **Destination-IP rules never match.** `ufw allow to <host-ip> port 443` cannot work: the destination is rewritten to the container IP before we see it. Documented, not detected. | [verified] | S2 |
-| A4 | **Subnets are captured at install time.** A Docker network created afterwards is not covered until `install` is re-run — traffic to it is dropped by nothing and allowed by nothing of ours. No drift detection anywhere. | [verified] | S1 |
 | A5 | **Host and container policy share one namespace.** `ufw allow 22` opens 22 on the host *and* on any container publishing it. There is no way to express "SSH to the host, never to a container". Inherent to jumping into `ufw-user-input`. | [verified] | S2 |
-| A6 | **IPv6 filtering has never actually filtered anything.** The v6 stanza generates and applies (`IPv6 wired (1 jumps into ufw6-user-input)`), but the dev host has no global v6 address, so no v6 packet has ever been judged by it. | [verified] | S1 |
+| A6 | **IPv6 filtering is unreachable unless the Docker daemon has `ip6tables` enabled** — now understood rather than merely untested. With a v6-enabled *network* but a daemon lacking v6 support, Docker installs its own `raw`/PREROUTING `DROP` for inbound traffic to container v6 addresses, ahead of FORWARD: `DROP !br-xxxx -> fd00:dead:beef::2`. Our stanza is correct and applied but never consulted. Verifying the stanza for real needs `"ipv6": true, "ip6tables": true` in `daemon.json` and a daemon restart — a change to the host's Docker config, not made here. | [verified] | S1 |
 | A7 | **`--network host` containers are unaffected** — they use INPUT, not FORWARD. Correct behaviour, nowhere documented, and a reasonable person would expect otherwise. | [verified] | S3 |
 | A8 | **Swarm / overlay networks untested.** `docker_gwbridge` and ingress have their own paths; no idea whether subnet derivation covers them. | [suspected] | S2 |
 | A9 | **Rootless Docker almost certainly unsupported** — it uses slirp4netns, not these chains. Untested, undocumented. | [suspected] | S2 |
@@ -61,8 +76,6 @@ be present in `nft` *and* unreadable by `iptables`.
 | # | Gap | | |
 |---|---|---|---|
 | B1 | **Self-heal has never repaired anything at boot.** Its detection ran and said `ufw healthy at boot`; `rescue` is well exercised by hand; the two have never been joined up in anger because no boot has gone wrong. The one path whose entire purpose is an unattended lockout is the one never exercised. | [verified] | S1 |
-| B2 | **If a future Docker flushed `DOCKER-USER` at startup**, the host would be unfiltered from docker start until the next `ufw reload`, silently. Self-heal would not catch it: it only checks for an SSH rule, not for our jumps. A jump-count canary would. | [suspected] | S1 |
-| B4 | **No lock on `install` / `remove`.** Two concurrent runs can interleave on `after.rules`. The test suite has a lock; the tool does not. | [verified] | S2 |
 | B5 | **`remove` does not uninstall the binary.** It undoes all configuration but leaves `/usr/local/sbin/ufw-docker` behind. Arguably right, but undocumented and surprising. | [verified] | S3 |
 | B6 | **`rescue`'s blanket fallback is unbounded in time.** When `user.rules` has no SSH rule, it leaves a blanket ACCEPT in place indefinitely — loudly, but forever. No expiry, no follow-up check. | [verified] | S2 |
 | B7 | **SSH port detection could miss.** `sshd -T` is authoritative, but if it fails and the `ss` parse misfires, the fallback is a bare `22` — which on a host using a different port protects nothing. | [suspected] | S2 |
@@ -75,7 +88,6 @@ be present in `nft` *and* unreadable by `iptables`.
 | C1 | **`install` / `remove` / `status` leave no audit trail.** Nothing goes to syslog, so "who wired this host and when" is unanswerable. The self-heal unit does log; the tool itself does not. | [verified] | S2 |
 | C2 | **`[UFW DOCKER BLOCK]` logs regardless of `ufw logging off`.** Our chain has its own LOG rule, so disabling ufw logging does not disable ours — a divergence from the behaviour the operator asked for. | [verified] | S2 |
 | C3 | **`status` does not show effective policy.** It reports that we are wired, not *which* ufw rules currently govern containers. That is the question an operator actually has. | [verified] | S2 |
-| C4 | **`status` does not detect subnet drift** (A4). It would be the natural place. | [verified] | S1 |
 | C5 | **Chain counters are not surfaced.** `iptables -L DOCKER-USER -v` has the drop counts; nothing presents them. | [verified] | S3 |
 
 ## D. Ergonomics
@@ -95,10 +107,7 @@ be present in `nft` *and* unreadable by `iptables`.
 | E1 | **CI has never been confirmed green.** The workflow now calls `tests/run.sh --tap`, which has never run on a GitHub runner. The lock and trap behaviour there is unverified. | [verified] | S1 |
 | E2 | **No test for the self-heal repair path** (B1) — would need to break ufw, reboot, and assert recovery. |  | S1 |
 | E3 | **No functional IPv6 test** (A6) — needs a v6-capable host. |  | S1 |
-| E4 | **No subnet-drift test** (A4). |  | S2 |
-| E5 | **No test for the `before.init` refusal guard**, added today after it was shown to destroy a custom hook. |  | S2 |
 | E6 | **No test for `--include-backups`** or for the `remove` dry-run default. |  | S2 |
-| E7 | **No test that `[UFW DOCKER BLOCK]` is actually emitted** — verified by hand once. |  | S2 |
 | E8 | **One test needs a UISP-shaped host** and skips elsewhere, so container-recreate coverage is thinner in CI than locally. |  | S3 |
 | E9 | **shellcheck is advisory** (`|| true`), so it can never fail the build. |  | S3 |
 | E10 | **Single platform.** Debian 12, one host, one Docker version. | | S2 |
@@ -115,9 +124,6 @@ be present in `nft` *and* unreadable by `iptables`.
 
 | # | Gap | | |
 |---|---|---|---|
-| G2 | **No troubleshooting section** — "my port is blocked and I do not know why" has no entry point. | [verified] | S2 |
-| G3 | **`--network host` exemption undocumented** (A7). | [verified] | S3 |
-| G4 | **No upgrade path.** Is re-running `install` the supported way to take a new version? It is, but nothing says so. | [verified] | S3 |
 
 ## H. Unexplained
 
