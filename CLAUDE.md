@@ -301,6 +301,20 @@ Keep that property if you touch this: **the rescue path may never leave a host m
 exposed than it found it, except where the alternative is no access at all** — and then it
 must say so in terms someone reading a log will act on.
 
+## The systemd unit is embedded, not shipped as a file
+
+`install_selfheal()` writes the unit from a heredoc. There is deliberately **no**
+`systemd/ufw-docker-selfheal.service` in the repo.
+
+There was one briefly, and it had already drifted from the embedded copy within the hour —
+unreferenced by anything, undownloadable by the one-liner install (which fetches only
+`ufw-docker`), and therefore guaranteed to be the version that never runs. Same mistake as
+an early `stanza.sh`: a second copy of generated content, which exists only to be wrong
+later.
+
+The rule for this repo: **one file ships, so anything the tool writes is generated from
+inside it.** If you want to read the unit, read `install_selfheal()`.
+
 ## Still open
 
 - **Reboot/boot-ordering**, above.
