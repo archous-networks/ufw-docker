@@ -27,21 +27,34 @@ rules_diff_report() {
     # DELETIONS ARE ALWAYS A BUG. No test has any business removing a rule the
     # operator put there. This is the exact failure that cost two CI runs and
     # eleven misattributed test failures.
+    local deleted=0 leaked=0
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        echo "### DELETED AN OPERATOR RULE ###"
+        echo "### THIS TEST DELETED AN OPERATOR RULE ###"
         echo "    $line"
-        bad=1
+        deleted=1; bad=1
     done < <(comm -23 "$before" "$after")
+    if [ "$deleted" -eq 1 ]; then
+        echo "    There is no allowlist for this and there will not be one."
+        echo "    Restore whatever you deleted, or test it on a port of your own."
+    fi
 
     # ADDITIONS are allowed only on ports and addresses the suite owns.
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         test_owned "$line" && continue
-        echo "### LEAKED A RULE THE SUITE DOES NOT OWN ###"
+        echo "### THIS TEST LEAKED A RULE THE SUITE DOES NOT OWN ###"
         echo "    $line"
-        bad=1
+        leaked=1; bad=1
     done < <(comm -13 "$before" "$after")
+    if [ "$leaked" -eq 1 ]; then
+        echo "    If that rule is YOURS -- a new test using a port or address not yet"
+        echo "    declared -- add it in tests/rules-lib.bash and re-run:"
+        echo "        TEST_PORTS='$TEST_PORTS'"
+        echo "        TEST_ADDRS='$TEST_ADDRS'"
+        echo "    If it is NOT yours, the test is changing the operator's rules."
+        echo "    Delete the rule before the test ends."
+    fi
 
     return $bad
 }
