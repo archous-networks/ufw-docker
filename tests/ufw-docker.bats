@@ -16,18 +16,45 @@ ssh_rule()  { sudo iptables -S ufw-user-input 2>/dev/null | grep -c 'dport 22'; 
 jumps()     { sudo iptables -S DOCKER-USER 2>/dev/null | grep -c 'ufw-user-input'; }
 active()    { sudo ufw status 2>/dev/null | grep -c 'Status: active'; }
 
+# Confirm something is actually listening behind the port under test, from the
+# host, before asserting anything about the firewall. A probe of a port with no
+# listener returns 000 whatever the rules say -- which is indistinguishable from
+# "correctly blocked" and silently turns the allow-tests into passes-for-free.
+ensure_service() {
+    local port="${1:-8089}" i
+    for i in $(seq 1 10); do
+        curl -sS -o /dev/null --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null && return 0
+        # Bring back anything a daemon restart stopped.
+        docker start testsvc >/dev/null 2>&1 || true
+        sleep 2
+    done
+    return 1
+}
+
 setup_file() {
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" up
     # A rule we can prove host-level filtering with, independent of Docker.
-    sudo ufw allow 22/tcp >/dev/null 2>&1
+    # Only add it if it is not already there, and record that we did -- the
+    # teardown must not delete an SSH rule the environment provided. In CI the
+    # workflow adds one before the suite runs; removing it made `rescue` find no
+    # SSH rule, fall back to a blanket ACCEPT, and report the job as failed.
+    if sudo ufw status 2>/dev/null | grep -qE '^22/tcp +ALLOW'; then
+        echo no > "$BATS_FILE_TMPDIR/we-added-ssh"
+    else
+        echo yes > "$BATS_FILE_TMPDIR/we-added-ssh"
+        sudo ufw allow 22/tcp >/dev/null 2>&1
+    fi
     sudo "$REPO/ufw-docker" install >/dev/null 2>&1
 }
 
 teardown_file() {
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1 || true
-    # setup_file added a blanket SSH allow for the host-level test; leaving it
-    # behind would quietly widen the operator's SSH exposure after a test run.
-    sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
+    # Remove the blanket SSH allow ONLY if we added it. Leaving one behind would
+    # widen the operator's exposure; deleting one we were given breaks whatever
+    # put it there.
+    if [ "$(cat "$BATS_FILE_TMPDIR/we-added-ssh" 2>/dev/null)" = yes ]; then
+        sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
+    fi
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" down || true
     # Non-negotiable: never leave a broken firewall behind.
     sudo "$REPO/ufw-docker" rescue >/dev/null 2>&1 || true
@@ -56,6 +83,7 @@ teardown_file() {
 }
 
 @test "ufw allow opens a Docker-published port" {
+    ensure_service 8089 || skip "nothing listening on 8089"
     sudo ufw allow 8089/tcp >/dev/null 2>&1
     [ "$(probe 8089)" != "000" ]
 }
@@ -68,6 +96,7 @@ teardown_file() {
 }
 
 @test "source-restricted allow is honoured" {
+    ensure_service 8089 || skip "nothing listening on 8089"
     sudo ufw allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
     [ "$(probe 8089)" != "000" ]
     sudo ufw delete allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
@@ -156,6 +185,7 @@ teardown_file() {
 }
 
 @test "ufw route rules are honoured" {
+    ensure_service 8089 || skip "nothing listening on 8089"
     # Before this was wired, `ufw route allow` -- the verb ufw intends for
     # forwarded traffic -- was ignored entirely, with no warning.
     sudo ufw route allow to any port 8089 proto tcp >/dev/null 2>&1
@@ -166,6 +196,7 @@ teardown_file() {
 }
 
 @test "blocked container traffic is logged" {
+    ensure_service 8089 || skip "nothing listening on 8089"
     # The LOG rule is rate-limited to 3/min with a burst of 10 -- the same limit
     # ufw uses. Earlier tests in this file generate blocks and drain that burst,
     # so a single probe can legitimately produce no line. Poll instead: at

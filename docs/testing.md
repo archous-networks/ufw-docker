@@ -54,6 +54,25 @@ never saw the rules missing). The other was the concurrency above.
 **Before believing an intermittent failure, confirm nothing else is touching the
 firewall**: `pgrep -f bats`, and check for the lock.
 
+## Negative assertions pass for the wrong reason
+
+Most assertions in this suite are negative — "this port is blocked". A blocked port and a
+port with **nothing listening** both return `000`, so any environmental breakage turns
+those tests into passes-for-free while looking perfectly green.
+
+This has happened twice, both only visible in CI:
+
+- **A remapped published port.** `-p 8089:80` means the rule must name the *container*
+  port, so `ufw allow 8089` could never match. The "allow opens it" tests failed; the
+  "blocked" tests passed vacuously.
+- **A dead container.** One test restarts the Docker daemon, which stops a container with
+  no restart policy and removes its DNAT rule. Later tests probed a port with nothing
+  behind it. Invisible locally, where UISP's containers are `restart: always`.
+
+`ensure_service` now checks from the host that something is actually listening before any
+assertion about the firewall, and **skips loudly** rather than passing. When adding a
+negative assertion here, ask what else produces the same observation.
+
 ## The probe reports, it does not assert
 
 `netns-probe.sh get` **always exits 0** and prints the HTTP code (`000` when blocked).

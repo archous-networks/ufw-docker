@@ -56,7 +56,12 @@ jobs:
           # never match and the "allow opens it" tests would fail while the
           # "blocked" tests passed vacuously. That is a real property of this
           # design, covered by its own test below rather than tripped over here.
-          docker run -d --name testsvc -p 8089:8089 python:3-alpine \
+          # --restart always is REQUIRED, not tidiness: one test restarts the
+          # Docker daemon, which stops a no-policy container and removes its
+          # DNAT rule. Later tests then probe a port with nothing behind it and
+          # fail for a reason that has nothing to do with the firewall. Invisible
+          # locally, where UISP's containers are already `restart: always`.
+          docker run -d --name testsvc --restart always -p 8089:8089 python:3-alpine \
             python -m http.server 8089
           sleep 5
           curl -sS -o /dev/null -w 'local probe: %{http_code}\n' http://127.0.0.1:8089/

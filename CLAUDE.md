@@ -50,6 +50,14 @@ This mutates a real firewall on a machine you are probably SSH'd into.
 - Sample state **after** an operation completes, not during. A rescue takes ~20s;
   snapshots taken mid-run look like a broken firewall.
 
+## Negative assertions are the weak spot
+
+Most of this suite asserts "blocked". A blocked port and a port with no listener both look
+like `000`, so environmental breakage turns those tests green instead of red. Twice now,
+only CI caught it — a remapped port, and a container killed by the daemon-restart test.
+`ensure_service` guards it. When adding a negative assertion, ask what else produces the
+same observation.
+
 ## A flaky result here is usually contention
 
 Two apparent flakes were investigated as real bugs; both were measurement artifacts —
