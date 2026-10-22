@@ -17,6 +17,8 @@ rule chains into Docker's `DOCKER-USER` hook.
 | boot behaviour, the systemd unit | [docs/self-heal.md](docs/self-heal.md) |
 | `rescue`, SSH handling, nft fallback | [docs/rescue.md](docs/rescue.md) |
 | log output, `[UFW DOCKER BLOCK]` | [docs/logging.md](docs/logging.md) |
+| host vs container rule scope | [docs/scoping.md](docs/scoping.md) |
+| targeting a single container | [docs/per-container.md](docs/per-container.md) |
 | "why doesn't rule X work" | [docs/caveats.md](docs/caveats.md) |
 | running or writing tests | [docs/testing.md](docs/testing.md) ← **read before running the suite** |
 | what is still missing | [TODO.md](TODO.md) |
@@ -74,4 +76,5 @@ installed.
 | Docker daemon restart | `DOCKER-USER` preserved; 100 samples at 0.5s across a restart, never empty |
 | `iptables -S <absent chain>` | prints `... is incompatible, use 'nft' tool` — the **same** message as a genuinely incompatible chain. Never key on that string alone. |
 | bats + a helper that exits non-zero | a bare `helper args` statement fails the test under errexit. `netns-probe.sh get` always exits 0 for this reason |
+| destination IP is the only discriminator | no dst → rule hits host AND containers; dst=host-ip → host only; dst=container-ip → that container only. Measured. |
 | IPv6 without daemon `ip6tables` | Docker adds its own `raw`/PREROUTING DROP ahead of FORWARD, so our v6 stanza is correct but never consulted |

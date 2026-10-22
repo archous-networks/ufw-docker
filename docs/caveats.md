@@ -17,23 +17,37 @@ Pinned by a test so it cannot regress silently. Fixing it properly would mean tr
 ufw's rules into `DOCKER-USER` with `--ctorigdstport`, which is a resident translator
 rather than a static stanza.
 
-## Destination-IP rules never match
+## Destination-IP rules match the CONTAINER, not the host
 
 ```bash
-ufw allow to 203.0.113.10 port 443     # will NOT work for a container
+ufw allow to 203.0.113.10 port 443     # ❌ the HOST's address — never matches
+ufw allow to 172.20.0.10  port 80      # ✅ the CONTAINER's address — works
 ```
 
-The destination has been rewritten to the container's address before we see it. Use
-port-only or source-based rules.
+The destination is rewritten to the container's address before we see it, so naming the
+host address cannot work. Naming the **container** address can, and is a useful
+capability rather than a limitation — see [per-container.md](per-container.md).
 
-## Host and container rules share one namespace
+Pair it with a static IPAM address, or the rule stops matching when the container is
+recreated.
 
-`ufw allow 22` opens 22 on the host **and** on any container publishing 22. There is no
-way to express "SSH to the host, never to a container".
+## A PORT-ONLY rule applies to the host and to containers
 
-This is the direct cost of jumping into `ufw-user-input` — which is also the entire point
-of the tool, since it is what makes the commands you already know apply to containers. If
-you need that separation, `chaifeng/ufw-docker` targets container IPs instead.
+`ufw allow 22` opens 22 on the host **and** on any container whose container port is 22.
+One rule, two effects, and `ufw status` shows nothing unusual.
+
+That is the cost of jumping into `ufw-user-input` — which is also the point of the tool,
+since it is what makes the commands you already know apply to containers.
+
+**It is not a hard limitation.** The destination address separates them cleanly, measured:
+
+| rule | host | container |
+|---|---|---|
+| `ufw allow 9100/tcp` | open | open |
+| `ufw allow to <host-ip> port 9100` | open | **closed** |
+| `ufw allow to <container-ip> port 9100` | **closed** | open |
+
+Full detail, and the `ufw deny 80` hazard, in [scoping.md](scoping.md).
 
 ## `--network host` containers are unaffected
 

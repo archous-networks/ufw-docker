@@ -45,6 +45,12 @@ setup_file() {
         sudo ufw allow 22/tcp >/dev/null 2>&1
     fi
     sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+
+    # Snapshot the operator's rules. The teardown compares against this: a suite
+    # that verifies a firewall tool must not leave the firewall different from
+    # how it found it. A blanket `22/tcp ALLOW Anywhere` leaked out once and was
+    # only caught by eye.
+    sudo ufw status 2>/dev/null | tail -n +4 | sort > "$BATS_FILE_TMPDIR/rules-before"
 }
 
 teardown_file() {
@@ -58,6 +64,17 @@ teardown_file() {
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" down || true
     # Non-negotiable: never leave a broken firewall behind.
     sudo "$REPO/ufw-docker" rescue >/dev/null 2>&1 || true
+
+    # And never leave it DIFFERENT, either. A suite that verifies a firewall
+    # tool must not change the operator's rules; a blanket `22/tcp ALLOW
+    # Anywhere` leaked out of this suite once and was caught only by eye.
+    if [ -f "$BATS_FILE_TMPDIR/rules-before" ]; then
+        sudo ufw status 2>/dev/null | tail -n +4 | sort > "$BATS_FILE_TMPDIR/rules-after"
+        if ! diff -q "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" >/dev/null 2>&1; then
+            echo "### WARNING: this run CHANGED the host's ufw rules ###" >&2
+            diff "$BATS_FILE_TMPDIR/rules-before" "$BATS_FILE_TMPDIR/rules-after" >&2 || true
+        fi
+    fi
 }
 
 @test "install wires DOCKER-USER into ufw-user-input" {
@@ -181,7 +198,16 @@ teardown_file() {
     sudo ufw reload >/dev/null 2>&1
     run sudo ip netns exec ufwprobe timeout 4 bash -c "exec 3<>/dev/tcp/${HOST_IP}/22"
     [ "$status" -ne 0 ]      # refused: no allow rule for this source
-    sudo ufw allow 22/tcp >/dev/null 2>&1
+
+    # Restore ONLY if setup_file put a blanket rule there. Re-adding it
+    # unconditionally left `22/tcp ALLOW Anywhere` on a host whose SSH was
+    # deliberately restricted to one source -- the suite widening the very
+    # exposure it is meant to verify.
+    if [ "$(cat "$BATS_FILE_TMPDIR/we-added-ssh" 2>/dev/null)" = yes ]; then
+        sudo ufw allow 22/tcp >/dev/null 2>&1
+    else
+        sudo ufw reload >/dev/null 2>&1
+    fi
 }
 
 @test "ufw route rules are honoured" {
@@ -268,6 +294,125 @@ teardown_file() {
     echo "$output" | grep -q 'WOULD REMOVE'
     echo "$output" | grep -q 'force'
     [ "$(jumps)" -eq "$before" ]
+}
+
+@test "per-container rules: destination, source+dest, route, deny, and the published-port trap" {
+    # Verified capability, not just a caveat: after DNAT the destination IS the
+    # container address, so a rule naming it matches -- and does not affect a
+    # different container on the same container port.
+    docker rm -f ctgt1 ctgt2 >/dev/null 2>&1 || true
+    docker network rm ctgtnet >/dev/null 2>&1 || true
+    # Fail with a USEFUL message if the subnet is taken. A leftover network from
+    # ad-hoc testing once held this range, and `create` failing silently made the
+    # error point at the line rather than at the cause.
+    if ! docker network create --subnet 172.21.0.0/24 ctgtnet >/dev/null 2>&1; then
+        echo "could not create ctgtnet - is 172.21.0.0/24 already used by:" >&2
+        docker network ls -q | while read -r n; do
+            docker network inspect "$n" --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null
+        done | grep '172.21' >&2
+        return 1
+    fi
+    docker run -d --name ctgt1 --network ctgtnet --ip 172.21.0.10 -p 18090:80 \
+        python:3-alpine python -m http.server 80 >/dev/null 2>&1
+    docker run -d --name ctgt2 --network ctgtnet --ip 172.21.0.11 -p 18091:80 \
+        python:3-alpine python -m http.server 80 >/dev/null 2>&1
+    sleep 6
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1    # pick up the new subnet
+
+    [ "$(probe 18090)" = "000" ]
+    [ "$(probe 18091)" = "000" ]
+
+    # A. destination only
+    sudo ufw allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    [ "$(probe 18090)" != "000" ]      # the targeted container opens
+    [ "$(probe 18091)" = "000" ]       # its neighbour on the same port does not
+    sudo ufw --force delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+
+    # B. source AND destination compose
+    sudo ufw allow from 10.97.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    [ "$(probe 18090)" != "000" ]
+    sudo ufw --force delete allow from 10.97.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+
+    # B2. a source that does NOT match must stay closed
+    sudo ufw allow from 10.98.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    [ "$(probe 18090)" = "000" ]
+    sudo ufw --force delete allow from 10.98.0.0/24 to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+
+    # C. THE TRAP: naming the PUBLISHED port is accepted, listed, and matches
+    #    nothing -- the dport is rewritten to the container port before we see
+    #    it. This asserts the failure mode so it cannot quietly start "working"
+    #    and give people a false mental model.
+    sudo ufw allow to 172.21.0.10 port 18090 proto tcp >/dev/null 2>&1
+    sudo ufw status | grep -q '18090'          # ufw really did accept it
+    [ "$(probe 18090)" = "000" ]               # and it really does nothing
+    sudo ufw --force delete allow to 172.21.0.10 port 18090 proto tcp >/dev/null 2>&1
+
+    # D. ufw route targeting a container
+    sudo ufw route allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    [ "$(probe 18090)" != "000" ]
+    sudo ufw route delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+
+    # E. deny one container, leave its neighbour alone
+    sudo ufw allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw allow to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw deny to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
+    [ "$(probe 18090)" != "000" ]
+    [ "$(probe 18091)" = "000" ]
+    sudo ufw --force delete deny to 172.21.0.11 port 80 proto tcp >/dev/null 2>&1
+    sudo ufw --force delete allow to 172.21.0.10 port 80 proto tcp >/dev/null 2>&1
+    docker rm -f ctgt1 ctgt2 >/dev/null 2>&1 || true
+    docker network rm ctgtnet >/dev/null 2>&1 || true
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+}
+
+@test "destination scopes a rule to the host or to a container, not both" {
+    # A host service and a container on the SAME port number. A port-only rule
+    # hits both; a destination-qualified rule hits exactly one. This is the
+    # property that makes the shared namespace workable, so it is pinned.
+    docker rm -f collc >/dev/null 2>&1 || true
+    docker network rm collnet >/dev/null 2>&1 || true
+    docker network create --subnet 172.23.0.0/24 collnet >/dev/null 2>&1 || skip "172.23.0.0/24 in use"
+    docker run -d --name collc --network collnet --ip 172.23.0.10 -p 19100:9100 \
+        python:3-alpine python -m http.server 9100 >/dev/null 2>&1
+    python3 -m http.server 9100 --bind 0.0.0.0 >/dev/null 2>&1 &
+    local hostpid=$!
+    sleep 5
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+
+    clr() {
+        sudo ufw --force delete allow 9100/tcp >/dev/null 2>&1
+        sudo ufw --force delete allow to "$HOST_IP" port 9100 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow to 172.23.0.10 port 9100 proto tcp >/dev/null 2>&1
+        sudo ufw reload >/dev/null 2>&1
+    }
+
+    clr; [ "$(probe 9100)" = "000" ] && [ "$(probe 19100)" = "000" ]
+
+    clr; sudo ufw allow 9100/tcp >/dev/null 2>&1
+    [ "$(probe 9100)" != "000" ]      # port-only: host open
+    [ "$(probe 19100)" != "000" ]     # ...and container open too
+
+    clr; sudo ufw allow to "$HOST_IP" port 9100 proto tcp >/dev/null 2>&1
+    [ "$(probe 9100)" != "000" ]      # host only
+    [ "$(probe 19100)" = "000" ]
+
+    clr; sudo ufw allow to 172.23.0.10 port 9100 proto tcp >/dev/null 2>&1
+    [ "$(probe 9100)" = "000" ]       # container only
+    [ "$(probe 19100)" != "000" ]
+
+    clr
+    kill "$hostpid" 2>/dev/null || true
+    docker rm -f collc >/dev/null 2>&1 || true
+    docker network rm collnet >/dev/null 2>&1 || true
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
+}
+
+@test "containers subcommand lists addresses and flags dynamic ones" {
+    run sudo "$REPO/ufw-docker" containers
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'NAME'
+    echo "$output" | grep -qE '(static|dynamic)'
 }
 
 @test "remove returns DOCKER-USER to stock" {

@@ -9,6 +9,7 @@
 #   ufw-docker remove --force --include-backups
 #                              ...and delete old backups/rescue snapshots too
 #   ufw-docker status          report what is wired and whether it is healthy
+#   ufw-docker containers      container addresses, for per-container rules
 #   ufw-docker rescue          get SSH back and rebuild ufw after a bad state
 #   ufw-docker rescue --open   emergency: firewall OFF, you are definitely back in
 
@@ -32,6 +33,34 @@ head_(){ printf '\n%s\n' "$*"; }
 die()  { bad "$*"; exit 1; }
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0 $*)"; }
+
+# Every subcommand -- including the read-only ones -- must talk to Docker.
+#
+# The socket is root:docker 0660, so a plain user outside that group cannot use
+# it. Checked up front and named plainly, because the alternative is worse than
+# a failure: the docker calls return empty and `status` concludes "is the ucrm
+# container running?", blaming the container for a permissions problem.
+require_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed, or not on PATH"
+    docker info >/dev/null 2>&1 && return 0
+
+    [ "$(id -u)" -eq 0 ] && die "cannot talk to the Docker daemon even as root — is it running?"
+
+    bad "cannot talk to the Docker daemon as $(id -un)"
+    say ""
+    say "  The socket is normally root:docker 0660, so this needs either:"
+    say "    sudo $0 ${1:-status}"
+    say "  or membership of the docker group:"
+    say "    sudo usermod -aG docker $(id -un)   # then log out and back in"
+    exit 1
+}
+
+# Readable config, checked separately so the message names the real obstacle.
+require_readable() {
+    [ -r /etc/ufw/after.rules ] && [ -r /etc/ufw/user.rules ] && return 0
+    bad "cannot read /etc/ufw as $(id -un) — re-run with sudo"
+    exit 1
+}
 
 # Keep a few backups, not every one ever made. Twelve accumulated on the dev box
 # before anyone noticed; a backup nobody prunes is just litter in /etc.
@@ -240,8 +269,9 @@ INIT
 
 cmd_install() {
     require_root install
-    command -v docker >/dev/null || die "docker is not installed"
-    command -v ufw    >/dev/null || die "ufw is not installed"
+    require_docker install
+    require_readable
+    command -v ufw >/dev/null || die "ufw is not installed"
 
     local selfheal=1
     while [ $# -gt 0 ]; do
@@ -322,6 +352,8 @@ cmd_install() {
 
 cmd_remove() {
     require_root remove
+    require_docker remove
+    require_readable
 
     local force=0 wipe=0
     while [ $# -gt 0 ]; do
@@ -483,7 +515,39 @@ cmd_selfheal() {
     return 0
 }
 
+# Container addresses, so a per-container rule can be written without looking
+# them up by hand. Flags dynamic ones: a rule written against an address that
+# changes on recreate silently stops matching the container it was written for.
+container_rows() {
+    docker ps --format '{{.Names}}' 2>/dev/null | while read -r c; do
+        [ -n "$c" ] || continue
+        ip=$(docker inspect "$c" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null | awk '{print $1}')
+        [ -n "$ip" ] || continue
+        if docker inspect "$c" --format '{{range .NetworkSettings.Networks}}{{.IPAMConfig.IPv4Address}}{{end}}' 2>/dev/null | grep -q '[0-9]'; then
+            printf '%-26s %-16s static\n' "$c" "$ip"
+        else
+            printf '%-26s %-16s dynamic\n' "$c" "$ip"
+        fi
+    done
+}
+
+cmd_containers() {
+    require_docker containers
+    head_ "containers"
+    say "target one with:  ufw allow to <ip> port <CONTAINER port>"
+    say "note the CONTAINER port, not the published one — see docs/per-container.md"
+    say ""
+    printf '  %-26s %-16s %s\n' NAME ADDRESS KIND
+    container_rows | sed 's/^/  /'
+    say ""
+    say "'dynamic' addresses change when the container is recreated, and a rule"
+    say "written against one will then match nothing. Pin with Docker IPAM."
+    return 0
+}
+
 cmd_status() {
+    require_docker status
+    require_readable
     head_ "ufw-docker status"
     local rc=0
 
@@ -542,6 +606,13 @@ cmd_status() {
     local stale
     stale="$(comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$have") 2>/dev/null | grep -v ':' || true)"
     [ -n "$stale" ] && warn "stanza covers subnets Docker no longer has (harmless): $(echo "$stale" | tr '\n' ' ')"
+
+    # A count only -- the full list floods `status` on a host with many
+    # containers (15 on the development box). `ufw-docker containers` lists them.
+    local ntot nstat
+    ntot=$(docker ps -q 2>/dev/null | wc -l)
+    nstat=$(container_rows | grep -c 'static' || true)
+    [ "${ntot:-0}" -gt 0 ] && say "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
 
     local v6nets; v6nets="$(subnets 6)"
     local j6; j6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c 'ufw6-user-input')
@@ -798,5 +869,6 @@ case "${1:-}" in
     remove|uninstall) shift; cmd_remove "$@" ;;
     status)  shift; cmd_status "$@" ;;
     selfheal) shift; cmd_selfheal "$@" ;;
+    containers) shift; cmd_containers "$@" ;;
     *) sed -n '2,14p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'; exit 1 ;;
 esac

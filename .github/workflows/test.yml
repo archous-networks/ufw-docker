@@ -27,6 +27,11 @@ jobs:
           for f in ufw-docker tests/netns-probe.sh; do
             bash -n "$f" && echo "ok  $f"
           done
+      - name: functions defined, dispatcher and usage agree
+        # Gating, not advisory: this catches a helper silently dropped by a
+        # refactor, which bash -n and shellcheck both pass. It has happened.
+        run: tests/lint-functions.sh
+
       - name: shellcheck (advisory)
         run: shellcheck -S warning ufw-docker tests/netns-probe.sh || true
 

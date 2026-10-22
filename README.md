@@ -65,6 +65,8 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [The self-heal service](docs/self-heal.md) | boot-time repair, what it checks, opting out |
 | [`rescue`](docs/rescue.md) | break-glass: what it does to your SSH exposure |
 | [Logging](docs/logging.md) | `[UFW DOCKER BLOCK]`, and what is recorded where |
+| [Rule scoping](docs/scoping.md) | which rules reach the host, which reach containers |
+| [Per-container rules](docs/per-container.md) | targeting one container rather than a port |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
 | [Testing](docs/testing.md) | the suite, and two ways to break your own host |
