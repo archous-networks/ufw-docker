@@ -3,14 +3,38 @@
 Make plain `ufw allow` and `ufw deny` actually govern **Docker-published ports**.
 
 ```bash
-sudo ./ufw-docker.sh install
+sudo ufw-docker install
 sudo ufw deny 8089/tcp      # ...and this now genuinely closes it
 ```
 
-> **Not the same project as [`chaifeng/ufw-docker`](https://github.com/chaifeng/ufw-docker).**
-> That one solves the same plumbing but adds its own CLI (`ufw-docker allow httpd 80/tcp`).
-> This one wires ufw's *existing* rules through instead, so there is no new command to learn.
-> If your team is happy to learn one verb, chaifeng's is older and more widely deployed — use it.
+## Not the same project as `chaifeng/ufw-docker`
+
+There is an older, well-known project called
+[`ufw-docker`](https://github.com/chaifeng/ufw-docker) by Chaiwat Suttipongsakul. **This is
+not it, not a fork of it, and contains none of its code.** No file, line, or rule text was
+copied or adapted from it. Everything here was derived from reading ufw's own source on a
+running host (`/lib/ufw/ufw-init-functions`, `backend_iptables.py`) and testing against a
+live firewall.
+
+The two converge on the same hook because there is only one correct place to put these
+rules — Docker documents `DOCKER-USER` precisely so people can filter container traffic.
+Agreeing on that is not derivation.
+
+Where they genuinely differ:
+
+| | `chaifeng/ufw-docker` | this |
+|---|---|---|
+| ufw chain used | `ufw-user-forward` | `ufw-user-input` |
+| how you write rules | its own CLI: `ufw-docker allow httpd 80/tcp` | plain `ufw allow 80/tcp` |
+| targets | a named container | a port, as ufw always has |
+
+Theirs is semantically tidier — forwarded traffic judged by forward rules — and it targets
+container IPs, which sidesteps the remapped-port caveat below. It is also older and far
+more widely deployed.
+
+**Use theirs if your team will accept one new verb.** This exists for the case where that
+is the sticking point: operators who already know `ufw` and should not have to learn
+anything to firewall a Docker host.
 
 ## The problem
 
@@ -49,14 +73,39 @@ container ports behave per their own rules.
 
 ## Install
 
+**Install the rescue script first.** Especially on a remote host — it is what gets you
+back in if anything goes wrong.
+
 ```bash
-git clone https://github.com/archous-networks/ufw-docker.git
-cd ufw-docker
-sudo ./ufw-docker.sh install
-sudo ./ufw-docker.sh status
+curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-rescue \
+  | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-rescue
 ```
 
-Then use ufw normally:
+Then the tool itself:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/archous-networks/ufw-docker/main/ufw-docker \
+  | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-docker
+```
+
+Those two files are everything — there is nothing else to clone.
+
+> **You are piping a script into `sudo`.** That is convenient and it is also exactly the
+> pattern you should be suspicious of, particularly for something that rewrites your
+> firewall. Read them first if that matters to you:
+> ```bash
+> curl -fsSL .../ufw-rescue | less
+> ```
+> Both are a few hundred lines of plain shell with no dependencies.
+
+Wire it up:
+
+```bash
+sudo ufw-docker install
+sudo ufw-docker status
+```
+
+Then use ufw exactly as you always have:
 
 ```bash
 sudo ufw allow 443/tcp
@@ -64,20 +113,11 @@ sudo ufw deny 8089/tcp
 sudo ufw allow from 10.0.0.0/8 to any port 8089 proto tcp
 ```
 
-Undo with `sudo ./ufw-docker.sh remove`.
+Undo with `sudo ufw-docker remove`.
 
-## Install `ufw-rescue` first
+## If something breaks
 
-**Do this before anything else, especially on a remote host.**
-
-```bash
-sudo install -m 0755 ufw-rescue.sh /usr/local/sbin/ufw-rescue
-```
-
-(The repo file keeps `.sh` so editors and `shellcheck` pick it up; the installed
-command drops it, matching every other tool in `sbin` — `ufw`, `iptables`, `nft`.)
-
-If the firewall ends up in a bad state, from the console:
+From the console:
 
 ```bash
 sudo ufw-rescue          # strip the stanza, rebuild ufw, verify

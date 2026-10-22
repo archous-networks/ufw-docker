@@ -20,11 +20,11 @@ setup_file() {
     sudo HOST_IP="$HOST_IP" "${BATS_TEST_DIRNAME}/netns-probe.sh" up
     # A rule we can prove host-level filtering with, independent of Docker.
     sudo ufw allow 22/tcp >/dev/null 2>&1
-    sudo "$REPO/ufw-docker.sh" install >/dev/null 2>&1
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1
 }
 
 teardown_file() {
-    sudo "$REPO/ufw-docker.sh" remove >/dev/null 2>&1 || true
+    sudo "$REPO/ufw-docker" remove >/dev/null 2>&1 || true
     # setup_file added a blanket SSH allow for the host-level test; leaving it
     # behind would quietly widen the operator's SSH exposure after a test run.
     sudo ufw delete allow 22/tcp >/dev/null 2>&1 || true
@@ -73,6 +73,30 @@ teardown_file() {
     sudo ufw delete allow from 10.97.0.0/24 to any port 8089 proto tcp >/dev/null 2>&1
     sudo ufw reload >/dev/null 2>&1
     [ "$(probe 8089)" = "000" ]
+}
+
+@test "a REMAPPED published port is matched by its CONTAINER port, not the published one" {
+    # The sharpest trap in this design, pinned so it cannot regress silently.
+    # Docker DNATs in PREROUTING, before FORWARD -- so by the time DOCKER-USER
+    # sees the packet the dport is the CONTAINER port. Publishing 18443:18080
+    # means `ufw allow 18443` does NOTHING and `ufw allow 18080` is what works.
+    docker rm -f remapsvc >/dev/null 2>&1 || true
+    docker run -d --name remapsvc -p 18443:18080 python:3-alpine \
+        python -m http.server 18080 >/dev/null 2>&1
+    sleep 5
+    sudo "$REPO/ufw-docker" install >/dev/null 2>&1   # pick up any new subnet
+
+    sudo ufw allow 18443/tcp >/dev/null 2>&1
+    run probe 18443
+    [ "$output" = "000" ]              # the published port does NOT work
+    sudo ufw delete allow 18443/tcp >/dev/null 2>&1
+
+    sudo ufw allow 18080/tcp >/dev/null 2>&1
+    run probe 18443
+    [ "$output" != "000" ]             # the container port DOES
+    sudo ufw delete allow 18080/tcp >/dev/null 2>&1
+
+    docker rm -f remapsvc >/dev/null 2>&1 || true
 }
 
 @test "REGRESSION: repeated ufw reload does not break the firewall" {
@@ -125,7 +149,7 @@ teardown_file() {
 }
 
 @test "remove returns DOCKER-USER to stock" {
-    sudo "$REPO/ufw-docker.sh" remove >/dev/null 2>&1
+    sudo "$REPO/ufw-docker" remove >/dev/null 2>&1
     [ "$(jumps)" -eq 0 ]
     [ "$(active)" -eq 1 ]
     [ "$(ssh_rule)" -gt 0 ]

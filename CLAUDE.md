@@ -133,6 +133,25 @@ Two details worth keeping:
   bats run that interleaved `ufw-rescue`'s `iptables -F/-X` with ufw's own rebuild. If
   you can reproduce it deterministically, write it down here.
 
+## CI caught a blind spot in the test design
+
+First CI run: tests 5 and 7 failed (`ufw allow` should open a port), while 4 and 6
+(`blocked`) passed. The workflow published `-p 8089:80` — a **remapped** port. After DNAT
+the rule must name the *container* port, so `ufw allow 8089` could never match. The
+"blocked" tests were therefore passing **vacuously**: the port was shut, but for the wrong
+reason, and they would have kept passing even if the tool did nothing at all.
+
+Two changes came out of it:
+
+- CI publishes **1:1** (`8089:8089`), so the port an operator writes is the port matched.
+- A dedicated test now pins the remap behaviour: with `18443:18080` published,
+  `ufw allow 18443` must **not** open it and `ufw allow 18080` must. The footgun is now a
+  verified property instead of a comment.
+
+Worth noting the shape of the mistake: a test that asserts "blocked" is only meaningful if
+something could have unblocked it. Both vacuous tests looked green on the host where the
+ports happen to be 1:1.
+
 ## Still open
 
 - **Reboot/boot-ordering**, above.

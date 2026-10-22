@@ -2,9 +2,9 @@
 #
 # ufw-docker — make plain `ufw allow/deny` actually govern Docker-published ports.
 #
-#   ufw-docker.sh install    wire ufw into Docker's DOCKER-USER chain
-#   ufw-docker.sh remove     undo it
-#   ufw-docker.sh status     report what is wired and whether it is healthy
+#   ufw-docker install    wire ufw into Docker's DOCKER-USER chain
+#   ufw-docker remove     undo it
+#   ufw-docker status     report what is wired and whether it is healthy
 #
 # Docker publishes ports by DNAT in PREROUTING and then FORWARDs them, while ufw
 # filters INPUT. Forwarded traffic never traverses INPUT, so `ufw deny 443` has
@@ -46,7 +46,7 @@ stanza() {   # $1 = 4|6
     [ -n "$nets" ] || return 1
 
     printf '%s\n' "$MARK_BEGIN"
-    printf '%s\n' "# Managed by ufw-docker.sh. Do not edit; re-run 'install'."
+    printf '%s\n' "# Managed by ufw-docker. Do not edit; re-run 'install'."
     printf '%s\n' "*filter"
     printf '%s\n' "# after.rules is restored BEFORE user.rules, so $chain does not"
     printf '%s\n' "# exist yet. Declaring it creates it; user.rules fills it in afterwards."
@@ -71,7 +71,7 @@ install_hook() {
     [ -f "$f" ] && [ ! -f "$f.ufw-docker-backup" ] && cp -a "$f" "$f.ufw-docker-backup"
     cat > "$f" <<'INIT'
 #!/bin/sh
-# Managed by ufw-docker.sh.
+# Managed by ufw-docker.
 #
 # WHY THIS IS REQUIRED, AND IS NOT OPTIONAL:
 #
