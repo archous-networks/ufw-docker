@@ -118,6 +118,9 @@ ufw-docker status --json | jq -e '.supported and (.checks[]|select(.key=="wired-
 `level` is one of `ok`, `warn`, `bad`, `info`. **`bad` is what sets the exit code**;
 `warn` is a thing to know, not a thing to page on.
 
+`status --counters` adds `DOCKER-USER` packet counts to the human-readable form —
+the cheapest signal of *wired but filtering nothing*. See [logging.md](logging.md).
+
 Two fields deserve attention:
 
 - **`supported`** — whether this host passes the preflight *right now*. A host can stop

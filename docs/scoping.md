@@ -7,15 +7,19 @@ This matters most when a host service and a container use the **same port number
 
 ## Measured
 
-A host service and a container both on port 9100 — the container publishing `19100:9100`,
-so both are reachable and both end up matching on `--dport 9100`:
+These numbers come from the suite, not from reasoning — `destination scopes a rule to the host or to a container, not both` in
+`tests/ufw-docker.bats`, which runs on every push. The ports below are the ones
+that test actually drives, so the claim is checkable rather than illustrative.
 
-| rule | host:9100 | container (via 19100) |
+A host service and a container both on port 19101 — the container publishing `19100:19101`,
+so both are reachable and both end up matching on `--dport 19101`:
+
+| rule | host:19101 | container (via 19100) |
 |---|---|---|
 | *(none)* | `000` | `000` |
-| `ufw allow 9100/tcp` | **200** | **200** |
-| `ufw allow to <HOST ip> port 9100` | **200** | `000` |
-| `ufw allow to <CONTAINER ip> port 9100` | `000` | **200** |
+| `ufw allow 19101/tcp` | **200** | **200** |
+| `ufw allow to <HOST ip> port 19101` | **200** | `000` |
+| `ufw allow to <CONTAINER ip> port 19101` | `000` | **200** |
 
 Clean separation, in both directions.
 
@@ -24,8 +28,8 @@ Clean separation, in both directions.
 The two paths have different destinations by the time a rule is evaluated:
 
 ```
-host service      client ──▶ host:9100 ─────────────────▶ INPUT     dst = HOST ip
-container         client ──▶ host:19100 ──DNAT──▶ ctr:9100 ─▶ FORWARD  dst = CONTAINER ip
+host service      client ──▶ host:19101 ─────────────────▶ INPUT     dst = HOST ip
+container         client ──▶ host:19100 ──DNAT──▶ ctr:19101 ─▶ FORWARD  dst = CONTAINER ip
 ```
 
 A port-only rule names neither, so it is consulted on both paths and matches on both. Add

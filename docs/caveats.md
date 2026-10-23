@@ -43,9 +43,9 @@ since it is what makes the commands you already know apply to containers.
 
 | rule | host | container |
 |---|---|---|
-| `ufw allow 9100/tcp` | open | open |
-| `ufw allow to <host-ip> port 9100` | open | **closed** |
-| `ufw allow to <container-ip> port 9100` | **closed** | open |
+| `ufw allow 19101/tcp` | open | open |
+| `ufw allow to <host-ip> port 19101` | open | **closed** |
+| `ufw allow to <container-ip> port 19101` | **closed** | open |
 
 Full detail, and the `ufw deny 80` hazard, in [scoping.md](scoping.md).
 
@@ -97,10 +97,10 @@ with `"ipv6": true, "ip6tables": true` in `daemon.json`.
 | rule | v6 probe |
 |---|---|
 | none | `000` blocked |
-| `ufw allow 9200/tcp` | `200` |
-| `ufw deny 9200/tcp` | `000` |
-| `ufw allow to <container v6> port 9200` | `200` |
-| `ufw allow from <client v6> to any port 9200` | `200` |
+| `ufw allow 19200/tcp` | `200` |
+| `ufw deny 19200/tcp` | `000` |
+| `ufw allow to <container v6> port 19200` | `200` |
+| `ufw allow from <client v6> to any port 19200` | `200` |
 | `ufw allow from <a different v6> …` | `000` |
 
 CI runs the whole suite **twice**, with daemon `ip6tables` off and on, because the two

@@ -68,6 +68,27 @@ The logic is `ufw-docker selfheal`, a normal subcommand, not a shell one-liner i
 - `DOCKER-USER` emptied → rewired, 0 → 3 jumps
 - `ufw-user-input` emptied → SSH restored **restricted, not blanket**, no leftovers
 - a real reboot → ordering confirmed, no intervention needed
+- **a real BAD boot → detected and repaired.** No longer the outstanding item:
 
-Not yet verified: the unit performing a repair during an actual bad boot. Its detection
-has run at boot and `rescue` is well exercised by hand, but no boot has gone wrong.
+  ```
+  17:43:42  DOCKER-USER emptied after ufw applied the stanza
+  17:43:42  ufw-docker-selfheal starts (sleeps 20s)
+  17:44:02  "stanza installed but DOCKER-USER unwired - reloading ufw"
+  17:44:06  finished — jumps: 3, status healthy
+  ```
+
+  Driven by `tests/cold-boot-check.sh`, which installs a one-shot unit ordered
+  `After=docker.service Before=ufw-docker-selfheal.service` to recreate the ordering a
+  late-starting Docker daemon produces.
+
+**That run also validated the 20-second delay, which until then was a guess.** The chain
+was emptied at boot and the unit caught it exactly twenty seconds later — so the delay is
+what gives a Docker daemon starting after ufw time to do its damage *before* the unit
+looks. Checking immediately would have found everything fine, every time, and the unit
+would have been useless without ever appearing to be.
+
+> An earlier attempt at this test reported PASS having exercised nothing: it emptied
+> `DOCKER-USER` *before* rebooting, which proves nothing because that is runtime state
+> and ufw rewires it from the stanza at boot. The unit logged `ufw healthy at boot` and
+> the test counted the healthy firewall as proof of a repair. See
+> [testing.md](testing.md).

@@ -16,8 +16,25 @@ separate file from `ufw-docker` deliberately — handing someone the real tool m
 them to type the right subcommand, and this one cannot do damage even if they do not. It is
 short enough to read end to end before running, which is the point.
 
-Root is needed only because `iptables -S` and the Docker socket require it. Without root it
-still runs and says which sections are incomplete.
+**It requires root, and refuses rather than guess.** Not for safety — it only reads. It is
+because `/etc/ufw/*.rules`, `before.init`, the iptables tables and the Docker socket are
+all root-only, and a survey that cannot read them does not report "unknown".
+
+It used to carry on with a one-line caveat. What it actually produced, run as a normal
+user on a completely healthy host, was four confident falsehoods:
+
+```
+version      NOT INSTALLED                                   (ufw 0.36.2, active)
+iptables     NOT FOUND                                       (v1.8.9, nf_tables)
+stanza       (none)                                          (installed, 0.9.0)
+before.init  CUSTOMISED BY OPERATOR — install would refuse    (it is ours)
+```
+
+Incomplete would have been fine. Wrong is not: this output is pasted into the
+[platform matrix](../docs/supported.md), where it becomes a row nobody re-checks. Two of
+those four were the `/usr/sbin` PATH trap — `ufw` and `iptables` are not on a plain
+user's `PATH` — which has now caught this project three times, so the survey sets `PATH`
+defensively as well.
 
 ### The quick fleet sweep
 

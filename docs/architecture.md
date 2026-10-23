@@ -40,6 +40,25 @@ network from somewhere else — which is exactly the traffic ufw could not previ
 Precedence is deliberate: `ufw route` rules win over plain `ufw` rules, because `route` is
 ufw's own verb for forwarded traffic and therefore the more specific statement.
 
+## It refuses environments it has not been proven on
+
+Before writing anything, `install` runs a preflight and **refuses** where this tool has
+never been verified. That is a refusal rather than a warning because the failure it
+guards is silent: `install` would succeed, `status` would report everything wired, and
+nothing would be filtered. Nobody would learn otherwise until something reached a port
+it should not have.
+
+Two kinds of check. The **platform matrix** (distro + major version + iptables backend)
+must match a row that real evidence put there — a green CI leg, or a full suite run on a
+host of that class. And four **mechanism** checks that fail regardless of platform:
+rules present in *both* iptables backends, Docker Swarm, rootless Docker, and ufw's
+files not being where ufw says they are.
+
+`--unsupported --force` overrides it, and the fact is baked into the stanza so every
+later `status` says so.
+
+→ [supported.md](supported.md), and `ufw-docker platforms`
+
 ## Where each piece lives
 
 | Piece | Lives in | Detail |

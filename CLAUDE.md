@@ -22,6 +22,9 @@ rule chains into Docker's `DOCKER-USER` hook.
 | targeting a single container | [docs/per-container.md](docs/per-container.md) |
 | "why doesn't rule X work" | [docs/caveats.md](docs/caveats.md) |
 | WAF / Cloudflare / reverse-proxy questions | [docs/waf.md](docs/waf.md) |
+| which platforms are proven, and how a row earns it | [docs/supported.md](docs/supported.md) |
+| cutting a release, verifying a download | [docs/releases.md](docs/releases.md) |
+| surveying a host you do not control | [tools/README.md](tools/README.md) |
 | running or writing tests | [docs/testing.md](docs/testing.md) ← **read before running the suite** |
 | what is still missing, approved to build | [TODO.md](TODO.md) |
 | what was deferred, and what would un-defer it | [FUTURE.md](FUTURE.md) |
@@ -40,6 +43,16 @@ rule chains into Docker's `DOCKER-USER` hook.
 5. **One file ships**, so anything the tool writes is generated from inside it. Two
    committed duplicates of generated content (`stanza.sh`, a `systemd/*.service`) both
    drifted within the hour and were deleted.
+6. **One source of truth per question.** Three times in one day a second copy of a rule
+   was added and the two disagreed within hours: a hardcoded "backend must be nf_tables"
+   check beside the matrix's backend column; the suite's `host_supported()`
+   re-implementing the preflight instead of asking the tool; and `rescue` matching SSH
+   rules one way while its own verification step matched them another. If two places
+   answer the same question, one of them is already wrong.
+7. **A check that cannot fail is not a check.** Every gate here has been run against a
+   deliberately broken input to prove it fires — `invariant-selftest.sh`,
+   `ssh-detect-selftest.sh`, `lint-supported.sh`, `lint-functions.sh`,
+   `cold-boot-check.sh`. Two of them were found vacuous exactly this way.
 
 ## Working on a live host
 
@@ -49,9 +62,12 @@ This mutates a real firewall on a machine you are probably SSH'd into.
 - **Never run firewall commands while the test suite is running.** This produced a
   convincing fictitious bug — a "reproducible 3/3" failure that was the suite's teardown
   stripping config mid-check. `tests/run.sh` takes a lock; respect it.
-- **After a suite run the tool is uninstalled** (teardown removes it). Re-run `install`
-  before testing anything by hand, or you will measure an unfiltered host and think the
-  feature is broken. This has happened twice.
+- **A suite run now RESTORES the host** — `/etc/ufw`, ufw's enabled state, and the
+  self-heal unit are snapshotted before and put back after, with a fingerprint diff
+  printed if anything does not match. This used to say "after a suite run the tool is
+  uninstalled, re-run install" and that is no longer true; following it would now
+  re-install over a correctly restored host. Trust the `host state matches the
+  pre-suite snapshot` line, and read the diff if it is absent.
 - Sample state **after** an operation completes, not during. A rescue takes ~20s;
   snapshots taken mid-run look like a broken firewall.
 
@@ -89,3 +105,13 @@ installed.
 | `iptables-restore --test` | catches **syntax** (`--bogus` → rc=2) on both backends; a jump to a nonexistent chain is **accepted** (rc=0) under nf_tables and **rejected** under legacy. Backend-dependent, asserted per backend by a test |
 | `iptables-restore` is in `/usr/sbin` | not on a plain user's `PATH`. A `command -v` guard that looks fine interactively passes vacuously; the tool only ever runs this as root |
 | `ufw logging off` | does not reach our own `LOG` rule. `install` reads the setting and bakes it in; `status` reports the drift |
+| **mixed iptables backends** | the kernel evaluates **both**, and a `DROP` in either wins. Switching the alternative does NOT move existing rules. This is what made the legacy CI leg fail for days while the stanza it wrote was correct; `nft flush ruleset` after the switch fixed it. Hardest failure here to see from outside — everything looks wired and nothing flows |
+| **iptables-legacy itself** | works. 51/51 green on Ubuntu 24.04 / iptables 1.8.10. The earlier failure was the mixed-backend runner above, not legacy |
+| `ufw allow in on <iface>` | writes `-A ufw-user-input -i wg0 -j ACCEPT` — **no `--dport` at all**. Matching SSH rules on `--dport` alone reads such a host as "no SSH rule"; `rescue` then opened port 22 to the world. Measured |
+| self-heal's syslog tag | `ufw-docker-selfheal`, **not** `ufw-docker`. Grepping the latter returns "No entries" and hides the evidence |
+| `SELFHEAL_DELAY` (20s) | load-bearing, and now validated: a chain emptied at boot was caught exactly 20s later. Checking immediately would find everything fine every time, and the unit would be useless without ever looking broken |
+| cold boot | verified by observation, not declaration: wiring survives, the unit runs in the boot environment, leaves a healthy firewall alone, **and repairs a broken one**. `tests/cold-boot-check.sh` |
+| `ufw`'s shebang | `#! /usr/bin/python3` — so the interpreter that can import `ufw.common` is guaranteed wherever ufw runs. That is what makes deriving ufw's paths safe (D5) |
+| Debian iptables/ufw by release | 10 → 1.8.2 / 0.36 · 11 → 1.8.7 / 0.36 · 12 → 1.8.9 / 0.36.2 · Ubuntu 24.04 (CI) → 1.8.10. **CI tests only the last of these**, so a Debian-only regression reaches `main` green |
+| systemd inside a privileged container | **works**, and is the route to a real CI matrix. `debian:12` + `systemd-sysv` + `--privileged --cgroupns=host`, dockerd inside, own netns → `install`, the netns probe and the filtering tests all pass, on iptables **1.8.9**. Measured on the dev host |
+| `grep -c` | PRINTS `0` and EXITS 1 on no match. `x=$(... | grep -c y) || true`, never `|| printf 0` — that emits `0\n0` and breaks every arithmetic test downstream. Bitten twice: the survey and the preflight |

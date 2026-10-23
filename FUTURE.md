@@ -119,12 +119,30 @@ environment, each gated behind its own proof:
 
 | environment | status |
 |---|---|
-| iptables-legacy | **in progress as A11** — the leg exists and fails |
-| Debian 10 / 11 | needs E10 stage 2 (no GitHub Debian runners) |
+| iptables-legacy | **done.** A11 green; `ubuntu 24 / legacy` is a `supported` row, evidenced by run 39868550084 |
+| Debian 10 / 11 | **unblocked — see below.** Still unproven, but no longer expensive |
 | rootless Docker | A9 above |
 | Swarm | closed as out of scope — see `caveats.md` |
 
-**Brings it forward:** a survey result, or a customer, on an environment we refuse.
+### The blocker on Debian legs turned out not to be real
+
+This said "no GitHub Debian runners", which is true and was taken to mean VMs, DinD or
+self-hosted infrastructure. **Measured on the dev host, it means none of those.** A
+privileged `debian:12` container with `systemd-sysv`, `--cgroupns=host` and dockerd
+inside gives systemd as pid1, a working Docker daemon, its own network namespace, and
+**iptables v1.8.9** — the exact version the fleet runs and the one CI cannot reach today.
+`install`, the netns probe and the filtering tests all passed inside it.
+
+That turns the matrix from one distro into Debian 10/11/12 + Ubuntu × {nft, legacy},
+covering iptables **1.8.2 / 1.8.7 / 1.8.9 / 1.8.10**, on stock runners.
+
+Worth stating plainly while it is still deferred: **CI tests Ubuntu 24.04 / iptables
+1.8.10 only, and nothing in the fleet runs that.** Debian 12 is verified by full suite
+runs on a real host, which is strong evidence but not per-push — so a Debian-only
+regression would reach `main` green.
+
+**Brings it forward:** a survey result, or a customer, on an environment we refuse — or
+simply the decision to spend a day on it before tagging `v1.0.0`.
 
 ---
 

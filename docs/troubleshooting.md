@@ -74,6 +74,76 @@ sudo ufw-docker rescue       # step 3b handles this
 Note this message **also** appears for a chain that simply does not exist, so it is not by
 itself evidence of a problem.
 
+## `install` refused: "UNSUPPORTED ENVIRONMENT"
+
+This is deliberate, and it is a refusal rather than a warning because the failure it
+prevents is **silent**: `install` would succeed, `status` would report everything wired,
+and nothing would be filtered.
+
+```bash
+sudo ufw-docker platforms     # the matrix, and where this host sits in it
+```
+
+Two kinds of check fail here:
+
+| failure | meaning |
+|---|---|
+| `platform` | distro + major version + iptables backend match no row anything has proven |
+| `mixed-backends` | rules exist in **both** iptables backends; the kernel evaluates both and a `DROP` in either wins |
+| `swarm` | Swarm publishes through its own ingress mesh, a path this tool does not hook |
+| `rootless` | rootless Docker publishes via a userspace proxy, so traffic never reaches `DOCKER-USER` |
+| `ufw-paths` | ufw's rules files are not where ufw itself says they are |
+
+**`mixed-backends` is the one to take seriously even though it sounds procedural.** It is
+the hardest failure here to diagnose from outside, because everything looks correct and
+traffic still does not flow — it is what made this project's own iptables-legacy CI leg
+fail for days while the stanza it wrote was right the whole time. Fix it by rebooting
+after a backend switch; see [operations.md](operations.md#changing-the-iptables-backend).
+
+To install anyway:
+
+```bash
+sudo ufw-docker install --unsupported --force
+```
+
+Both flags are required — one flag is something you can paste from a forum post without
+reading it. The fact is recorded in the stanza and reported by **every** `status` run
+afterwards, because the person reading `status` is rarely the person who typed `--force`.
+
+An accepted override **warns** and leaves `status` exiting 0. An environment that became
+unsupported *after* install — somebody switched the backend — **goes red**, because that
+is a change nobody agreed to.
+
+## I want this in a monitoring check, not prose
+
+```bash
+ufw-docker status --json
+```
+
+Every check carries a stable `key`, so an alert names a condition instead of matching a
+sentence that has changed wording several times in a single day.
+
+```bash
+# everything currently wrong, by name
+ufw-docker status --json | jq -r '.checks[] | select(.level=="bad") | "\(.key): \(.message)"'
+
+# the two that mean "filtering silently is not happening"
+ufw-docker status --json | jq -e '.supported and (.checks[]|select(.key=="wired-v4").level=="ok")'
+```
+
+`bad` sets the exit code; `warn` is a thing to know, not a thing to page on.
+
+## Wired, but is it actually filtering anything?
+
+```bash
+sudo ufw-docker status --counters
+```
+
+"Wired but filtering nothing" is the quietest failure in this design. A zero is **not**
+reported as a fault — a quiet host is a normal host — so read the numbers yourself, and
+remember they reset on every chain rebuild (`install`, `ufw reload`, the `before.init`
+hook), not at boot.
+
 ## status exits non-zero — what does the code mean
 
 | | |
