@@ -72,6 +72,8 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 say "build $IMAGE from $BASE"
 docker build --build-arg "BASE=$BASE" -t "$IMAGE" "$HERE/containers" || exit 1
 
+SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO=sudo
+
 # ── THE KERNEL DROPS OUR LOG LINES UNLESS TOLD NOT TO ──────────────────────
 # `net.netfilter.nf_log_all_netns` defaults to 0, which means netfilter LOG
 # calls are written to the kernel ring buffer ONLY from the initial network
@@ -90,7 +92,6 @@ docker build --build-arg "BASE=$BASE" -t "$IMAGE" "$HERE/containers" || exit 1
 # failed on every leg. It only appeared to work during development because
 # the sysctl had been set by hand in an earlier debugging session: the check
 # was passing on state the script had not established. Hence $SUDO.
-SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO=sudo
 NFLOG_PATH=/proc/sys/net/netfilter/nf_log_all_netns
 if [ -r "$NFLOG_PATH" ]; then
     NFLOG_WAS="$(cat "$NFLOG_PATH")"
@@ -99,6 +100,30 @@ if [ -r "$NFLOG_PATH" ]; then
 else
     echo "WARNING: $NFLOG_PATH absent -- the drop-logging test will fail" >&2
 fi
+
+# ── KERNEL MODULES ARE HOST STATE TOO ──────────────────────────────────────
+# A container cannot load a module: it has no /lib/modules for the running
+# kernel, so `modprobe` inside it fails with
+#
+#     FATAL: Module ip6_tables not found in directory /lib/modules/6.17.0-azure
+#
+# and ufw's `enable` dies on `can't initialize ip6tables table filter`. This
+# is the same class of thing as the sysctl above -- namespaced rules, global
+# kernel.
+#
+# It did not show up locally, and that is the interesting part: the
+# development host already has ip_tables and ip6_tables loaded because its
+# OWN ufw uses them, so every local leg inherited a kernel that happened to
+# be ready. The GitHub runner's does not, and all three legacy legs failed
+# there while passing here. "Works on the dev host" was load-bearing and
+# invisible.
+#
+# NOT undone afterwards, unlike the sysctl: unloading a module that something
+# else may be using is a real risk, and an unused table costs nothing -- it
+# holds no rules, so it cannot change how anything is filtered.
+for m in ip_tables iptable_filter iptable_nat ip6_tables ip6table_filter nf_tables; do
+    ${SUDO:-} modprobe "$m" 2>/dev/null || true
+done
 
 say "boot systemd in $NAME"
 docker rm -f "$NAME" >/dev/null 2>&1 || true

@@ -22,6 +22,10 @@ BEFORE_INIT="$(dirname "$AFTER4")/before.init"
 # fails on the preflight long before reaching what it meant to test.
 install_args() { host_supported || printf '%s' "--unsupported --force"; }
 
+# `install` colours its output, and a colour code between `-j` and the target
+# makes awk read the escape as the chain name.
+strip_ansi_stream() { sed -E 's/\x1b\[[0-9;]*m//g'; }
+
 probe()  { sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" get "$1" "${2:-http}"; }
 health() { sudo iptables -S ufw-user-input 2>/dev/null; }
 logchains() { sudo iptables -S 2>/dev/null | grep -cE '^-N ufw.*logging'; }
@@ -882,23 +886,57 @@ teardown_file() {
     run sudo bash -c 'printf "*filter\n:TESTCHAIN - [0:0]\n-A TESTCHAIN --bogus\nCOMMIT\n" | iptables-restore --test'
     [ "$status" -ne 0 ]
 
-    # The blind spot, which is BACKEND-DEPENDENT. A jump to a chain that does
-    # not exist passes --test under nf_tables (rc=0) and is rejected under
-    # legacy xtables. Asserted per backend rather than hardcoding one, so the
-    # difference is a recorded property instead of something the legacy CI leg
-    # trips over.
+    # The blind spot: a jump to a chain that does not exist. This is REPORTED,
+    # NOT ASSERTED, and that is a correction.
     #
-    # Either way the stanza is safe by construction: it declares every chain it
-    # jumps to. Under legacy the pre-write check is simply strictly stronger.
+    # It used to assert rc=0 under nf_tables and rc!=0 under legacy, on the
+    # strength of measuring one host. Debian 10 disproved it: iptables 1.8.2
+    # in nft mode REJECTS the unresolvable jump, exactly as legacy does, so
+    # the leg failed on a tool that was behaving perfectly. The rule is not
+    # "nft accepts it" -- it is "nft 1.8.9 and 1.8.10 accept it, 1.8.2 does
+    # not", which is a property of a version we do not control and must not
+    # pin a test to.
+    #
+    # What matters is the SAFETY claim, and that is asserted on its own below
+    # ("the stanza never jumps to a chain it does not declare"). Where --test
+    # catches the jump, the pre-write check is simply strictly stronger.
     local backend=nft
     sudo iptables --version 2>/dev/null | grep -q legacy && backend=legacy
-    echo "# iptables backend: $backend" >&3
+    local version; version="$(sudo iptables --version 2>/dev/null | awk '{print $2}')"
 
     run sudo bash -c 'printf "*filter\n:TESTCHAIN - [0:0]\n-A TESTCHAIN -j NOSUCHCHAIN\nCOMMIT\n" | iptables-restore --test'
-    if [ "$backend" = legacy ]; then
-        [ "$status" -ne 0 ]
-    else
-        [ "$status" -eq 0 ]
+    echo "# unresolvable jump: iptables $version/$backend -> rc=$status$([ "$status" -eq 0 ] && echo ' (ACCEPTED - the blind spot is present here)' || echo ' (rejected)')" >&3
+}
+
+@test "the stanza never jumps to a chain it does not declare" {
+    # THE REAL GUARANTEE, and until now it existed only as a comment claiming
+    # the stanza was "safe by construction". A claim nothing checks is a claim
+    # that quietly stops being true -- and this one is load-bearing, because
+    # `iptables-restore --test` does not reliably catch an unresolvable jump
+    # (see above). If that is our only protection, it has to be enforced.
+    run sudo "$REPO/ufw-docker" install --dry-run
+    [ "$status" -eq 0 ]
+
+    local bad
+    bad="$(printf '%s\n' "$output" | strip_ansi_stream | awk '
+        # :CHAIN - [0:0]  declares a chain
+        /^[[:space:]]*:[^[:space:]]+ /          { d = $1; sub(/^:/, "", d); declared[d] = 1 }
+        # -j TARGET  jumps to one
+        /^[[:space:]]*-A / {
+            for (i = 1; i < NF; i++) if ($i == "-j") jump[$(i+1)] = 1
+        }
+        END {
+            # Targets the kernel always provides. Anything else must have been
+            # declared by the stanza itself.
+            split("ACCEPT DROP RETURN LOG REJECT QUEUE", std, " ")
+            for (i in std) builtin[std[i]] = 1
+            for (t in jump) if (!(t in builtin) && !(t in declared)) print t
+        }')"
+
+    if [ -n "$bad" ]; then
+        echo "# stanza jumps to undeclared chain(s):" >&3
+        printf '#   %s\n' $bad >&3
+        false
     fi
 }
 

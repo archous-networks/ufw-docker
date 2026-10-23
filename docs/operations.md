@@ -34,20 +34,29 @@ and a lockout.
 
 **What `--test` catches, and it depends on the backend:**
 
-| rule | iptables-nft 1.8.9 | iptables-legacy |
+| rule | iptables-nft | iptables-legacy |
 |---|---|---|
 | `-A TESTCHAIN --bogus` | ✅ rejected, rc=2 | ✅ rejected |
-| `-A TESTCHAIN -j NOSUCHCHAIN` | ⚠️ **accepted**, rc=0 | ✅ rejected |
+| `-A TESTCHAIN -j NOSUCHCHAIN` | **version-dependent** — see below | ✅ rejected |
 
-The nft row is measured on this project's development host; the legacy row is asserted by
-the `iptables=legacy` CI leg. Under legacy the pre-write check is simply strictly
-stronger.
+Syntax is always caught; that half is universal and is asserted outright.
 
-So under nf_tables it is a syntax check, not a link check. The unresolvable-jump case is covered by
-construction instead — the stanza declares every chain it jumps to, so it cannot name a
-target it did not create. Both rows are pinned by a test, so the day a future iptables
-changes its mind about either, the suite says so rather than the check quietly becoming a
-no-op that still prints `stanza parses`.
+The unresolvable jump is not, and it is not even a clean split by backend. 1.8.9 and
+1.8.10 in nft mode **accept** it (rc=0); **1.8.2 rejects it**, exactly as legacy does.
+
+> This table used to read "nf_tables: accepted, rc=0", measured on one host and stated as
+> a property of the backend. The Debian 10 leg disproved it on its first run — and failed
+> a test that was asserting the measurement rather than the guarantee. It is a property of
+> an iptables version we do not control, so the suite now **records** what it observes here
+> and asserts the guarantee separately.
+
+**The guarantee is that the stanza never jumps to a chain it does not declare**, and that
+is now a test (`the stanza never jumps to a chain it does not declare`) rather than a
+comment claiming it is true by construction. It parses the generated stanza, collects
+every `-j` target, and fails on any that is neither a kernel builtin nor declared by the
+stanza itself. That is what makes the blind spot harmless, so it is the thing worth
+enforcing — and where `--test` does catch the jump, the pre-write check is simply
+strictly stronger.
 
 ## What is actually governing my containers: `status --rules`
 

@@ -184,6 +184,20 @@ flushing chains and restarting a daemon is confined to it. Verified by running
 The two things that *are* host-wide are named above: the `nf_log_all_netns` sysctl, which
 is set and restored, and the kernel ring buffer, which is read-only here.
 
+### A fourth trap, and the most interesting one
+
+**Docker 29 creates `DOCKER-USER` empty.** Every earlier version added
+`-A DOCKER-USER -j RETURN` when it made the chain. 29 does not. Nothing filters
+differently — an empty chain falls through — but `rescue` writes that RETURN back as
+"stock", so a suite run on Docker 29 *ends by reporting that it changed the host*, which
+it had, and could not undo.
+
+The fix is the general one rather than a special case: `snapshot_state` now records
+`DOCKER-USER` per family and `restore_state` replays it verbatim. **The fingerprint was
+covering something the restore did not** — the same shape of gap as the self-heal unit
+above, caught the other way round. Whatever the fingerprint reads, the restore must be
+able to put back.
+
 > ⚠️ **Do not edit a script while it is running.** Bash reads a script by byte offset, so
 > editing `container-leg.sh` mid-leg shifted the file under the running shell: it resumed
 > mid-token (`line 184: he: command not found`) and re-ran the whole suite a second time.

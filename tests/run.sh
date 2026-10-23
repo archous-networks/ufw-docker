@@ -172,6 +172,14 @@ snapshot_state() {
         # the unit is present but off.
         systemctl is-enabled ufw-docker-selfheal.service 2>/dev/null > "$SNAP/selfheal.enabled" || true
     fi
+    # DOCKER-USER's live contents, per family. The fingerprint already reads
+    # these; snapshotting them separately is what lets the restore PUT THEM
+    # BACK. Covering something in the fingerprint but not in the restore is
+    # how this suite ends a run by correctly reporting a difference it could
+    # have fixed -- and the last time the two lists disagreed, the fingerprint
+    # was the one missing an entry and reported a false all-clear.
+    iptables  -S DOCKER-USER 2>/dev/null > "$SNAP/docker-user.v4"
+    ip6tables -S DOCKER-USER 2>/dev/null > "$SNAP/docker-user.v6"
     fingerprint > "$SNAP/fingerprint"
     echo "pre-suite state snapshotted to $SNAP"
 }
@@ -211,6 +219,32 @@ restore_state() {
     else
         ufw --force disable >/dev/null 2>&1
     fi
+
+    # Finally DOCKER-USER, which `enable` only rebuilds when the stanza was
+    # part of the restored state. Two cases it does not cover:
+    #
+    #   - the host had no stanza, so nothing replays into the chain; and
+    #   - `rescue` deliberately leaves `-A DOCKER-USER -j RETURN` behind as
+    #     "stock" -- which it was, until Docker 29. DOCKER 29 CREATES
+    #     DOCKER-USER EMPTY, with no RETURN at all. Semantically identical, an
+    #     empty chain falls through; textually different, so a run on Docker 29
+    #     ended by reporting a host it had changed and could not change back.
+    #
+    # Replaying the snapshot verbatim covers both without special-casing
+    # either. Flush first, so a chain `enable` already rebuilt is not doubled.
+    for fam in v4 v6; do
+        [ -s "$SNAP/docker-user.$fam" ] || continue
+        case "$fam" in v4) ipt=iptables ;; *) ipt=ip6tables ;; esac
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        "$ipt" -S DOCKER-USER 2>/dev/null | diff -q - "$SNAP/docker-user.$fam" >/dev/null 2>&1 && continue
+        "$ipt" -F DOCKER-USER 2>/dev/null
+        while IFS= read -r rule; do
+            case "$rule" in
+                -A\ *) # shellcheck disable=SC2086
+                       "$ipt" ${rule} 2>/dev/null ;;
+            esac
+        done < "$SNAP/docker-user.$fam"
+    done
 }
 
 cleanup() {
