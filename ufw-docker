@@ -18,12 +18,19 @@
 #   ufw-docker status          report what is wired and whether it is healthy
 #   ufw-docker status --rules  ...and list the ufw rules containers are judged by
 #   ufw-docker status --json   the same report, machine-readable, for monitoring
+#   ufw-docker status --counters
+#                              ...and DOCKER-USER packet/byte counts
+#   ufw-docker remove --force --purge
+#                              ...and delete this binary too
 #   ufw-docker containers      container addresses, for per-container rules
 #   ufw-docker platforms       the platforms this tool is proven on, and whether
 #                              this host is one of them
 #   ufw-docker rescue          get SSH back and rebuild ufw after a bad state
 #   ufw-docker rescue --open   emergency: firewall OFF, you are definitely back in
 #   ufw-docker --version       print the version
+#
+#   ufw-docker <subcommand> --help
+#                              flags and caveats for that subcommand
 
 #
 # Docker publishes ports by DNAT in PREROUTING and then FORWARDs them, while ufw
@@ -866,11 +873,12 @@ cmd_remove() {
     require_docker remove
     require_readable
 
-    local force=0 wipe=0
+    local force=0 wipe=0 purge=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --force|-f)        force=1 ;;
             --include-backups) wipe=1 ;;
+            --purge)           purge=1 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
@@ -881,6 +889,8 @@ cmd_remove() {
     # Losing either to a stray flag on a dry run would be a bad trade.
     [ "$wipe" -eq 1 ] && [ "$force" -eq 0 ] \
         && die "--include-backups is destructive; pass --force as well"
+    [ "$purge" -eq 1 ] && [ "$force" -eq 0 ] \
+        && die "--purge deletes this binary; pass --force as well"
 
     head_ "ufw-docker remove"
 
@@ -906,6 +916,13 @@ cmd_remove() {
     say "WOULD LEAVE:"
     say "  - all of your ufw rules, untouched"
     say "  - a fresh backup of after.rules, taken before anything is changed"
+    if [ "$purge" -eq 0 ]; then
+        # B5: it always left the binary and never said so, which is the one
+        # question a preview exists to answer. Keeping it is deliberate --
+        # reinstalling is the likely next step, and `rescue` has to stay
+        # reachable exactly when you have just unwound the firewall.
+        say "  - $0 itself  ('rescue' stays available; --purge --force to delete it)"
+    fi
     if [ "$wipe" -eq 0 ]; then
         [ "${nbak:-0}"  -gt 0 ] && say "  - $nbak older after.rules backup(s)  (--include-backups to delete)"
         [ "${nsnap:-0}" -gt 0 ] && say "  - $nsnap rescue snapshot(s)           (--include-backups to delete)"
@@ -977,6 +994,17 @@ cmd_remove() {
     head_ "done"
     say "your ufw rules still apply to services on the HOST, unchanged."
     warn "they no longer affect Docker-published ports."
+    if [ "$purge" -eq 1 ]; then
+        # From a TRAP, not here. bash reads a script incrementally as it
+        # executes, so deleting the file we are running from mid-run can make
+        # the interpreter read garbage off the freed inode. Deferring to exit
+        # means every byte has already been read.
+        PURGE_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+        trap 'rm -f "$PURGE_SELF"' EXIT
+        warn "deleting $PURGE_SELF on exit — 'rescue' is no longer available here"
+    else
+        say "$0 is still installed; 'rescue' remains available."
+    fi
 }
 
 # What the self-heal unit runs at boot.
@@ -1093,6 +1121,25 @@ EOF
     return 0
 }
 
+# A7. Containers on the host network have NO address of their own, so
+# container_rows drops them -- and the operator cannot see the thing they
+# cannot target. They are listed separately, with deliberately different
+# words from the preflight's.
+#
+# "Not governed by ufw-docker" is the accurate phrase, and it is NOT
+# "unsupported". Host-network containers traverse INPUT like any host service,
+# so ordinary ufw rules already govern them correctly. Spending the word
+# "unsupported" on something that works fine is how it stops being read in the
+# cases where it means real danger -- Swarm, rootless, a mixed backend.
+host_net_containers() {
+    local c
+    docker ps --format '{{.Names}}' 2>/dev/null | while read -r c; do
+        [ -n "$c" ] || continue
+        [ "$(docker inspect "$c" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)" = host ] \
+            && printf '%s\n' "$c"
+    done
+}
+
 cmd_containers() {
     require_docker containers
     head_ "containers"
@@ -1104,6 +1151,20 @@ cmd_containers() {
     say ""
     say "'dynamic' addresses change when the container is recreated, and a rule"
     say "written against one will then match nothing. Pin with Docker IPAM."
+
+    local hostnet; hostnet="$(host_net_containers)"
+    if [ -n "$hostnet" ]; then
+        head_ "on the HOST network — not governed by ufw-docker"
+        printf '%s\n' "$hostnet" | sed 's/^/    /'
+        say ""
+        say "These share the host's network namespace, so they have no address of"
+        say "their own and 'ufw allow to <ip>' can never target them."
+        say ""
+        say "That is not a gap: their traffic arrives on INPUT like any host"
+        say "service, so your ORDINARY ufw rules already govern them —"
+        say "'ufw allow 8080/tcp' works on these exactly as you would expect."
+        say "It is the Docker-published ports that needed this tool, not these."
+    fi
     return 0
 }
 
@@ -1187,11 +1248,12 @@ cmd_status() {
     require_docker status
     require_readable
 
-    local show_rules=0 as_json=0
+    local show_rules=0 as_json=0 show_counters=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --rules) show_rules=1 ;;
             --json)  as_json=1 ;;
+            --counters) show_counters=1 ;;
             *) die "unknown option: $1" ;;
         esac
         shift
@@ -1330,6 +1392,10 @@ cmd_status() {
     [ "${ntot:-0}" -gt 0 ] && st containers info \
         "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
 
+    local nhost; nhost="$(host_net_containers | grep -c . || true)"
+    [ "${nhost:-0}" -gt 0 ] && st host-network info \
+        "$nhost container(s) on the HOST network — not governed here; plain ufw INPUT rules apply to them"
+
     # Loud, not fatal: the rule may legitimately be for a host service on that
     # same port. Does not set rc -- a confusing rule is the operator's to judge.
     local remap; remap="$(check_remapped_rules 2>&1 | strip_ansi || true)"
@@ -1353,6 +1419,27 @@ cmd_status() {
 container. A rule with -d <container ip> governs only that container.
 Ports are CONTAINER ports, not published ones. See docs/scoping.md."
         st _hdr2 head "wiring"
+    fi
+
+    # C5. "Wired but filtering nothing" is the quietest failure in this whole
+    # design, and a packet count is the cheapest visible signal of it.
+    #
+    # Deliberately NOT a warning when the counters are flat. A quiet host is a
+    # perfectly normal host -- a box nobody is attacking and whose containers
+    # nothing reaches legitimately will sit at zero for weeks. Warning on that
+    # trains people to ignore the output. Show the number; the operator knows
+    # whether their host should be seeing traffic.
+    if [ "$show_counters" -eq 1 ]; then
+        st _hdrc head "DOCKER-USER counters (packets / bytes, since the chain was last built)"
+        local ctr
+        ctr="$(iptables -L DOCKER-USER -n -v 2>/dev/null | sed -n '3,$p' | grep -v '^$')"
+        st counters info "" "${ctr:-(chain is empty or unreadable)}"
+        st counters-note info "" \
+"A rule at 0 is not evidence of a problem. These reset on every rebuild --
+install, 'ufw reload' and the before.init hook all rebuild the chain --
+so compare against how long ago the firewall was last applied, not
+against uptime."
+        st _hdrc2 head "wiring"
     fi
 
     local v6nets j6
@@ -1533,7 +1620,23 @@ cmd_rescue() {
         # healthy host down this destructive path.
         if nft list chain ip filter ufw-user-input >/dev/null 2>&1 \
            && ! iptables -S ufw-user-input >/dev/null 2>&1; then
+            # H1. This condition has been seen exactly ONCE, and never since:
+            # zero occurrences across four full local suite runs and both CI
+            # backends under the corrected detection above. The earlier belief
+            # that it "fires reliably" was the STRING-MATCHING bug -- an absent
+            # chain prints the same message, and an absent chain at the end of
+            # a run is perfectly ordinary.
+            #
+            # So we cannot reproduce it, and a guard we cannot exercise is a
+            # guard we cannot trust. The next best thing to a reproducer is to
+            # make the next real occurrence self-reporting: record it in syslog
+            # and keep the chain as nft renders it, so whoever sees this has
+            # the evidence we currently lack rather than just a repaired host.
+            audit "STEP 3B FIRED — ufw chains unreadable by iptables (nft-native syntax). Please report: $BACKUP/nft-incompatible.txt"
+            nft list table ip filter > "$BACKUP/nft-incompatible.txt" 2>&1 || true
             warn "ufw chains are not readable by iptables; clearing them with nft"
+            warn "  THIS IS RARE AND WE WANT TO KNOW ABOUT IT."
+            warn "  Evidence saved: $BACKUP/nft-incompatible.txt"
             for base in INPUT FORWARD OUTPUT; do
                 while :; do
                     h=$(nft -a list chain ip filter "$base" 2>/dev/null \
@@ -1654,14 +1757,187 @@ cmd_rescue() {
 # Before anything reads or writes one of ufw's files.
 derive_ufw_paths
 
+# ── per-subcommand help ────────────────────────────────────────────────────
+# D3. `remove --help` used to print the global block, which lists every
+# subcommand and explains none of their flags -- so the single question it
+# was asked ("what does --include-backups actually do?") was the one it would
+# not answer.
+#
+# Sequenced last on purpose: --dry-run, --rules, --json, --counters,
+# --unsupported, --force and --purge all arrived after this was triaged, and
+# writing it first would have meant writing it twice.
+#
+# Routed from the DISPATCHER rather than from inside each cmd_*, so that
+# `ufw-docker remove --help` works without sudo. Those functions call
+# require_root before they parse anything, and refusing to explain a flag
+# until you are root is a small, daily, pointless obstruction.
+#
+# No man page: it would duplicate this, need separate installation, and fight
+# the single-file property that makes this tool one curl.
+wants_help() {
+    local a
+    for a in "$@"; do case "$a" in --help|-h) return 0 ;; esac; done
+    return 1
+}
+
+subcmd_help() {
+    case "$1" in
+    install) cat <<'H'
+ufw-docker install [--dry-run] [--no-selfheal] [--unsupported --force]
+
+  Wire ufw into Docker's DOCKER-USER chain so plain `ufw allow` and `ufw deny`
+  govern Docker-published ports. Idempotent: re-running strips our own stanza
+  and rewrites it, which is how you pick up new Docker subnets or a new
+  version of this tool.
+
+  --dry-run, -n   Print the exact stanza that would be written, the hook and
+                  self-heal intentions, and the preflight verdict. Changes
+                  nothing at all.
+
+  --no-selfheal   Skip the boot-time repair unit. That unit re-wires
+                  DOCKER-USER if it is found empty at boot, which is the
+                  failure with no other symptom -- so skipping it is a real
+                  choice, not a tidiness option.
+
+  --unsupported   Acknowledge that this host fails the supported-environment
+                  preflight. ON ITS OWN THIS STILL REFUSES; it has to be given
+                  together with --force.
+
+  --force         Required alongside --unsupported. Two flags, because one
+                  flag is something you can paste from a forum post without
+                  reading it. Installing this way is recorded in the stanza
+                  and reported by every `status` run from then on.
+
+  Re-run install after: creating or removing a Docker network, running
+  `ufw logging on|off`, or upgrading this tool. `status` reports all three.
+H
+    ;;
+    remove) cat <<'H'
+ufw-docker remove [--force] [--include-backups] [--purge]
+
+  Undo the install. WITHOUT --force this only PREVIEWS -- it prints what would
+  be removed and what would be left, and changes nothing.
+
+  --force, -f         Actually do it.
+
+  --include-backups   Also delete the after.rules backups and the
+                      /var/backups/ufw-rescue-* snapshots. Requires --force.
+                      The backup taken by THIS run is kept: it is the way back
+                      if the removal itself goes wrong.
+
+  --purge             Also delete this binary. Requires --force. Without it
+                      the binary is deliberately left behind -- reinstalling is
+                      the likely next step, and `rescue` has to stay reachable
+                      exactly when you have just unwound the firewall.
+
+  What remove does NOT touch: any of your ufw rules. They all survive and keep
+  governing services on the HOST. They simply stop affecting Docker-published
+  ports again, which is the state you were in before installing.
+H
+    ;;
+    status) cat <<'H'
+ufw-docker status [--rules] [--counters] [--json]
+
+  Report what is wired and whether it is healthy. EXIT 1 MEANS NEEDS
+  ATTENTION, so this is usable straight from cron or a monitoring check.
+
+  --rules      Also list the two chains that decide what reaches containers,
+               in the order they are consulted: ufw-user-forward (written by
+               `ufw route ...`) first, then ufw-user-input.
+
+  --counters   Also show DOCKER-USER packet and byte counts. "Wired but
+               filtering nothing" is the quietest failure in this design and a
+               packet count is the cheapest signal of it. A zero is NOT
+               reported as a fault: a quiet host is a normal host.
+
+  --json       The same report, machine-readable. Every check carries a stable
+               `key`, so an alert can name a condition instead of matching a
+               sentence. Top level: healthy, installed, supported,
+               preflight_failed, installed_unsupported.
+
+  Checked on EVERY run, not only at install: whether this host is still a
+  platform the tool has been proven on. A host can stop being one without
+  anybody touching this tool, by switching the iptables backend.
+H
+    ;;
+    rescue) cat <<'H'
+ufw-docker rescue [--open]
+
+  Recover a firewall that is in a bad state. Restores SSH FIRST, before
+  touching anything else, then unwinds our stanza, returns DOCKER-USER to
+  stock, rebuilds ufw and verifies the result. A forensic snapshot of the
+  broken state is kept under /var/backups/ufw-rescue-<timestamp>.
+
+  It NEVER opens a port you had not already opened. It replays YOUR OWN rules
+  from user.rules -- including interface- and source-scoped ones that name no
+  port at all -- falling back to the newest snapshot; and if nothing permits
+  SSH it invents nothing and tells you so.
+
+  --open   EMERGENCY. Disables ufw entirely and sets INPUT, FORWARD and OUTPUT
+           to ACCEPT. THE HOST IS THEN UNFILTERED. This is the deliberate "get
+           me in regardless" case; run `rescue` without it once you are back.
+H
+    ;;
+    containers) cat <<'H'
+ufw-docker containers
+
+  List running containers with the address and kind you need in order to write
+  a per-container rule:
+
+      ufw allow to <ip> port <CONTAINER port> proto tcp
+
+  Note CONTAINER port, not published port. Docker DNATs before this tool ever
+  sees the packet, so a rule naming the published port can never match.
+
+  'dynamic' addresses change when a container is recreated, and a rule written
+  against one then matches nothing. Pin the address with Docker IPAM.
+
+  Containers on the HOST network are listed separately. They have no address
+  of their own and cannot be targeted this way -- but they need nothing from
+  this tool, because their traffic traverses INPUT and ordinary ufw rules
+  already govern them correctly.
+H
+    ;;
+    platforms) cat <<'H'
+ufw-docker platforms
+
+  Print the supported-platform matrix, and say where this host sits in it.
+
+  Matching is on distro + major version + iptables backend. ufw and Docker
+  versions are recorded but deliberately NOT matched on: they move constantly,
+  and gating on them would turn every routine upgrade into a refusal.
+
+  A row may say `supported` only where its verified-by column names real
+  evidence -- a green CI leg, or a full suite run on a host of that class. A
+  host matching no supported row is refused by `install`, which can be
+  overridden with `install --unsupported --force`.
+H
+    ;;
+    selfheal) cat <<'H'
+ufw-docker selfheal
+
+  Check the wiring and repair it if it is broken. This is what the boot-time
+  systemd unit runs. Running it by hand is safe, and does nothing at all on a
+  healthy host.
+
+  It exists for the failure with no other symptom: DOCKER-USER found empty
+  after a boot, where `ufw status` looks entirely normal while nothing is
+  actually filtering container traffic.
+H
+    ;;
+    *) return 1 ;;
+    esac
+    return 0
+}
+
 case "${1:-}" in
-    install) shift; cmd_install "$@" ;;
-    rescue)  shift; cmd_rescue "$@" ;;
-    remove|uninstall) shift; cmd_remove "$@" ;;
-    status)  shift; cmd_status "$@" ;;
-    selfheal) shift; cmd_selfheal "$@" ;;
-    containers) shift; cmd_containers "$@" ;;
-    platforms) shift; cmd_platforms "$@" ;;
+    install) shift; wants_help "$@" && { subcmd_help install; exit 0; }; cmd_install "$@" ;;
+    rescue) shift; wants_help "$@" && { subcmd_help rescue; exit 0; }; cmd_rescue "$@" ;;
+    remove|uninstall) shift; wants_help "$@" && { subcmd_help remove; exit 0; }; cmd_remove "$@" ;;
+    status) shift; wants_help "$@" && { subcmd_help status; exit 0; }; cmd_status "$@" ;;
+    selfheal) shift; wants_help "$@" && { subcmd_help selfheal; exit 0; }; cmd_selfheal "$@" ;;
+    containers) shift; wants_help "$@" && { subcmd_help containers; exit 0; }; cmd_containers "$@" ;;
+    platforms) shift; wants_help "$@" && { subcmd_help platforms; exit 0; }; cmd_platforms "$@" ;;
     --version|-V|version) printf 'ufw-docker %s\n' "$VERSION" ;;
     # Usage is the header comment, printed up to the first blank line. Ranged by
     # marker rather than by line number: a hardcoded '2,14p' silently truncates

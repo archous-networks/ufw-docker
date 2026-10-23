@@ -94,14 +94,17 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | `sudo ufw-docker status` | what is wired and whether it is healthy. **Exit 1 = needs attention** |
 | `sudo ufw-docker status --rules` | …and the rules containers are actually judged by |
 | `sudo ufw-docker status --json` | the same report, machine-readable, for monitoring |
+| `sudo ufw-docker status --counters` | …and `DOCKER-USER` packet counts — the cheapest signal of *wired but filtering nothing* |
 | `sudo ufw-docker install --unsupported --force` | install anyway on an environment we have **not** proven |
 | `sudo ufw-docker containers` | container addresses, for per-container rules |
 | `sudo ufw-docker platforms` | the platforms this is proven on, and whether this host is one |
 | `sudo ufw-docker remove` | preview the undo — changes nothing |
 | `sudo ufw-docker remove --force` | actually undo it |
 | `sudo ufw-docker remove --force --include-backups` | …and delete the backups too |
+| `sudo ufw-docker remove --force --purge` | …and delete the binary too (it is kept by default, so `rescue` stays available) |
 | `sudo ufw-docker rescue` | get back in after a bad state |
 | `ufw-docker --version` | the version; the installed stanza records the one that wired the host |
+| `ufw-docker <cmd> --help` | flags and caveats for that subcommand — works without `sudo` |
 
 Both `install` and `remove` preview before they change anything, and `install` parses the
 stanza it generated before writing a byte of it.

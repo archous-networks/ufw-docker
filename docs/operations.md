@@ -197,3 +197,81 @@ safe. Do it after:
 
 `status` reports all three, so the honest answer to "when" is: whenever `status` tells
 you to.
+
+## Updating to a new version
+
+```bash
+curl -fsSL https://github.com/archous-networks/ufw-docker/releases/latest/download/ufw-docker \
+  | sudo install -m 0755 /dev/stdin /usr/local/sbin/ufw-docker
+sudo ufw-docker install        # <- not optional
+```
+
+`install` refreshes all three pieces of installed state — the stanza, `before.init` if
+we manage it, and the self-heal unit — then reloads and verifies.
+
+**The trap: curling the new binary without re-running `install` leaves a new binary
+enforcing the old version's stanza.** Nothing breaks loudly; the firewall keeps working
+exactly as the previous version wired it, while `--version` reports the new one. That is
+why the stanza records the version that wrote it, and why `status` says:
+
+```
+wired by ufw-docker 0.9.0, but this binary is 1.0.0 — re-run install
+```
+
+The gap between the two commands is safe. The old stanza keeps filtering the whole time;
+nothing is torn down until `install` succeeds, and it rolls back if the result is
+unhealthy.
+
+Verify the download first — see [releases.md](releases.md).
+
+## Changing the iptables backend
+
+Switching between `iptables-nft` and `iptables-legacy` is not just changing the
+alternative. **Rules already in the old backend stay there, and the kernel evaluates
+both** — so a `DROP` left behind in the one you walked away from still wins over an
+`ACCEPT` in the one you moved to. That is the single hardest failure here to diagnose
+from the outside, because `status` reports everything correctly wired and traffic still
+does not flow.
+
+It is not hypothetical: this is exactly what made the project's iptables-legacy CI leg
+fail for days while the stanza it was writing was correct the whole time.
+
+```bash
+sudo ufw-docker remove --force                              # 1. unwind our stanza
+sudo update-alternatives --set iptables  /usr/sbin/iptables-legacy
+sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+sudo reboot                                                 # 2. the guaranteed-clean step
+sudo ufw-docker install                                     # 3. rewire
+```
+
+**Step 2 is the one people skip.** `remove` unwinds *our* stanza, but Docker's own
+chains, ufw's chains and anything else stay in the old backend. A reboot is the only
+step that reliably clears both subsystems. If you genuinely cannot reboot,
+`nft flush ruleset` followed by `systemctl restart docker` achieves the same thing for
+the nft side — that is what CI does — but a reboot is what to do on a host you care
+about.
+
+X1's **mixed-backend check is the other half of this procedure**: it refuses to install
+when rules exist in both subsystems, which is precisely what skipping step 2 leaves
+behind. The check and this procedure are one thing described from two directions.
+
+## `remove` leaves the binary
+
+Deliberately. Reinstalling is the likely next step, and `rescue` has to stay reachable
+exactly when you have just unwound the firewall. The preview says so:
+
+```
+WOULD LEAVE:
+  - /usr/local/sbin/ufw-docker itself  ('rescue' stays available; --purge --force to delete it)
+```
+
+To remove it too:
+
+```bash
+sudo ufw-docker remove --force --purge
+```
+
+`--purge` requires `--force`, and is orthogonal to `--include-backups` so the two
+compose. The deletion happens from an `EXIT` trap rather than inline: bash reads a
+script incrementally as it runs, so deleting the file mid-execution can leave the
+interpreter reading garbage off the freed inode.

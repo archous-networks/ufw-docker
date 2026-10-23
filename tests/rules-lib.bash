@@ -25,11 +25,11 @@
 # rule rather than by port. A bare `ufw allow 80/tcp` is still flagged, which
 # is correct -- the suite never creates one.
 #
-# STILL IMPERFECT: 9100, 9200 and 9300 are node_exporter and Elasticsearch
-# ports. Nothing here runs them, but they fail the "nothing real listens on
-# it" test and should move. Tracked in TODO.md.
-TEST_PORTS='9100|9200|9300|18080|18090|18443|19089|19100|19443'
-TEST_ADDRS='-d (172\.21\.|172\.23\.|fd00:dead:beef:)|-s (10\.97\.|10\.98\.|fd00:97:|fd00:99:)'
+# 9100, 9200 and 9300 are gone too -- node_exporter and Elasticsearch listen
+# on those, and nothing in TEST_PORTS may be a port a real service plausibly
+# uses, because every port here is one the suite will DELETE A RULE FOR.
+TEST_PORTS='18080|18090|18443|19080|19089|19100|19101|19200|19300|19443|19500'
+TEST_ADDRS='-d (172\.21\.|172\.23\.|172\.24\.|fd00:dead:beef:)|-s (10\.97\.|10\.98\.|fd00:97:|fd00:99:)'
 
 test_owned() {   # $1 = one rule line
     printf '%s' "$1" | grep -qE -- "dport ($TEST_PORTS)\b" && return 0

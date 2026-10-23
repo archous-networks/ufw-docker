@@ -25,9 +25,22 @@ for fn in $called; do
 done
 
 # Every subcommand the dispatcher offers must exist.
+#
+# \bcmd_ and not just cmd_: without the word boundary this matched the
+# SUBSTRING inside `subcmd_help` and demanded a `cmd_help` that was never
+# meant to exist. A lint that invents work is a lint people learn to override.
 for sub in $(sed -n '/^case "${1:-}" in/,/^esac/p' "$FILE" \
-             | grep -oE 'cmd_[a-z_]+' | sort -u); do
+             | grep -oE '\bcmd_[a-z_]+' | sort -u); do
     grep -qx "$sub" <<< "$defined" || { echo "DISPATCHER CALLS MISSING: $sub" >&2; rc=1; }
+done
+
+# Every subcommand must explain its own flags. Without this, the next
+# subcommand ships with the global help block as its --help, which is exactly
+# the state D3 was filed to fix -- and nothing would notice.
+for sub in $(sed -n '/^case "${1:-}" in/,/^esac/p' "$FILE" \
+             | grep -oE '\bcmd_[a-z_]+' | sed 's/^cmd_//' | sort -u); do
+    grep -qE "^    ${sub}\) cat <<'H'" "$FILE" \
+        || { echo "NO PER-SUBCOMMAND HELP: $sub (add a case to subcmd_help)" >&2; rc=1; }
 done
 
 # Every subcommand listed in the usage text must be dispatchable.

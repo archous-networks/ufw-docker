@@ -216,6 +216,44 @@ removed afterwards only if the suite created it.
 something a real service plausibly listens on. Every port in `TEST_PORTS` is a port the
 suite will *delete a rule for*, which is the whole reason this matters.
 
+## The one test that cannot be automated: a real cold boot
+
+The self-heal unit is verified in almost every respect by the suite — systemd drives it
+against a genuinely broken firewall, it repairs it, it restores a *restricted* SSH rule
+rather than a blanket one, it logs what it did, it leaves a healthy firewall alone, and
+its enablement and `After=`/`Wants=` ordering are asserted declaratively.
+
+**All of that happens on a running host.** The thing the unit exists for is the boot
+race — ufw, Docker and this unit coming up in the right order on a cold start — and the
+only honest way to test a boot race is to boot. So that part is currently verified *by
+declaration*, not by observation, and the difference is exactly the kind this project
+tries not to paper over.
+
+`tests/cold-boot-check.sh` makes it two commands with a reboot between them. It is
+deliberately **not** part of the suite: nothing should reboot a host as a side effect of
+running tests.
+
+```bash
+sudo tests/cold-boot-check.sh arm      # breaks DOCKER-USER, on purpose
+sudo reboot
+sudo tests/cold-boot-check.sh verify   # did the unit put it back?
+```
+
+`arm` states the cost before doing anything and requires you to type `break it`:
+
+- it empties `DOCKER-USER`, so **Docker-published ports are unfiltered** from that moment
+  until the unit repairs them after the reboot;
+- it does **not** touch SSH, which arrives on `INPUT` — there is no lockout risk here,
+  only an exposure window, and it lasts as long as you delay the reboot.
+
+It refuses to arm if the self-heal unit is not enabled, since nothing would then repair
+it. `verify` refuses to pass if `/proc/sys/kernel/random/boot_id` is unchanged — a check
+that "survived a reboot" without a reboot is the purest form of a test that passes for
+the wrong reason, and this suite has shipped three of those already.
+
+A failure here is a *finding*, not an inconvenience: it would mean the unit's ordering is
+wrong on a real boot, which is the single scenario it was written for.
+
 ## The operator's rules are an enforced invariant
 
 Every test is measured against a baseline snapshot of `/etc/ufw/user.rules` taken in

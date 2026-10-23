@@ -49,10 +49,33 @@ since it is what makes the commands you already know apply to containers.
 
 Full detail, and the `ufw deny 80` hazard, in [scoping.md](scoping.md).
 
-## `--network host` containers are unaffected
+## `--network host` containers are unaffected — and are now listed
 
 They share the host's network namespace, so their traffic is `INPUT`, not `FORWARD`.
 Ordinary ufw rules already govern them — correctly, and without this tool.
+
+The problem was never the behaviour, it was the **presentation**. Those containers have
+no address of their own, so `ufw-docker containers` dropped them entirely: you could not
+see the thing you could not target, and the natural conclusion was that this tool had
+silently missed them. They are now listed in their own section:
+
+```
+on the HOST network — not governed by ufw-docker
+    prometheus-node-exporter
+
+These share the host's network namespace, so they have no address of
+their own and 'ufw allow to <ip>' can never target them.
+
+That is not a gap: their traffic arrives on INPUT like any host
+service, so your ORDINARY ufw rules already govern them —
+'ufw allow 8080/tcp' works on these exactly as you would expect.
+```
+
+**Note the wording, which is deliberate: "not governed by ufw-docker", never
+"unsupported".** These containers work correctly. Swarm, rootless Docker and a mixed
+iptables backend are *unsupported* — the preflight refuses to install on them. Spending
+that word on something harmless is exactly how it stops being read in the cases where it
+means real danger, so host-network containers do **not** trip the preflight.
 
 ## IPv6 needs daemon support to matter
 

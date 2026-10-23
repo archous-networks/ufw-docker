@@ -411,10 +411,52 @@ teardown_file() {
 }
 
 @test "rules survive a container recreate" {
-    [ -d /home/unms/app ] || skip "no UISP install here"
-    ( cd /home/unms/app && sudo -u unms docker compose -p unms up -d --force-recreate ucrm >/dev/null 2>&1 )
-    sleep 8
-    [ "$(jumps)" -gt 0 ]
+    # E8. This was UISP-specific and skipped in CI, so whether it was green
+    # depended on WHERE it ran -- the exact shape this suite spent a day
+    # removing. It also asserted only that DOCKER-USER still had jumps, which
+    # is a much weaker claim than the one that matters.
+    #
+    # Triage assumed another test already covered recreate in CI and that this
+    # one could simply be deleted. It did not: nothing else in the suite
+    # recreates a container at all, so deleting this would have removed real
+    # coverage. It builds its own container instead, and now runs everywhere.
+    #
+    # STATIC IPAM address on purpose. A dynamic address CHANGES on recreate and
+    # a rule naming the old one then matches nothing -- that is real, documented
+    # behaviour and the reason `containers` flags dynamic addresses, so it is
+    # not something to assert against. The static case is the one an operator
+    # writing per-container rules should be in.
+    docker rm -f recreatesvc >/dev/null 2>&1 || true
+    docker network rm recreatenet >/dev/null 2>&1 || true
+    docker network create --subnet 172.24.0.0/24 recreatenet >/dev/null 2>&1 \
+        || skip "172.24.0.0/24 is in use on this host"
+
+    mk_recreatesvc() {
+        docker run -d --name recreatesvc --network recreatenet --ip 172.24.0.10 \
+            -p 19500:19500 python:3-alpine \
+            python -m http.server 19500 >/dev/null 2>&1
+    }
+
+    mk_recreatesvc; sleep 5
+    reinstall                                  # pick up the new subnet
+
+    sudo ufw allow to 172.24.0.10 port 19500 proto tcp >/dev/null 2>&1
+    [ "$(probe 19500)" != "000" ]              # the rule governs it
+
+    # Recreate it, deliberately WITHOUT re-running install. Docker rebuilds its
+    # own DNAT and this tool must not need to be told.
+    docker rm -f recreatesvc >/dev/null 2>&1
+    mk_recreatesvc; sleep 5
+
+    local rc=0
+    [ "$(jumps)" -gt 0 ]             || rc=1   # the wiring survived
+    [ "$(probe 19500)" != "000" ]    || rc=1   # and the rule still reaches it
+
+    sudo ufw --force delete allow to 172.24.0.10 port 19500 proto tcp >/dev/null 2>&1
+    docker rm -f recreatesvc >/dev/null 2>&1 || true
+    docker network rm recreatenet >/dev/null 2>&1 || true
+    reinstall
+    [ "$rc" -eq 0 ]
 }
 
 @test "rules survive a Docker daemon restart" {
@@ -449,7 +491,7 @@ teardown_file() {
     #
     # A firewall suite has no business deleting the SSH rule of the box it is
     # running on to prove a point any port can prove. It uses its own port now.
-    local port=9300
+    local port=19300
     start_host_listener "$port"
 
     sudo ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
@@ -638,7 +680,13 @@ teardown_file() {
     # Fail with a USEFUL message if the subnet is taken. A leftover network from
     # ad-hoc testing once held this range, and `create` failing silently made the
     # error point at the line rather than at the cause.
-    if ! docker network create --subnet 172.21.0.0/24 ctgtnet >/dev/null 2>&1; then
+    # A10: a CUSTOM BRIDGE NAME, not the br-<hash> Docker picks. The stanza
+    # matches on subnets and never on interface names, so this ought to make
+    # no difference -- but "ought to" is reasoning, and every per-container
+    # assertion below then measures it for free. Converting a [suspected] to a
+    # [verified] for the cost of one flag.
+    if ! docker network create --subnet 172.21.0.0/24 \
+            -o com.docker.network.bridge.name=ufwdtest0 ctgtnet >/dev/null 2>&1; then
         echo "could not create ctgtnet - is 172.21.0.0/24 already used by:" >&2
         docker network ls -q | while read -r n; do
             docker network inspect "$n" --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null
@@ -712,31 +760,31 @@ teardown_file() {
     docker rm -f collc >/dev/null 2>&1 || true
     docker network rm collnet >/dev/null 2>&1 || true
     docker network create --subnet 172.23.0.0/24 collnet >/dev/null 2>&1 || skip "172.23.0.0/24 in use"
-    docker run -d --name collc --network collnet --ip 172.23.0.10 -p 19100:9100 \
-        python:3-alpine python -m http.server 9100 >/dev/null 2>&1
-    start_host_listener 9100
+    docker run -d --name collc --network collnet --ip 172.23.0.10 -p 19100:19101 \
+        python:3-alpine python -m http.server 19101 >/dev/null 2>&1
+    start_host_listener 19101
     sleep 5
     reinstall
 
     clr() {
-        sudo ufw --force delete allow 9100/tcp >/dev/null 2>&1
-        sudo ufw --force delete allow to "$HOST_IP" port 9100 proto tcp >/dev/null 2>&1
-        sudo ufw --force delete allow to 172.23.0.10 port 9100 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow 19101/tcp >/dev/null 2>&1
+        sudo ufw --force delete allow to "$HOST_IP" port 19101 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow to 172.23.0.10 port 19101 proto tcp >/dev/null 2>&1
         sudo ufw reload >/dev/null 2>&1
     }
 
-    clr; [ "$(probe 9100)" = "000" ] && [ "$(probe 19100)" = "000" ]
+    clr; [ "$(probe 19101)" = "000" ] && [ "$(probe 19100)" = "000" ]
 
-    clr; sudo ufw allow 9100/tcp >/dev/null 2>&1
-    [ "$(probe 9100)" != "000" ]      # port-only: host open
+    clr; sudo ufw allow 19101/tcp >/dev/null 2>&1
+    [ "$(probe 19101)" != "000" ]      # port-only: host open
     [ "$(probe 19100)" != "000" ]     # ...and container open too
 
-    clr; sudo ufw allow to "$HOST_IP" port 9100 proto tcp >/dev/null 2>&1
-    [ "$(probe 9100)" != "000" ]      # host only
+    clr; sudo ufw allow to "$HOST_IP" port 19101 proto tcp >/dev/null 2>&1
+    [ "$(probe 19101)" != "000" ]      # host only
     [ "$(probe 19100)" = "000" ]
 
-    clr; sudo ufw allow to 172.23.0.10 port 9100 proto tcp >/dev/null 2>&1
-    [ "$(probe 9100)" = "000" ]       # container only
+    clr; sudo ufw allow to 172.23.0.10 port 19101 proto tcp >/dev/null 2>&1
+    [ "$(probe 19101)" = "000" ]       # container only
     [ "$(probe 19100)" != "000" ]
 
     clr
@@ -942,8 +990,8 @@ v6nets() {
     # correctly blocked port. That cost a real debugging round: the firewall was
     # working the whole time and the service was not listening.
     docker rm -f v6svc >/dev/null 2>&1 || true
-    docker run -d --name v6svc --restart always -p 9200:9200 python:3-alpine \
-        python -m http.server 9200 --bind :: >/dev/null 2>&1
+    docker run -d --name v6svc --restart always -p 19200:19200 python:3-alpine \
+        python -m http.server 19200 --bind :: >/dev/null 2>&1
     sleep 6
     local cip
     cip=$(docker inspect v6svc --format '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}')
@@ -955,30 +1003,30 @@ v6nets() {
     local peer; peer=$(sudo HOST_IP="$HOST_IP" "$REPO/tests/netns-probe.sh" peer6)
     [ -n "$peer" ]
     clr6() {
-        sudo ufw --force delete allow 9200/tcp >/dev/null 2>&1
-        sudo ufw --force delete deny 9200/tcp >/dev/null 2>&1
-        sudo ufw --force delete allow to "$cip" port 9200 proto tcp >/dev/null 2>&1
-        sudo ufw --force delete allow from "$peer" to any port 9200 proto tcp >/dev/null 2>&1
-        sudo ufw --force delete allow from fd00:99::2 to any port 9200 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow 19200/tcp >/dev/null 2>&1
+        sudo ufw --force delete deny 19200/tcp >/dev/null 2>&1
+        sudo ufw --force delete allow to "$cip" port 19200 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow from "$peer" to any port 19200 proto tcp >/dev/null 2>&1
+        sudo ufw --force delete allow from fd00:99::2 to any port 19200 proto tcp >/dev/null 2>&1
         sudo ufw reload >/dev/null 2>&1
     }
 
-    clr6;  [ "$(probe6 9200)" = "000" ]                       # default deny
+    clr6;  [ "$(probe6 19200)" = "000" ]                       # default deny
 
-    clr6; sudo ufw allow 9200/tcp >/dev/null 2>&1
-    [ "$(probe6 9200)" != "000" ]                             # allow opens it
+    clr6; sudo ufw allow 19200/tcp >/dev/null 2>&1
+    [ "$(probe6 19200)" != "000" ]                             # allow opens it
 
-    clr6; sudo ufw deny 9200/tcp >/dev/null 2>&1
-    [ "$(probe6 9200)" = "000" ]                              # deny closes it
+    clr6; sudo ufw deny 19200/tcp >/dev/null 2>&1
+    [ "$(probe6 19200)" = "000" ]                              # deny closes it
 
-    clr6; sudo ufw allow to "$cip" port 9200 proto tcp >/dev/null 2>&1
-    [ "$(probe6 9200)" != "000" ]                             # per-container v6 dst
+    clr6; sudo ufw allow to "$cip" port 19200 proto tcp >/dev/null 2>&1
+    [ "$(probe6 19200)" != "000" ]                             # per-container v6 dst
 
-    clr6; sudo ufw allow from "$peer" to any port 9200 proto tcp >/dev/null 2>&1
-    [ "$(probe6 9200)" != "000" ]                             # source-restricted
+    clr6; sudo ufw allow from "$peer" to any port 19200 proto tcp >/dev/null 2>&1
+    [ "$(probe6 19200)" != "000" ]                             # source-restricted
 
-    clr6; sudo ufw allow from fd00:99::2 to any port 9200 proto tcp >/dev/null 2>&1
-    [ "$(probe6 9200)" = "000" ]                              # ...and a WRONG source
+    clr6; sudo ufw allow from fd00:99::2 to any port 19200 proto tcp >/dev/null 2>&1
+    [ "$(probe6 19200)" = "000" ]                              # ...and a WRONG source
 
     clr6
     docker rm -f v6svc >/dev/null 2>&1 || true
@@ -1159,6 +1207,79 @@ assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
     # ...and did not invent anything.
     ! echo "$output" | grep -q 'NOT inventing one'
     ! echo "$output" | grep -qi 'BLANKET ACCEPT'
+}
+
+@test "status --counters shows DOCKER-USER traffic, and does not cry about zeroes" {
+    run sudo "$REPO/ufw-docker" status --counters
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'DOCKER-USER counters'
+    echo "$output" | grep -q 'ufw-user-input'
+    # A flat counter is a normal host, not a fault. If this ever starts
+    # warning, it will be ignored along with everything else this prints.
+    ! echo "$output" | grep -qiE 'WARN.*counter|counter.*(suspicious|problem)'
+    echo "$output" | grep -q 'not evidence of a problem'
+}
+
+@test "remove says it leaves the binary, and --purge needs --force" {
+    # The preview exists to answer "what remains?", and it never mentioned the
+    # one thing that always did.
+    run sudo "$REPO/ufw-docker" remove
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q "itself"
+    echo "$output" | grep -q -- '--purge --force'
+
+    run sudo "$REPO/ufw-docker" remove --purge
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -q -- '--purge deletes this binary'
+    # and it changed nothing
+    sudo grep -q 'BEGIN DOCKER-UFW' "$AFTER4"
+}
+
+@test "containers lists host-network containers separately, not as unsupported" {
+    # A7. They have no address of their own, so container_rows drops them and
+    # the operator cannot see the thing they cannot target.
+    docker rm -f hostnetsvc >/dev/null 2>&1 || true
+    docker run -d --name hostnetsvc --network host python:3-alpine \
+        python -m http.server 19400 >/dev/null 2>&1
+    sleep 3
+
+    run sudo "$REPO/ufw-docker" containers
+    docker rm -f hostnetsvc >/dev/null 2>&1 || true
+
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'hostnetsvc'
+    echo "$output" | grep -q 'HOST network'
+    # The VOCABULARY matters as much as the detection. These are correctly
+    # governed by ordinary ufw rules, so calling them "unsupported" would
+    # spend a word we need for Swarm and rootless on something harmless.
+    ! echo "$output" | grep -qi 'unsupported'
+    echo "$output" | grep -qi 'ordinary ufw rules'
+}
+
+@test "each subcommand explains its OWN flags, without root" {
+    # D3. `remove --help` used to print the global block, which lists every
+    # subcommand and explains none of their flags -- so the one question it
+    # was asked was the one it would not answer.
+    run "$REPO/ufw-docker" remove --help
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q -- '--include-backups'
+    echo "$output" | grep -q -- '--purge'
+    # ...and NOT the global block
+    ! echo "$output" | grep -q 'ufw-docker rescue --open'
+
+    # Routed from the dispatcher so it works without sudo. Refusing to explain
+    # a flag until you are root is a small, daily, pointless obstruction.
+    [ "$(id -u)" -ne 0 ] || skip "running as root; cannot prove the non-root path here"
+}
+
+@test "every dispatchable subcommand has its own help" {
+    local sub
+    for sub in install remove status rescue containers platforms selfheal; do
+        run "$REPO/ufw-docker" "$sub" --help
+        [ "$status" -eq 0 ] || { echo "no help for $sub" >&3; return 1; }
+        echo "$output" | grep -q "ufw-docker $sub" \
+            || { echo "help for $sub does not name it" >&3; return 1; }
+    done
 }
 
 @test "remove returns DOCKER-USER to stock" {

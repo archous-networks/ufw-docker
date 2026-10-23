@@ -83,6 +83,26 @@ Deliberately best-effort: a host without `logger` loses the trail rather than th
 The chain counters answer "is anything actually being dropped":
 
 ```bash
+sudo ufw-docker status --counters      # the same numbers, with the caveats attached
+```
+
+or the raw form:
+
+```bash
 sudo iptables -L DOCKER-USER -v -n --line-numbers
 sudo iptables -L ufw-docker-logging-deny -v -n
 ```
+
+**"Wired but filtering nothing" is the quietest failure in this design**, and a packet
+count is the cheapest visible signal of it. `--counters` exists so you do not have to
+remember the chain name.
+
+Two things it deliberately does *not* do:
+
+- **It does not warn when a counter is zero.** A quiet host is a normal host. A box
+  nobody is attacking, whose containers nothing reaches legitimately, will sit at zero
+  for weeks. Warning on that teaches people to ignore the output, and then the real
+  signal goes unread too.
+- **It does not compare against uptime.** The counters reset every time the chain is
+  rebuilt — `install`, `ufw reload`, and the `before.init` hook all do that. Compare
+  against when the firewall was last applied, not when the box last booted.

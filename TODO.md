@@ -17,7 +17,12 @@ Not a rule, but these have real dependencies on each other:
 3. ~~**B6, B7**~~ — **Done**, see *Implemented* below.
 4. ~~**F1 + F2**~~ — **Done**, see *Implemented* below. The machinery exists; **cutting
    the actual `v1.0.0` tag is a decision, not a task**, and is left to the maintainer.
-5. **D3 last** — per-subcommand help, after the new flags exist, or it gets written twice.
+5. ~~**D3 last**~~ — **Done**, see *Implemented* below.
+
+**Everything approved is now done except `B1`**, which needs a deliberate reboot into a
+broken firewall on a real host — a decision about a production box, not a task.
+`tests/cold-boot-check.sh` reduces it to `arm` → `reboot` → `verify` for whenever that
+moment comes.
 
 ---
 
@@ -25,17 +30,7 @@ Not a rule, but these have real dependencies on each other:
 
 | # | | | |
 |---|---|---|---|
-| **X5** | **Three test ports still fail the test-port rule.** The rule, now written into `tests/rules-lib.bash`: *every port in `TEST_PORTS` is a port the suite will delete a rule for, so it must be a port nothing real listens on.* **9100** (node_exporter), **9200** (Elasticsearch HTTP) and **9300** (Elasticsearch transport) fail it. Nothing in this estate runs them, so there is no live breakage — but 8089, 443 and container-port 80 were all *also* fine until the day they were not, and each cost a debugging round trip. Move `collc`'s container port off 9100, `v6svc` off 9200, and the host listener off 9300. Cheap and mechanical; the only care needed is keeping `v6svc` published **1:1**, since the remap trap depends on it. | [verified] | S3 |
-| **H1** | **The nft-incompatible chain condition is handled but not understood.** `rescue` step 3b fires reliably at the end of a full run and has never escaped into a failure — but a fix we do not understand is a fix we cannot rely on, and the first version of its detection was wrong in a way that would have run a destructive teardown on a healthy host. Reproduce minimally (interleave `iptables -F`/`-X` on a ufw chain with a `ufw reload`), find the mechanism in the nft compatibility layer, document it. Free experiment: if 3b never fires on the legacy leg, that localises it to iptables-nft. | [unknown] | S2 |
-| **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced — the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the cold-boot path: all of that is systemd driving the unit on a *running* host, so the boot race is verified by declaration rather than observation. Needs one deliberate reboot into breakage. | [verified] | S2 |
-| **A7** | **`--network host` containers are unaffected, and nothing says so.** Correct behaviour — they traverse `INPUT`, so plain ufw rules govern them — but it is the opposite of what a user of this tool will assume, and they have **no address of their own**, so `-d <ip>` can never target them and `containers` shows nothing to target. Same presentation discipline as X1 (detected, named in `containers` and `status`, documented alongside) but **deliberately different vocabulary**: *"not governed by ufw-docker — host network, plain ufw INPUT rules apply"*, **not** "unsupported". It does not trip the preflight. Reserving "unsupported" for genuinely dangerous cases is what keeps the word worth reading. | [verified] | S3 |
-| **C5** | **Chain counters are not surfaced.** `status --counters` (or fold into `--rules`) showing `DOCKER-USER` packet/byte counts with a one-line interpretation. Value: **"wired but counters flat"** is the cheapest visible signal of the wired-but-filtering-nothing family. Do **not** warn on flat counters — a quiet host is legitimate; show the number and let the operator read it. Update `logging.md`, which currently tells you to run raw `iptables -L -v -n` yourself. | [verified] | S3 |
-| **B5** | **`remove` leaves the binary, undocumented.** Keep that behaviour — reinstall is the likely next step and `rescue` must stay available exactly when you have just unwound the firewall — but **say so** in the preview and the done message, since the preview exists to answer "what remains?". Add `--purge` to also remove the binary, requiring `--force`, orthogonal to `--include-backups` so they compose. **Implementation note:** bash reads a script incrementally, so deleting `$0` mid-run can make it read garbage. Do the `rm` from an `EXIT` trap. | [verified] | S3 |
-| **A10** | **Custom bridge names untested.** Matching is on subnets, never interface names, so it should be irrelevant — but that is reasoning, not measurement. Add `com.docker.network.bridge.name` to the network the per-container test already creates; existing assertions then cover it. ~3 lines, converts [suspected] → [verified] for free. | [suspected] | S3 |
-| **E8** | **Test 12 skips in CI**, so its green/red depends on *where* it runs — the exact shape we spent a day removing. The property is not UISP-specific, and test 22 already creates its own static-IPAM container and asserts survival across recreate **in CI**. Read both, determine the overlap, then either generalise test 12 to create its own container or **retire it as duplicate**. Likely outcome: delete. Removes a skip that makes CI look more thorough than it is. | | S3 |
-| **D3** | **No per-subcommand help.** `remove --help` gives the global block rather than explaining `--force`, `--include-backups`, `--purge`. **Sequence last** — the items above add `--dry-run`, `--rules`, `--counters`, `--unsupported`, `--purge` and the preflight flags, so writing this first means writing it twice. No man page: it fights the single-file design for something `--help` already covers. The dangerous half is already fixed — the usage block is marker-ranged, after a hardcoded line range silently truncated it once. | [verified] | S3 |
-| **X3** | **Document the backend-change procedure.** `ufw-docker remove --force` → switch the alternative → **reboot** (or flush the departing backend's ruleset) → `ufw-docker install`. The reboot is the guaranteed-clean step; `remove` unwinds our stanza but Docker's own chains stay in the old backend, and both are evaluated. X1's mixed-backend check is what catches whoever skips a step — the check and the procedure are two halves of one thing. | | S3 |
-| **X4** | **Document the update process.** `curl` the new file, then re-run `install` — which refreshes all three pieces of installed state (the stanza, `before.init` if tool-managed, the selfheal unit), then reloads and verifies. Worth stating: the `before.init` backup is taken **once only**, so the original is preserved across updates; and the gap between the two commands is safe, because the old stanza keeps working and `status` flags the version mismatch. **The trap:** curl without re-running `install` leaves a new binary enforcing the *old* version's rules. | | S3 |
+| **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced: the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the boot race, which is verified **by declaration rather than observation** — and the only honest way to test a boot race is to boot. **`tests/cold-boot-check.sh` now makes this two commands with a reboot between them** (`arm` → `reboot` → `verify`); it refuses to arm if the unit is not enabled, and refuses to pass if `boot_id` is unchanged. Deliberately not in the suite: nothing should reboot a host as a side effect of running tests. **This is a decision about a production box, not a task** — it needs someone to choose a moment. | [suspected] | S2 |
 
 ---
 
@@ -257,6 +252,61 @@ Not a rule, but these have real dependencies on each other:
   **Not done, deliberately:** no tag has been cut. `VERSION` is still `0.9.0`. Choosing
   when `v1.0.0` happens is the maintainer's call, and `lint-version.sh` will refuse a
   tag that disagrees with the file.
+
+- **A7, A10, B5, C5, D3, E8, X3, X4, X5 — the S3 batch.**
+  - **A7** host-network containers are listed in their own section of `containers`, and
+    counted in `status`. The behaviour was always right; the *presentation* was the bug —
+    they have no address, so they were dropped entirely and you could not see the thing
+    you could not target. The wording is deliberately **"not governed by ufw-docker"**
+    and never "unsupported": these work correctly, and spending that word on something
+    harmless is how it stops being read for Swarm and rootless.
+  - **A10** the per-container test network now takes an explicit
+    `com.docker.network.bridge.name`. Matching is on subnets and never on interface
+    names, so this should change nothing — and now every existing per-container
+    assertion measures that for free. [suspected] → [verified] for one flag.
+  - **B5** `remove` says it leaves the binary (the one question a preview exists to
+    answer), and `--purge --force` deletes it. The `rm` runs from an `EXIT` trap: bash
+    reads a script incrementally, so deleting it mid-run can leave the interpreter
+    reading garbage off the freed inode.
+  - **C5** `status --counters`. It deliberately does **not** warn on a zero — a quiet
+    host is a normal host, and warning on that teaches people to ignore the output.
+  - **D3** per-subcommand help, routed from the **dispatcher** so `remove --help` works
+    without sudo. `lint-functions.sh` now fails if any dispatchable subcommand lacks a
+    help block, so the next one cannot ship without it. Fixed a real lint bug on the
+    way: `grep -oE 'cmd_[a-z_]+'` matched the substring inside `subcmd_help` and
+    demanded a `cmd_help` that was never meant to exist. A lint that invents work is a
+    lint people learn to override.
+  - **E8** the container-recreate test no longer skips in CI. **Triage was wrong here**:
+    it assumed another test already covered recreate and this one could be deleted.
+    Nothing else in the suite recreates a container at all, so deleting it would have
+    removed real coverage. It builds its own static-IPAM container instead, runs
+    everywhere, and now asserts that the *rule still reaches the container* rather than
+    merely that `DOCKER-USER` still has jumps.
+  - **X3 / X4** the backend-change and update procedures are documented in
+    `operations.md`, each with the step people skip: the **reboot** after switching
+    backends (rules left in the old subsystem are still evaluated, and a `DROP` there
+    wins), and **re-running `install`** after curling a new binary (otherwise a new
+    binary enforces the old stanza).
+  - **X5** the last three test ports that named real services — 9100 node_exporter,
+    9200/9300 Elasticsearch — are gone. Every port in `TEST_PORTS` is a port the suite
+    will delete a rule for, so none of them may be one a real service plausibly uses.
+- **H1 — the premise was wrong, and that is the finding.** Step 3b was believed to "fire
+  reliably at the end of every run". It does not: **zero occurrences across four full
+  local suite runs and both CI backends.** The earlier observation came from the
+  *string-matching* detection bug, which also matched a chain that does not exist — and
+  an absent `ufw-user-input` at the end of a run is a perfectly ordinary state. Once the
+  detection was corrected to require "present in nft AND unreadable by iptables", it
+  stopped firing, because the thing it was reporting was never there.
+
+  The genuine condition — a ufw chain expressed in native nft syntax — was observed once,
+  for real, and remains unreproduced. The free experiment the triage proposed (does 3b
+  fire on the legacy leg?) is answered and uninformative: it fires on neither, because it
+  fires nowhere.
+
+  A guard we cannot exercise is a guard we cannot trust, so rather than leave this open,
+  the next real occurrence is now **self-reporting**: 3b writes a syslog line and dumps
+  the nft table into the rescue snapshot before repairing, so whoever hits it has the
+  evidence we currently lack instead of just a repaired host.
 
 ## Fixed while compiling this list
 
