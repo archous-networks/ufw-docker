@@ -34,7 +34,7 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/coverage-shim/sudo; do
+          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/coverage-shim/sudo tests/kcov-summary.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: the operator-rule invariant actually fires
@@ -105,7 +105,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning tests/coverage-shim/sudo ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh
+        run: shellcheck -S warning tests/coverage-shim/sudo tests/kcov-summary.sh ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh
 
       - name: Record this job's result for the README table
         if: always()
@@ -588,7 +588,7 @@ jobs:
           HOST_IP=$(ip -4 -br addr show scope global | awk 'NR==1{print $3}' | cut -d/ -f1)
           sudo env PATH="$PWD/tests/coverage-shim:$PATH" HOST_IP="$HOST_IP" kcov \
             --include-pattern=ufw-docker \
-            --exclude-pattern=.bats,/tests/,/docs/ \
+            --exclude-pattern=.bats,/tests/,/docs/,ufw-docker-prev \
             --bash-dont-parse-binary-dir \
             "$RUNNER_TEMP/cov" tests/run.sh --tap 2>&1 | tail -40 || true
 
@@ -605,8 +605,22 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/result"
           json="$(find "$RUNNER_TEMP/cov" -name coverage.json 2>/dev/null | head -1)"
-          tot=0
-          [ -n "$json" ] && tot=$(grep -o '"total_lines"[^,}]*' "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
+
+          # Read THE TOOL'S OWN entry, not the report's aggregate.
+          #
+          # The upgrade test writes the previous revision to a temp file, and
+          # --include-pattern=ufw-docker matched that too -- so the report
+          # carried two files and the aggregate blended them. `tail -1` then
+          # picked the aggregate, publishing "57.79% (1065 of 1843)" when the
+          # tool's real figure was 78.84% (734 of 931). Not a false green, but
+          # a wrong number presented with the same confidence as a right one.
+          #
+          # The exclude-pattern above now keeps that copy out; selecting the
+          # entry by filename as well means a second file appearing for any
+          # other reason cannot silently move the number again.
+          pct=""; cov=""; tot=0
+          [ -n "$json" ] && read -r pct cov tot < <(tests/kcov-summary.sh "$json")
+          tot="${tot:-0}"
 
           # ZERO EXECUTABLE LINES IS NOT ZERO PERCENT COVERAGE -- it is no
           # measurement at all, and the first run published it as a green tick
@@ -615,13 +629,11 @@ jobs:
           # this table exists to prevent, committed by the table itself.
           if [ -z "$json" ] || [ "${tot:-0}" -eq 0 ]; then
             why="kcov produced no report"
-            [ -n "$json" ] && why="kcov attributed 0 executable lines -- it could not trace the tool"
+            [ -n "$json" ] && why="kcov attributed 0 executable lines to ufw-docker -- it could not trace the tool"
             echo "COVERAGE UNAVAILABLE: $why"
             printf 'coverage\tline coverage of ufw-docker\t-\t%s\t%s\tskip\t%s\n' \
               "$COV_RUNNER" "$(uname -r)" "$why" > "$RUNNER_TEMP/result/coverage.tsv"
           else
-            pct=$(grep -o '"percent_covered"[^,]*' "$json" | tail -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-            cov=$(grep -o '"covered_lines"[^,]*' "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
             echo "coverage: ${pct}% (${cov}/${tot} executable lines)"
             printf 'coverage\tline coverage of ufw-docker\t-\t%s\t%s\tpass\t%s%% (%s of %s executable lines)\n' \
               "$COV_RUNNER" "$(uname -r)" "${pct:-?}" "${cov:-?}" "$tot" > "$RUNNER_TEMP/result/coverage.tsv"
