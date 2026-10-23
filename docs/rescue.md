@@ -90,7 +90,7 @@ with the command to remove it.
 |---|---|
 | 1 | restore SSH (above) — **before** any cleanup, so a later failure still leaves you in |
 | 2 | strip the stanza from `after.rules` / `after6.rules` |
-| 3 | reset `DOCKER-USER` to a single `RETURN` — releases the chain references that block ufw's rebuild |
+| 3 | reset `DOCKER-USER` to a single `RETURN` — releases the chain references that block ufw's rebuild. That was Docker's own stock content up to Docker 28; **29 creates the chain empty**, so on 29 this leaves one rule where there were none. Behaviourally identical, since an empty chain falls through |
 | 3b | nft fallback, below |
 | 4 | tear ufw's chains down |
 | 5 | rebuild with `ufw enable`, which repopulates from `user.rules` |

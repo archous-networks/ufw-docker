@@ -57,7 +57,7 @@ above is the evidence.
 
 | host | distro | ufw | backend | docker | how we know |
 |---|---|---|---|---|---|
-| dev-00 | Debian 12 | 0.36.2 | nf_tables | 29.7.1 | full suite on demand, plus a verified cold boot |
+| dev-00 | Debian 12 | 0.36.2 | nf_tables | 29.7.1 | full suite on demand — 52/52, host state restored exactly — plus a verified cold boot, which is the one thing CI cannot do |
 | site-00 | Debian 12 | 0.36.2 | nf_tables | 29.9.2 | `tools/ufw-docker-survey` only |
 
 > An earlier version of this page had both of those **in the matrix**, as two rows with

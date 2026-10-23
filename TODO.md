@@ -23,6 +23,12 @@ Not a rule, but these have real dependencies on each other:
 [FUTURE.md](FUTURE.md), reviewed and deliberately deferred, each with what would bring
 it forward.
 
+Since then, **X2 has also been pulled forward out of FUTURE.md and completed** — the
+real CI matrix. Ten legs, each running the whole suite inside an actual Debian or Ubuntu
+release on both iptables backends. It found three genuine bugs on its first run, all of
+them only visible on an old or a very new environment; see FUTURE.md's X2 entry, which
+is kept rather than deleted because its *limitations* section is still live.
+
 ---
 
 ## The list
@@ -161,8 +167,8 @@ it forward.
   while every "should be BLOCKED" one passed, and why tests 1/10/18/38 kept proving the
   stanza was written correctly the whole time. `nft flush ruleset` after the switch
   gives a genuinely single-backend host: the leg now reports legacy=12 rules, nft=0, and
-  **44/44 green** (run 39868550084). Legacy is now a `supported` row with that run named
-  as its evidence.
+  **44/44 green** (run 39868550084). Legacy became a `supported` row with that run named
+  as its evidence — and is now five rows, one per distro, each with its own leg.
 
   Two things found on the way. A failing test left `before.init` customised and turned
   one failure into six, so that test now hands its backup to `teardown` *before* breaking

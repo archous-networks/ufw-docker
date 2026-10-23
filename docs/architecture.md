@@ -23,7 +23,10 @@ internet ──▶ PREROUTING (DNAT: 203.0.113.1:443 → 172.18.251.3:443)
 ## What we insert
 
 `DOCKER-USER` is Docker's documented hook: it runs **first** in `FORWARD`, and Docker
-creates it but never writes to it. We fill it in:
+creates it but never writes rules of its own into it. (Up to Docker 28 it seeded the
+chain with a single `-j RETURN`; **Docker 29 leaves it genuinely empty**. Same effect —
+an empty chain falls through — but do not key anything on finding that RETURN.) We fill
+it in:
 
 ```
 DOCKER-USER

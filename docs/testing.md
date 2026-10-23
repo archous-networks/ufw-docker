@@ -181,8 +181,20 @@ state is **per network namespace**, and the container has its own — so a leg e
 flushing chains and restarting a daemon is confined to it. Verified by running
 `ufw-docker status` on the development host mid-leg: healthy and unchanged throughout.
 
-The two things that *are* host-wide are named above: the `nf_log_all_netns` sysctl, which
-is set and restored, and the kernel ring buffer, which is read-only here.
+Three things *are* host-wide, because they are not namespaced, and all three are named
+rather than left to be discovered:
+
+| | |
+|---|---|
+| `net.netfilter.nf_log_all_netns` | set to 1, **restored** afterwards |
+| kernel modules (`ip_tables`, `ip6_tables`, …) | loaded on the host, **not unloaded**. A container has no `/lib/modules` for the running kernel, so it cannot load them itself, and ufw's `enable` dies without them. Unloading a module something else may be using is a real risk, and an unused table holds no rules, so it cannot change how anything is filtered |
+| the kernel ring buffer | read only |
+
+> The module one is worth dwelling on. It did not fail locally and failed every legacy
+> leg in CI — because the development host already had `ip_tables` and `ip6_tables`
+> loaded for its **own** ufw, so every local leg inherited a kernel that happened to be
+> ready. "Works on the dev host" was load-bearing and completely invisible until a
+> machine without that history ran the same script.
 
 ### A fourth trap, and the most interesting one
 
