@@ -56,8 +56,19 @@ Two things there are still host-wide, because they are not namespaced:
 - the kernel ring buffer, which a leg reads. Two legs on one machine can pass on each
   other's log lines, which is why the script takes `/var/lock/ufw-docker-leg`.
 
-What a container cannot give you is a **cold boot** or the distro's **own kernel**. For
-those, a real host and `tests/cold-boot-check.sh`.
+After the suite, the same script runs three phases bats cannot: concurrency
+(`leg-load.sh`), a rootless daemon beside the rootful one (`leg-rootless.sh`), and an
+**init boot** (`leg-coldboot.sh` — a leg runs systemd as pid 1, so `docker restart`
+re-runs every unit and re-evaluates ordering). They are skipped loudly if the suite
+failed. `LEG_PHASES=coldboot` narrows them.
+
+What a container cannot give you is the distro's **own kernel**, or a real machine
+starting — no initramfs, no module load, no NIC. For those, a real host and
+`tests/cold-boot-check.sh`.
+
+> If you write a "did we reboot?" check, **do not use `boot_id`**. It belongs to the
+> runner's kernel and never changes across a container restart, so the assertion passes
+> forever while testing nothing. Use a marker in `/run`, which is a `--tmpfs`.
 
 ## Verifying a filter actually filters
 

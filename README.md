@@ -139,7 +139,14 @@ never been verified. Two kinds of check:
   that something actually proved. See [supported.md](docs/supported.md), or run
   `ufw-docker platforms`.
 - **mechanism checks**, regardless of platform — rules present in *both* iptables
-  backends, Docker Swarm, rootless Docker, or ufw's files not where ufw says they are.
+  backends, Docker Swarm, a rootless-only daemon, a `DOCKER-USER` that `FORWARD` does
+  not reach, ufw's files not where ufw says they are, or **Docker's nftables firewall
+  backend**, in which there is no `DOCKER-USER` chain at all and nothing this tool
+  writes would ever be consulted.
+
+  A rootless daemon running *alongside* a rootful one is not a refusal: the rootful
+  daemon is wired normally, and `status` names the rootless one so nobody reads an
+  empty container table as an empty host.
 
 The refusal exists because the failure it prevents is **silent** — `install` would
 succeed, `status` would report everything wired, and nothing would be filtered.

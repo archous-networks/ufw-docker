@@ -151,6 +151,26 @@ forward_reaches_docker_user() {   # $1 = iptables|ip6tables
     "$1" -S FORWARD 2>/dev/null | grep -q -- '-j DOCKER-USER'
 }
 
+# Docker's own firewall backend, as reported by `docker info`. Empty on any
+# daemon older than API 1.49, which simply predates the field -- and predates
+# the nftables backend too, so empty is the right answer there.
+docker_firewall_backend() {
+    docker info --format '{{if .FirewallBackend}}{{.FirewallBackend.Driver}}{{end}}' 2>/dev/null
+}
+
+# Empty when the backend is one this tool can work with; otherwise the name of
+# the one it cannot. Split out from preflight so the classification can be
+# tested against synthetic values -- there is no way to stand up an nftables
+# backend in CI, and an untested branch on a refusal path is how a tool starts
+# refusing hosts that were fine.
+unsupported_firewall_backend() {
+    local fwb; fwb="$(docker_firewall_backend)"
+    case "$fwb" in
+        ""|iptables|iptables-legacy|iptables-nft) ;;
+        *) printf '%s\n' "$fwb" ;;
+    esac
+}
+
 preflight() {
     PF_FAILED=""; PF_DETAIL=""
 
@@ -194,7 +214,31 @@ preflight() {
             "not supported — run a rootful daemon, or see docs/caveats.md" ;;
     esac
 
-    # 5. Is the chain we are about to fill actually reachable? Gated on Docker
+    # 5. Docker's own firewall backend. READ THE SOURCE BEFORE CHANGING THIS.
+    #
+    #    Docker is growing a native nftables backend (`"firewall-backend":
+    #    "nftables"` in daemon.json, reported by `docker info` as
+    #    FirewallBackend.Driver since API 1.49). In that mode there is NO
+    #    DOCKER-USER chain at all. moby's own setupUserChains() opens with:
+    #
+    #        // There's no equivalent to DOCKER-USER in the nftables implementation.
+    #        if nftables.Enabled() { return }
+    #
+    #    so the chain is never created, FORWARD never jumps to it, and every
+    #    rule this tool writes would sit in a chain that does not exist. The
+    #    whole design rests on DOCKER-USER; this is the one setting that
+    #    removes it.
+    #
+    #    Check 6 below would catch the symptom -- no FORWARD jump -- but it
+    #    would report it as "something flushed FORWARD", which sends an
+    #    operator looking for a third-party firewall that is not there. Name
+    #    the cause.
+    local fwb; fwb="$(unsupported_firewall_backend)"
+    [ -z "$fwb" ] || pf_fail firewall-backend \
+        "Docker's firewall backend is '$fwb', not iptables; there is no DOCKER-USER chain in that mode" \
+        "this tool cannot work here — set '\"firewall-backend\": \"iptables\"' in daemon.json, or see docs/caveats.md"
+
+    # 6. Is the chain we are about to fill actually reachable? Gated on Docker
     #    being up, because a stopped daemon has no FORWARD jump and that is not
     #    a misconfiguration -- there is simply nothing to govern yet.
     if docker info >/dev/null 2>&1 && ! forward_reaches_docker_user iptables; then
@@ -203,8 +247,8 @@ preflight() {
             "Docker creates that jump; '\"iptables\": false' in daemon.json disables it, as does a third-party firewall flushing FORWARD"
     fi
 
-    # 6. Is this platform one anything has actually proven? Deliberately last,
-    #    because the four checks above name a MECHANISM that is known to break,
+    # 7. Is this platform one anything has actually proven? Deliberately last,
+    #    because the five checks above name a MECHANISM that is known to break,
     #    while this one only says "nobody has tried this combination". Both
     #    refuse, but the failures above are the ones worth reading first.
     local mstat; mstat="$(matrix_status)"
@@ -535,8 +579,26 @@ UNIT
         && ok "self-heal service installed and enabled" \
         || warn "self-heal service written but could not be enabled"
 
+    # Not fatal -- the firewall this run just wrote is correct either way. But
+    # the unit is dead until the binary is there, so say what fixes it rather
+    # than only that it is wrong. `status` now re-reports this every run; it
+    # used to be mentioned here once and never again.
     [ -x /usr/local/sbin/ufw-docker ] \
-        || warn "the unit calls /usr/local/sbin/ufw-docker, which is not installed there yet"
+        || warn "the unit calls /usr/local/sbin/ufw-docker, which is not there yet — it
+    will FAIL at every boot until it is:
+        sudo install -m 0755 $0 /usr/local/sbin/ufw-docker"
+}
+
+# Which binary does the installed unit actually call? Read it out of the unit
+# rather than assuming /usr/local/sbin/ufw-docker, so an operator who edited
+# the path still gets a true answer.
+#
+# systemd allows ExecStart=-/path, @/path and a few other prefix characters;
+# strip them, then take the first word.
+selfheal_execstart() {
+    [ -f "$SELFHEAL_UNIT" ] || return 1
+    sed -n 's/^ExecStart=//p' "$SELFHEAL_UNIT" 2>/dev/null \
+        | head -1 | sed 's/^[-@:+!]*//' | awk '{print $1}'
 }
 
 remove_selfheal() {
@@ -588,6 +650,61 @@ nonbridge_networks() {
         docker network inspect "$id" --format \
             '{{if and (ne .Driver "bridge") (ne .Driver "null") (ne .Driver "host")}}{{.Name}}|{{.Driver}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}{{end}}' 2>/dev/null
     done | grep -E '\|' | sort -u
+}
+
+# Rootless Docker daemons on this host (A9). Two signals, because either on its
+# own misses a real case: the conventional socket under $XDG_RUNTIME_DIR, and a
+# dockerd that simply is not running as root.
+#
+# WHAT A ROOTLESS PUBLISHED PORT ACTUALLY IS, because it changes the advice:
+# it is a USERSPACE listener owned by that user on the host, not a DNAT. So the
+# traffic arrives on INPUT, exactly like any host service -- it never reaches
+# FORWARD, never reaches DOCKER-USER, and nothing this tool writes applies to
+# it. Measured, not reasoned: a rootless container publishing 18099 showed ZERO
+# matching rules in iptables-save, and `ufw deny 18099/tcp` blocked it outright.
+#
+# So these containers are not unprotected. They are protected by ordinary ufw,
+# under the ordinary default policy -- which is the opposite of the bridge
+# containers this tool governs, and worth saying out loud rather than leaving
+# an operator to assume `ufw-docker status` covered everything on the box.
+rootless_daemons() {
+    local s uid name seen=""
+    for s in /run/user/*/docker.sock; do
+        [ -S "$s" ] || continue
+        uid="${s#/run/user/}"; uid="${uid%/docker.sock}"
+        name="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)"
+        name="${name:-uid $uid}"
+        seen="$seen $name"
+        printf '%s|%s\n' "$name" "$s"
+    done
+    # The process scan is the fallback, for a host whose XDG_RUNTIME_DIR is not
+    # under /run/user. It needs two filters, and the second one is not optional.
+    #
+    #   1. Skip a user the socket scan already found, or every rootless daemon
+    #      is reported twice -- once per signal -- and reads as two daemons.
+    #
+    #   2. Skip any dockerd in a DIFFERENT PID NAMESPACE. A container's
+    #      processes are visible in the host's `ps`, so a nested rootless
+    #      dockerd -- this project's own test legs, DinD, CI build agents --
+    #      made the HOST report a rootless daemon it does not have. Caught on
+    #      the development box, which reported `rspaeth` while the daemon in
+    #      question was three layers down inside a test container.
+    #
+    # Comparing against /proc/1 is what makes that precise: inside a container
+    # /proc/1 is that container's init, so a genuinely local rootless daemon is
+    # still found there. Where the readlink is not permitted -- `status` run
+    # unprivileged against another user's process -- we report nothing rather
+    # than guess, and the socket scan above still stands.
+    local selfns; selfns="$(readlink /proc/1/ns/pid 2>/dev/null)"
+    local pid u pns
+    ps -eo user:32,pid,args 2>/dev/null \
+        | awk '$1 != "root" && /[d]ockerd/ { print $1 " " $2 }' \
+        | while read -r u pid; do
+            case " $seen " in *" $u "*) continue ;; esac
+            pns="$(readlink "/proc/$pid/ns/pid" 2>/dev/null)" || continue
+            [ -n "$pns" ] && [ "$pns" = "$selfns" ] || continue
+            printf '%s|(dockerd running as this user; socket not under /run/user)\n' "$u"
+        done | sort -u
 }
 
 # Build the stanza for one family. The chain names differ (ufw-user-input vs
@@ -1290,6 +1407,21 @@ cmd_containers() {
     say "'dynamic' addresses change when the container is recreated, and a rule"
     say "written against one will then match nothing. Pin with Docker IPAM."
 
+    local rootless; rootless="$(rootless_daemons)"
+    if [ -n "$rootless" ]; then
+        head_ "rootless Docker daemon(s) — their containers are NOT listed above"
+        printf '%s' "$rootless" | awk -F'|' '{printf "    %s  %s\n", $1, $2}'
+        say ""
+        say "This tool talks to the rootful daemon only, so nothing a rootless"
+        say "daemon runs appears in the table above — however many ports it"
+        say "publishes. Ask that daemon directly:"
+        say "    sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid> docker ps"
+        say ""
+        say "Their published ports are userspace listeners on the host, so they"
+        say "arrive on INPUT and your ORDINARY ufw rules govern them — by the"
+        say "PUBLISHED port, and under ufw's default policy."
+    fi
+
     local hostnet; hostnet="$(host_net_containers)"
     if [ -n "$hostnet" ]; then
         head_ "on the HOST network — not governed by ufw-docker"
@@ -1482,6 +1614,46 @@ cmd_status() {
         st before-init bad "before.init hook MISSING — 'ufw reload' WILL break the firewall"; rc=1
     fi
 
+    # Can the thing that repairs this host unattended actually run?
+    #
+    # `install` warns ONCE, at install time, when the binary is not at the path
+    # the unit names -- and then nothing ever mentioned it again. A host in that
+    # state printed every check green, including "DOCKER-USER is reached from
+    # FORWARD", while the unit failed at every single boot.
+    #
+    # Verified by restarting a leg container's init with the binary absent from
+    # /usr/local/sbin: unit `failed`, DOCKER-USER left at 0 jumps, status all
+    # green. That is the same shape as the two false greens fixed before it --
+    # a health report that is cheerful about a mechanism that cannot run.
+    if [ -f "$SELFHEAL_UNIT" ]; then
+        local sh_bin sh_en
+        sh_bin="$(selfheal_execstart)"
+        sh_en="$(systemctl is-enabled ufw-docker-selfheal.service 2>/dev/null || true)"
+        if [ -n "$sh_bin" ] && [ ! -x "$sh_bin" ]; then
+            st selfheal bad \
+                "the self-heal unit calls $sh_bin, which is NOT executable — it fails at EVERY boot" \
+                "Nothing repairs this host unattended. Put the tool where the unit expects it:
+    sudo install -m 0755 $0 $sh_bin"
+            rc=1
+        elif [ "$sh_en" != enabled ]; then
+            st selfheal bad \
+                "the self-heal unit is installed but NOT enabled (${sh_en:-unknown}) — it will not run at boot" \
+                "Enable it, or remove it with 'ufw-docker install --no-selfheal' so nothing
+    implies a recovery that is not there:
+    sudo systemctl enable ufw-docker-selfheal.service"
+            rc=1
+        elif systemctl is-failed --quiet ufw-docker-selfheal.service 2>/dev/null; then
+            st selfheal warn \
+                "the self-heal unit is in a FAILED state — its last run did not complete" \
+                "journalctl -u ufw-docker-selfheal.service -b"
+        else
+            st selfheal ok "self-heal unit enabled, and $sh_bin is executable"
+        fi
+    else
+        st selfheal info \
+            "no self-heal unit — nothing repairs this host unattended (re-run install without --no-selfheal to add it)"
+    fi
+
     # Does our logging agree with ufw's? The stanza bakes in whatever ufw's
     # setting was at install time, so the two drift the moment somebody runs
     # `ufw logging on|off` without re-running install. Silent drift in a logging
@@ -1556,6 +1728,27 @@ cmd_status() {
             "$(printf '%s' "$nbn" | sed 's/|/  /g; s/^/    /')
     A macvlan or ipvlan container talks to the LAN directly, so NO rule on
     this host applies to it — not ufw's and not ours. Filter it upstream."
+    fi
+
+
+    # A9. Silence here is the whole problem: `containers` printed an EMPTY
+    # table on a host with a rootless container publishing a port, and `status`
+    # said nothing at all. The operator's reasonable reading of that is "this
+    # box exposes nothing", which was false.
+    local rl; rl="$(rootless_daemons)"
+    if [ -n "$rl" ]; then
+        st rootless warn \
+            "rootless Docker daemon(s) here — this tool does NOT govern them:" \
+            "$(printf '%s' "$rl" | awk -F'|' '{printf "    %s  %s\n", $1, $2}')
+    A rootless published port is a userspace listener on the host, so its
+    traffic arrives on INPUT and never reaches DOCKER-USER. Nothing in the
+    stanza applies to it.
+
+    That is not a hole -- plain 'ufw allow|deny <port>' DOES govern these.
+    Two differences from the containers above, both easy to get wrong:
+      - name the PUBLISHED port, not the container port
+      - ufw's DEFAULT policy applies to them, so on a default-allow host
+        they are OPEN while the bridge containers stay default-deny"
     fi
 
     local nhost; nhost="$(host_net_containers | grep -c . || true)"

@@ -8,30 +8,58 @@ just a way of never deciding.
 
 ---
 
-## H2 · Is Docker's preservation of `DOCKER-USER` contractual, or incidental?
-**S1 · [unknown] · needs a full investigation, not a drive-by note**
+## H2 · Is Docker's preservation of `DOCKER-USER` contractual? — **ANSWERED**
+**S1 · [verified, from moby's source] · resolved 2026-10-23**
 
-The whole design rests on Docker not clobbering a populated `DOCKER-USER`. Empirically it
-holds, and it has been tested harder than most things here: 100 samples at 0.5s across a
-daemon restart (always 3 jumps, never 0), survives a cold boot, a container recreate,
-`ufw reload`, and `ufw disable`/`enable`.
+Answered by reading moby rather than by another experiment. `setupUserChain()` in
+`daemon/libnetwork/firewall_linux.go` (and `libnetwork/firewall_linux.go` before the
+tree was reorganised) carries this, in moby's own words:
 
-What is unknown is whether Docker **guarantees** it or we are leaning on an implementation
-detail. "Documented as the place to put your rules" is not the same as "guaranteed to be
-preserved by every future daemon".
+```go
+// This chain allows users to configure firewall policies in a way that
+// persist daemon operations/restarts. The daemon does not delete or modify
+// any pre-existing rules from the DOCKER-USER filter chain.
+//
+// Once the DOCKER-USER chain is created, the daemon does not remove it when
+// IPTableForwarding is disabled, because it contains rules configured by user
+// that are beyond the daemon's control.
+```
 
-**Why deferred, not dismissed:** the mitigation already exists and is tested — self-heal
-detects exactly this state (stanza installed, `DOCKER-USER` unwired) and reloads. So the
-blast radius is "unfiltered until the next boot or self-heal run", not "unfiltered
-forever". This is about knowing how much to trust it, not about changing behaviour.
+**That is a stated intent, not an accident**, and the code matches it. Checked at
+v26.1.4, v28.0.0 and master:
 
-**Scope when it happens:** read Docker's source for how `DOCKER-USER` is created and what
-may flush it, pin the finding to a version, and state plainly whether it is a guarantee or
-an implementation detail. The answer may legitimately be "still not guaranteed, but here is
-the code path and here is what would have to change."
+| call | what it actually does | consequence for us |
+|---|---|---|
+| `NewChain(userChain, Filter)` | `-n -L` first; `-N` only if absent | **never flushes.** A populated chain survives. |
+| `AddReturnRule(userChain)` | appends `-j RETURN` if no bare `-j RETURN` exists | appends at the END, after our rules. Harmless — and **gone in master**, which is why Docker 29 creates the chain empty. |
+| `EnsureJumpRule("FORWARD", userChain)` | if the jump exists, `-D` it, then `-I` at position 1 | **deletes and re-inserts on every daemon start and every firewall reload.** Guarantees `DOCKER-USER` is first in FORWARD; also means a brief window where it is absent. |
 
-**Brings it forward:** any observed instance of `DOCKER-USER` being emptied in the wild, or
-a Docker major release that touches chain management.
+So: preserved by design, re-hooked at the top on every reload, and documented as such in
+the source. The tool's self-heal and reachability checks remain correct mitigations —
+not for Docker clobbering the chain, which it does not do, but for the window above and
+for third parties.
+
+### The real finding, which is worse and was not the question
+
+Docker is growing a **native nftables backend**. `setupUserChains()` on master opens:
+
+```go
+// There's no equivalent to DOCKER-USER in the nftables implementation.
+if nftables.Enabled() { return }
+```
+
+With `"firewall-backend": "nftables"` in `daemon.json` **there is no `DOCKER-USER` chain
+at all** — never created, never jumped to. The entire design is inert, and `status` would
+have reported it as "something flushed FORWARD".
+
+Now a **preflight refusal** naming the backend, read from `docker info`'s
+`FirewallBackend.Driver` (API ≥ 1.49; empty on older daemons, which is correct — they
+predate the backend). Classification is covered by `tests/firewall-backend-selftest.sh`,
+as pure logic: the refusal path cannot be exercised in a leg, and an untested refusal
+path is how a tool starts refusing hosts that were fine.
+
+**New standing item:** if Docker ever makes nftables the default backend, this tool needs
+a second implementation, not a patch. Watch the default, not the feature.
 
 ---
 
@@ -72,22 +100,35 @@ does not give name-based rules, only drift detection after the fact.
 
 ---
 
-## A9 · Rootless Docker
-**S2 · [suspected] · potential**
+## A9 · Rootless Docker — **DONE**, and the expectation was half wrong
+**S2 · [verified] · closed 2026-10-23**
 
-Rootless Docker uses slirp4netns or pasta in a user namespace; port forwarding happens in
-userspace and host netfilter largely does not see it. Expected — **but not verified** — to
-fail visibly, because `require_docker` would not find the socket (`$XDG_RUNTIME_DIR`).
+Stood up for real: a rootless daemon beside a rootful one in a Debian 12 leg, publishing
+a port, asserted on every push by `tests/leg-rootless.sh`.
 
-**The case that would be bad:** rootless running *alongside* a rootful daemon, where
-`require_docker` finds the rootful socket, wires happily, and the rootless containers are
-neither protected nor mentioned.
+This entry predicted "the rootless containers are neither protected nor mentioned". One
+half held, the other did not, and the wrong half changes the advice:
 
-**Why deferred:** not believed to be anywhere in the estate; it is a developer-laptop and
-shared-hosting pattern, not ISP infrastructure. `caveats.md` states it as untested and
-almost certainly unsupported, so nothing implies it works. X1 will refuse on it.
+- **"not protected" — false.** A rootless published port is a *userspace listener on the
+  host*, not a DNAT. Its traffic arrives on `INPUT`, so ordinary ufw governs it.
+  Measured: zero rules in `iptables-save` mention the port, and `ufw deny <port>` blocks
+  it outright.
+- **"not mentioned" — true, and that was the actual defect.** `ufw-docker containers`
+  printed an EMPTY table on a host with a rootless container publishing a port, and
+  `status` said nothing at all. Someone auditing exposure with this tool read that as
+  "nothing is listening here".
 
-**Brings it forward:** a survey result showing rootless anywhere.
+`status` and `containers` now name any rootless daemon and say which rules do govern it,
+including the two traps: it is the **published** port, not the container port, and ufw's
+**default policy** applies to them where it does not to bridge containers.
+
+Detection takes two signals — a socket under `/run/user/*/`, and a non-root `dockerd`.
+The second needs a PID-namespace filter: a container's processes are visible in the
+host's `ps`, so a nested rootless daemon made the HOST claim one. Caught on the
+development box, which reported `rspaeth` while the daemon was inside a test container.
+
+Still refused: a **rootless-only** host, where nothing published traverses `DOCKER-USER`
+and there is nothing for the stanza to do.
 
 ---
 
@@ -121,7 +162,7 @@ live, and because the kernel caveat below is a standing limitation, not a finish
 |---|---|
 | iptables-legacy | **done.** A11 green; evidenced by run 39868550084, and now by a `legacy` leg per distro |
 | Debian 10 / 11 / 12, Ubuntu 22.04 / 24.04 | **done.** `tests/container-leg.sh`, run per distro × backend on every push |
-| rootless Docker | A9 above — still open |
+| rootless Docker | **done** — A9 above; a rootless daemon beside a rootful one, per push |
 | Swarm | closed as out of scope — see `caveats.md` |
 
 ### What it turned out to cost
@@ -143,20 +184,41 @@ It paid for itself the same day, on the oldest leg:
 - **iptables 1.8.2 prints `-p 6`, not `-p tcp`.** Anything matching rule text by protocol
   name reads an old host as having no rule.
 
-### The standing limitation: the kernel is always the runner's
+### Two of the three standing limitations are now closed
+
+This section used to list three things a leg could not cover: the kernel, cold boot and
+real load. Two of them turned out to be assumptions rather than limits.
+
+**Cold boot — now per push.** A leg runs systemd as pid 1, so `docker restart` is a
+genuine init boot: every unit re-runs, ordering is re-evaluated, `/run` is a fresh
+tmpfs. `tests/leg-coldboot.sh` arms the same saboteur `cold-boot-check.sh` uses —
+ordered `After=docker.service Before=ufw-docker-selfheal.service` — restarts the init,
+and asserts the unit saw the broken chain and repaired it.
+
+What it still does not cover, and the script says so in its header: there is **no kernel
+boot**. `/proc/sys/kernel/random/boot_id` is the runner's and does not change, which is
+exactly why the freshness signal is `/run` and not `boot_id` — the obvious check would
+have passed forever while testing nothing. No initramfs, no module load, no real NIC, so
+anything depending on `network-online.target` against hardware is still untested.
+`tests/cold-boot-check.sh` on real hardware remains the real thing.
+
+**Real load — now per push.** `tests/leg-load.sh`, deliberately not a benchmark: a
+throughput number from a container on a shared runner is noise, and a test that fails on
+a busy runner teaches people to re-run until green. It asserts **correctness under
+concurrency**, which is deterministic — 200 concurrent connections against a DENY must
+all be refused, 200 against an ALLOW must all succeed, and the rule set must be
+byte-identical afterwards. One leaked connection is a failure, and a leak is precisely
+what a conntrack or ordering bug looks like: invisible one connection at a time.
+
+### The one that is still open: the kernel is always the runner's
 
 A leg is that distro's **userspace** on whatever kernel the runner boots. `debian:10`
 is Debian 10 tooling on a 6.x kernel, not the 4.19 a real Debian 10 box runs. A failure
 that needs the distro's own kernel is not caught, and no amount of containers fixes it.
 
-Also not covered, and listed so nobody assumes otherwise: **cold boot** (the self-heal
-unit's entire purpose, still `tests/cold-boot-check.sh` on real hardware, still manual)
-and **real load** (a leg is a clean room; the development host runs sixteen containers
-and a live UISP stack).
-
-**What would close the kernel gap:** real VMs per distro — self-hosted runners or a
-nested-virt provider. Deferred again, and now a much smaller gap than it was: everything
-reachable without a distro kernel is already covered per push.
+**What would close it:** real VMs per distro — self-hosted runners or a nested-virt
+provider. Not prototypable on the development host, which has no `/dev/kvm`. Deferred
+again, and now the only gap of the three.
 
 ---
 

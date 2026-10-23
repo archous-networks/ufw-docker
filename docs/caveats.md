@@ -72,8 +72,10 @@ service, so your ORDINARY ufw rules already govern them —
 ```
 
 **Note the wording, which is deliberate: "not governed by ufw-docker", never
-"unsupported".** These containers work correctly. Swarm, rootless Docker and a mixed
-iptables backend are *unsupported* — the preflight refuses to install on them. Spending
+"unsupported".** These containers work correctly. Swarm, a rootless-ONLY daemon, Docker's
+nftables firewall backend and a mixed iptables backend are *unsupported* — the preflight
+refuses to install on them. (A rootless daemon alongside a rootful one is a third case:
+supported, and now named in `status` — see below.) Spending
 that word on something harmless is exactly how it stops being read in the cases where it
 means real danger, so host-network containers do **not** trip the preflight.
 
@@ -129,8 +131,9 @@ Worth running `status` from cron for exactly this reason.
 
 ## The untested cases below are now REFUSED, not merely documented
 
-Everything in this file used to be a caveat you had to read. Swarm, rootless Docker, a
-mixed iptables backend, ufw's files not being where ufw says, and any platform the
+Everything in this file used to be a caveat you had to read. Swarm, a rootless-only
+daemon, **Docker's nftables firewall backend**, a mixed iptables backend, a `DOCKER-USER`
+that `FORWARD` does not reach, ufw's files not being where ufw says, and any platform the
 matrix does not cover are now **preflight failures**: `install` refuses, and `status`
 reports them on every run. A caveat in a document protects nobody who has not read it.
 
@@ -208,7 +211,59 @@ If you need Swarm, verify it yourself on a disposable host with the probe matrix
 [testing.md](testing.md) before trusting any of it. Treat a pass as evidence about your
 Docker version and topology, not as support.
 
-## Rootless Docker is untested
+## Rootless Docker — tested now, and the expectation was half wrong
 
-Rootless Docker uses slirp4netns, not these chains. Almost certainly unsupported; nothing
-here has been run against it.
+This used to say "almost certainly unsupported; nothing here has been run against it."
+It has been run against it now: a real rootless daemon stood up beside a rootful one in
+a Debian 12 leg, publishing a port, on every push (`tests/leg-rootless.sh`).
+
+**A rootless published port is a userspace listener on the host, not a DNAT.** That one
+fact decides everything else:
+
+| | |
+|---|---|
+| does its traffic reach `DOCKER-USER`? | **No.** It arrives on `INPUT`, like any host service. Measured: zero rules in `iptables-save` mention the published port. |
+| is it therefore unprotected? | **No** — and this is where the old guess was wrong. Ordinary ufw governs it. `ufw deny 18099/tcp` blocks it outright; verified both ways in the leg. |
+| does this tool govern it? | **No.** Nothing in the stanza applies. |
+| did this tool *say* so? | **It did not, and that was the real defect.** `ufw-docker containers` printed an EMPTY table on a host with a rootless container publishing a port, and `status` was silent. An operator auditing exposure with this tool got a clean bill of health for an open port. |
+
+`status` and `containers` now both name any rootless daemon they find, and say which
+rules do govern it. Two differences from the bridge containers this tool exists for, and
+both are easy to get backwards:
+
+- **name the PUBLISHED port**, not the container port — the exact opposite of the rule
+  for a bridge container, where `-p 8443:443` means you write `ufw allow 443`;
+- **ufw's default policy applies to them.** Bridge containers are default-deny whatever
+  the host policy says, because our jump enters `ufw-user-input` directly. Rootless ports
+  are not. On a `default allow incoming` host the two behave oppositely.
+
+A **rootless-only** host is still a preflight refusal: `docker info` reports rootless, no
+published port traverses `DOCKER-USER`, and there is nothing for the stanza to do. What
+is newly handled is the mixed case — rootless *alongside* rootful — where the tool wires
+the rootful daemon correctly and now says plainly that the other one is not its business.
+
+## Docker's nftables firewall backend has no DOCKER-USER at all
+
+**The one setting that removes the foundation this tool is built on.** Docker is growing
+a native nftables backend, selected with `"firewall-backend": "nftables"` in
+`daemon.json` and reported by `docker info` as `FirewallBackend.Driver` since API 1.49.
+
+This is not inference. moby's own `setupUserChains()` opens with:
+
+```go
+// There's no equivalent to DOCKER-USER in the nftables implementation.
+if nftables.Enabled() {
+    return
+}
+```
+
+So the chain is never created, `FORWARD` never jumps to it, and every rule this tool
+writes would sit in a chain that does not exist.
+
+**`install` refuses and `status` reports it**, naming the backend. The reachability check
+would have caught the symptom — no jump from `FORWARD` — but it would have blamed a
+third-party firewall flushing the chain, sending an operator to look for something that
+is not there.
+
+There is no workaround beyond `"firewall-backend": "iptables"`. If Docker ever makes
+nftables the default, this tool needs a second implementation, not a patch.

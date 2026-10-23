@@ -93,6 +93,24 @@ measuring a failure is a trap.
 - The suite must publish its test port **1:1**. A remapped `-p 19089:80` makes the "allow
   opens it" tests fail *and* the "blocked" tests pass vacuously — they would stay green
   even if the tool did nothing. This is why `start_testsvc()` publishes `19089:19089`.
+- **`cmd && false || true` always succeeds.** cmd true → `false` runs → `|| true`
+  swallows it; cmd false → `|| true`. Four assertions here were vacuous in *both*
+  directions, one of them for months. Write `! cmd`.
+- **`grep -c` prints `0` and exits 1** on no match, so `n=$(... | grep -c x) || echo 0`
+  emits `0\n0`. Three separate places here have been bitten. Prefer
+  `awk '/re/{n++} END{print n+0}'` — one exit status, one line.
+- **`cmd | grep -q x` under `set -o pipefail` reports failure ON A MATCH.** grep exits
+  immediately, the producer takes SIGPIPE and exits 141, and pipefail adopts that. The
+  same construct *also* adopts the producer's own exit status, so `ufw-docker status |
+  grep -q 'IPv4 wired'` is false whenever any unrelated check is red. Both inverted real
+  results in the leg phases. Capture the output, discard the status, match with `case` —
+  the phases share a `says()` helper that does exactly this.
+- **`curl -w '%{http_code}' || echo 000` prints `000000`.** curl's `-w` already emits
+  `000` on a refused connection *and* exits non-zero, so the fallback fires too and the
+  result compares unequal to `000` — a blocked port reads as reachable. Use `|| true`.
+- **Never edit a script while it is running.** bash reads the file by byte offset, so the
+  running shell resumes mid-token. Observed as `line 184: he: command not found`, followed
+  by the whole suite running a second time. It looks like a tool bug for a good while.
 
 ## The distro matrix — real distributions, in containers
 
@@ -139,16 +157,54 @@ Stated plainly because a matrix that overstates its reach is worse than a small 
 - **The kernel is the runner's**, shared by every leg. `debian:10` means Debian 10
   *userspace* on a 6.x kernel, not the 4.19 a real Debian 10 box runs. A distro whose own
   kernel lacks an nftables feature would not be caught here.
-- **No cold boot.** The self-heal unit exists for a real machine coming up with ufw at
-  ~3.7s and Docker at ~8.1s. A container cannot reproduce that; `tests/cold-boot-check.sh`
-  on real hardware remains the only evidence, and it is still manual.
-- **No real load.** A leg is a clean room with one container. The development host has
-  sixteen and a live UISP stack, where `install` costs ~8s against ~1s here.
+- **No *kernel* boot.** The init boot is covered — see the three post-suite phases below
+  — but nothing here brings up an initramfs, loads modules or waits on a real NIC.
+  `tests/cold-boot-check.sh` on real hardware is still the only evidence for those.
+- **Load is correctness, not capacity.** The concurrency phase below proves no connection
+  leaks past a DENY and none is dropped by an ALLOW. It does not say what this costs on a
+  busy box: the development host runs sixteen containers and a live UISP stack, where
+  `install` takes ~8s against ~1s here.
 - **A non-initial network namespace is not a host**, and that is not a theoretical
   reservation — see the logging trap below.
 
 So these legs are the **per-push gate**, and the host run is what you do before a release
 and after anything that touches boot or self-heal. They do not retire it.
+
+### Three phases the bats suite structurally cannot run
+
+Each needs something outside a single test process — a container restart, a second
+daemon, or many concurrent clients — so they run **after** the suite, from
+`tests/container-leg.sh`, in increasing order of disruption. `LEG_PHASES=coldboot`
+narrows them while debugging.
+
+They are skipped, **loudly**, if the suite failed. Running them against a host the suite
+has already failed on produces cascade noise that buries the real failure.
+
+| phase | script | what it proves |
+|---|---|---|
+| `load` | `tests/leg-load.sh` | 200 concurrent connections against a DENY all refused, 200 against an ALLOW all succeed, rule set byte-identical afterwards |
+| `rootless` | `tests/leg-rootless.sh` | a rootless daemon beside a rootful one is NAMED by `status` and `containers`, its port appears in no iptables rule, and plain `ufw deny` does block it |
+| `coldboot` | `tests/leg-coldboot.sh` | with `DOCKER-USER` emptied after ufw applies the stanza, the self-heal unit notices at the next init boot and repairs it |
+
+**The cold-boot phase is an init boot, not a kernel boot**, and the distinction is load
+bearing. A leg runs systemd as pid 1, so `docker restart` genuinely re-runs every unit
+and re-evaluates ordering — which is the surface the self-heal unit's `After=` lives on.
+It is not a machine starting.
+
+> **The freshness signal is `/run`, not `boot_id`.** The obvious check —
+> `/proc/sys/kernel/random/boot_id` changed, so we rebooted — is **wrong here and fails
+> open**: that id belongs to the runner's kernel and never changes across a container
+> restart, so the assertion would have passed forever while proving nothing. `/run` is a
+> `--tmpfs`, recreated on container start, so a marker surviving it means the init did
+> not actually restart.
+
+The rootless phase **skips rather than fails** where rootless cannot be stood up — an
+older base without `rootlesskit` or the `dockerd-rootless.sh` contrib script. A skip
+prints as a skip; it must never read as a pass.
+
+> One trap worth keeping: inside `rootlesskit`, `dockerd` is not on a normal user's
+> `PATH`. It lives in `/usr/sbin`, so the failure is a bare `exec: dockerd: not found`
+> that reads like a rootless problem and is a `PATH` one.
 
 ### Three traps, all of which produced a confident wrong answer first
 
@@ -346,18 +402,20 @@ removed afterwards only if the suite created it.
 something a real service plausibly listens on. Every port in `TEST_PORTS` is a port the
 suite will *delete a rule for*, which is the whole reason this matters.
 
-## The one test that cannot be automated: a real cold boot
+## The part of cold boot that still cannot be automated
 
 The self-heal unit is verified in almost every respect by the suite — systemd drives it
 against a genuinely broken firewall, it repairs it, it restores a *restricted* SSH rule
 rather than a blanket one, it logs what it did, it leaves a healthy firewall alone, and
 its enablement and `After=`/`Wants=` ordering are asserted declaratively.
 
-**All of that happens on a running host.** The thing the unit exists for is the boot
-race — ufw, Docker and this unit coming up in the right order on a cold start — and the
-only honest way to test a boot race is to boot. So that part is currently verified *by
-declaration*, not by observation, and the difference is exactly the kind this project
-tries not to paper over.
+**The ordering race is covered too, now, per push** — `tests/leg-coldboot.sh` restarts a
+leg's init with the stanza applied and `DOCKER-USER` emptied behind it, and asserts the
+unit noticed and repaired. What that does not do is boot a machine. There is no
+initramfs, no module loading, no real NIC, and the kernel never restarts.
+
+So the remaining gap is narrow and specific: **a real cold start, with ufw at ~3.7s and
+Docker at ~8.1s on actual hardware.** The only honest way to test that is to boot.
 
 `tests/cold-boot-check.sh` makes it two commands with a reboot between them. It is
 deliberately **not** part of the suite: nothing should reboot a host as a side effect of

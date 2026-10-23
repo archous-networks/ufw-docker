@@ -40,6 +40,24 @@ is kept rather than deleted because its *limitations* section is still live.
 
 ## Implemented since this list was written
 
+- **H2 answered, and it found something bigger.** `DOCKER-USER` preservation is
+  contractual — moby's `setupUserChain()` states it and the code matches at v26.1.4,
+  v28.0.0 and master. Reading that source also turned up Docker's **nftables firewall
+  backend**, in which `DOCKER-USER` does not exist at all (`if nftables.Enabled() {
+  return }`). Now a preflight refusal with its own selftest. See
+  [FUTURE.md](FUTURE.md#h2).
+- **A9 closed.** Rootless Docker beside a rootful daemon is stood up per push. The
+  prediction that such containers are "neither protected nor mentioned" was half wrong:
+  ordinary ufw *does* govern them (their published port is a userspace listener on
+  `INPUT`). The real defect was that `status` and `containers` said nothing at all; both
+  now name the daemon.
+- **Cold boot and load are no longer manual-only.** A leg runs systemd as pid 1, so
+  restarting it is a real init boot; `tests/leg-coldboot.sh` and `tests/leg-load.sh` run
+  after the suite on every leg. The kernel remains the one thing a container cannot give.
+- **A third false green closed:** `status` now checks that the self-heal unit's
+  `ExecStart` target exists and that the unit is enabled. A host whose unit pointed at a
+  missing binary reported every check green while failing at every boot.
+
 - **A1** `ufw route` rules are now honoured — `DOCKER-USER` consults `ufw-user-forward`
   before `ufw-user-input`, so the verb ufw intends for forwarded traffic wins. Verified.
 - **A4 / C4** subnet drift is detected by `status`, which names the uncovered networks and

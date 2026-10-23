@@ -287,6 +287,16 @@ teardown() {
         rm -f "$sv" "$BATS_FILE_TMPDIR/restore-stanza"
         reinstall || true
     fi
+    # A test that repoints or disables the self-heal unit hands us the original
+    # up front. A unit file left mutated is invisible until the next boot --
+    # exactly the failure these tests exist to catch, manufactured by the suite.
+    if [ -f "$BATS_FILE_TMPDIR/restore-selfheal-unit" ]; then
+        local su; su="$(cat "$BATS_FILE_TMPDIR/restore-selfheal-unit")"
+        [ -f "$su" ] && sudo cp -a "$su" /etc/systemd/system/ufw-docker-selfheal.service
+        sudo systemctl daemon-reload 2>/dev/null || true
+        sudo systemctl enable ufw-docker-selfheal.service >/dev/null 2>&1 || true
+        rm -f "$su" "$BATS_FILE_TMPDIR/restore-selfheal-unit"
+    fi
     if [ -f "$BATS_FILE_TMPDIR/restore-dummy-net" ]; then
         sudo docker network rm ufwmacvlan >/dev/null 2>&1 || true
         sudo ip link del ufwdummy0 >/dev/null 2>&1 || true
@@ -1399,7 +1409,12 @@ assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
     echo "$saved" > "$BATS_FILE_TMPDIR/restore-stanza"
 
     sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
-    ! sudo grep -q 'BEGIN UFW-DOCKER' "$AFTER4"          # genuinely gone
+    # The marker is 'BEGIN DOCKER-UFW', not 'BEGIN UFW-DOCKER'. This line had
+    # the two halves transposed, so the grep could never match and the `!`
+    # made it true unconditionally -- a negative assertion that passed whether
+    # the stanza was there or not. Found when three new leg phases copied the
+    # same wrong string and refused to run.
+    ! sudo grep -q 'BEGIN DOCKER-UFW' "$AFTER4"          # genuinely gone
 
     local mark; mark=$(date +%s)
     sudo SELFHEAL_DELAY=0 "$REPO/ufw-docker" selfheal
@@ -1467,4 +1482,66 @@ assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
     [ "$(jumps)" -eq 0 ]
     [ "$(active)" -eq 1 ]
     [ "$(ssh_rule)" -gt 0 ]
+}
+
+@test "a self-heal unit that cannot run is RED, not a green firewall" {
+    # THE THIRD FALSE GREEN, found by restarting a leg container's init.
+    #
+    # `install` warns once if the binary is not at the path the unit names, and
+    # then nothing mentioned it again. Such a host printed every check green --
+    # including "DOCKER-USER is reached from FORWARD" -- while the unit went
+    # `failed` at every boot and DOCKER-USER was left at 0 jumps.
+    #
+    # The firewall is not broken in this state. The thing that REPAIRS it
+    # unattended is, which is only discovered on the boot where it was needed.
+    reinstall
+    local unit=/etc/systemd/system/ufw-docker-selfheal.service
+    [ -f "$unit" ]
+
+    local saved="$BATS_FILE_TMPDIR/selfheal.unit"
+    sudo cp -a "$unit" "$saved"
+    echo "$saved" > "$BATS_FILE_TMPDIR/restore-selfheal-unit"
+
+    sudo sed -i 's|^ExecStart=.*|ExecStart=/usr/local/sbin/ufw-docker-absent selfheal|' "$unit"
+    sudo systemctl daemon-reload
+
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 1 ]                       # RED: the recovery path is dead
+    echo "$output" | grep -q 'ufw-docker-absent'
+    echo "$output" | grep -q 'NOT executable'
+    # It must still say the firewall itself is fine, so the operator can tell
+    # "unfiltered now" from "unrecoverable later" -- very different urgencies.
+    echo "$output" | grep -q 'DOCKER-USER is reached from FORWARD'
+
+    sudo cp -a "$saved" "$unit"
+    sudo systemctl daemon-reload
+    rm -f "$saved" "$BATS_FILE_TMPDIR/restore-selfheal-unit"
+
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'self-heal unit enabled'
+}
+
+@test "a self-heal unit left behind but disabled is reported, not assumed to run" {
+    # Half-removed is the state that lies: the unit file is present, so
+    # everything LOOKS configured, and `systemctl disable` means it never runs.
+    # Either enable it or remove it -- what must not happen is a host that
+    # believes it has unattended recovery and does not.
+    reinstall
+    local unit=/etc/systemd/system/ufw-docker-selfheal.service
+    local saved="$BATS_FILE_TMPDIR/selfheal.unit.disabled"
+    sudo cp -a "$unit" "$saved"
+    echo "$saved" > "$BATS_FILE_TMPDIR/restore-selfheal-unit"
+
+    sudo systemctl disable ufw-docker-selfheal.service >/dev/null 2>&1
+    [ "$(systemctl is-enabled ufw-docker-selfheal.service 2>&1)" != enabled ]
+
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q 'NOT enabled'
+
+    sudo systemctl enable ufw-docker-selfheal.service >/dev/null 2>&1
+    rm -f "$saved" "$BATS_FILE_TMPDIR/restore-selfheal-unit"
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
 }

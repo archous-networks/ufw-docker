@@ -263,7 +263,47 @@ rc=$?
 if [ $rc -ne 0 ]; then
     say "DIAGNOSTICS (leg failed, rc=$rc)"
     dexec sh -c 'ufw status verbose; echo; iptables -S DOCKER-USER; echo; iptables -S ufw-user-input' || true
+    # The phases below assume a healthy firewall to perturb. Running them on a
+    # host the suite has already failed against produces cascade noise that
+    # buries the real failure, so say they were skipped rather than skipping
+    # them quietly.
+    say "extra phases SKIPPED (the suite failed; they would only add cascade noise)"
+    say "leg $BASE / $BACKEND -> rc=$rc"
+    exit $rc
 fi
+
+# ── phases the bats suite structurally cannot run ──────────────────────────
+# Each needs something outside a single test process: a container restart, a
+# second daemon, or many concurrent clients. They run AFTER the suite, in
+# increasing order of disruption, and cold boot goes last because it restarts
+# the container out from under everything else.
+#
+# LEG_PHASES narrows them while debugging, e.g. LEG_PHASES=coldboot.
+#
+# RE-INSTALL FIRST, and the reason is a trap this walked straight into. The
+# suite's teardown_file ends with `ufw-docker remove --force`, so by the time
+# these phases run the tool is UNINSTALLED -- no stanza, no self-heal unit, no
+# jumps. The cold-boot phase duly found nothing to repair and still reported
+# "status is green after the boot", because `status` on an uninstalled host is
+# legitimately rc=0. A true statement, a useless one, and a pass.
+#
+# Each phase asserts this precondition for itself too. Establishing it here as
+# well is deliberate belt-and-braces: one place that sets it up, and a phase
+# that refuses to run if it somehow is not true.
+say "re-install for the phases (the suite's teardown removes the tool)"
+dexec sh -c '/usr/local/sbin/ufw-docker install >/dev/null 2>&1
+    /usr/local/sbin/ufw-docker status >/dev/null 2>&1' \
+    || { echo "FAIL  could not re-install before the phases"; dexec /usr/local/sbin/ufw-docker status || true; rc=1; }
+
+PHASES="${LEG_PHASES:-load rootless coldboot}"
+for phase in $PHASES; do
+    case "$phase" in
+        load)     say "phase: correctness under load";          "$HERE/leg-load.sh"     "$NAME" || rc=1 ;;
+        rootless) say "phase: rootless alongside rootful (A9)"; "$HERE/leg-rootless.sh" "$NAME" || rc=1 ;;
+        coldboot) say "phase: cold boot (B1, container init)";  "$HERE/leg-coldboot.sh" "$NAME" || rc=1 ;;
+        *) echo "unknown phase: $phase" >&2; rc=1 ;;
+    esac
+done
 
 say "leg $BASE / $BACKEND -> rc=$rc"
 exit $rc

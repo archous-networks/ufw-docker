@@ -45,9 +45,13 @@ a small one.
 
 | not covered | why |
 |---|---|
-| **each distro's own kernel** | a leg is that distro's *userspace* on the runner's kernel. `deb10-*` is Debian 10 tooling on a 6.x kernel, not the 4.19 a real Debian 10 box runs |
-| **cold boot** | the self-heal unit exists for a real machine coming up with ufw at ~3.7s and Docker at ~8.1s. `tests/cold-boot-check.sh` on real hardware, still manual |
-| **real load** | a leg is a clean room with one container; a production host has dozens |
+| **each distro's own kernel** | a leg is that distro's *userspace* on the runner's kernel. `deb10-*` is Debian 10 tooling on a 6.x kernel, not the 4.19 a real Debian 10 box runs. The only one of the three originally listed here that is still open |
+| **a real machine starting** | the *boot ordering race* is covered per push — a leg runs systemd as pid 1, so restarting it re-runs every unit (`tests/leg-coldboot.sh`). What is not covered is an initramfs, module loading and a real NIC coming up. `tests/cold-boot-check.sh` on hardware, still manual |
+| **capacity under load** | *correctness* under concurrency is covered per push — 200 simultaneous connections against a DENY all refused, against an ALLOW all served, rule set unchanged (`tests/leg-load.sh`). What that does not say is what it costs on a box running dozens of containers |
+
+> Two of these three used to be flat "not covered". They were assumptions about what a
+> container can do, not measurements — and they cost a year of "still manual" on a check
+> that takes a minute per leg. The kernel one is real.
 
 ## Hosts this has actually run on
 

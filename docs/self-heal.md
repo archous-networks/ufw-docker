@@ -51,6 +51,28 @@ RECOVERED but UNWIRED: ufw rules no longer affect Docker ports - run 'ufw-docker
 Auto-reinstalling would be a loop if the stanza is what broke ufw in the first place. An
 unfiltered host that says so beats one that flaps.
 
+**It cannot run at all if the binary it names is not there.** `ExecStart` is
+`/usr/local/sbin/ufw-docker selfheal`, which is where the documented install puts the
+tool — but a host wired from a clone, or one where the binary was later moved, has a unit
+that fails at every boot. `install` warns about that, once; **`status` now checks it on
+every run**, and grades it red:
+
+```
+the self-heal unit calls /usr/local/sbin/ufw-docker, which is NOT executable — it fails at EVERY boot
+    Nothing repairs this host unattended. Put the tool where the unit expects it:
+    sudo install -m 0755 ./ufw-docker /usr/local/sbin/ufw-docker
+```
+
+A unit file present but **disabled** is graded the same way, for the same reason: the
+host looks configured and nothing runs. Either enable it or remove it with
+`install --no-selfheal`, so that nothing implies a recovery that is not there.
+
+This was found by restarting a leg container's init. Before the check, such a host
+printed *every* status line green — including `DOCKER-USER is reached from FORWARD` —
+while the unit went `failed` and left the chain at zero jumps. The firewall was not
+broken; the thing that repairs it was, and that is only discovered on the boot where it
+was needed.
+
 ## Reading it
 
 ```bash
@@ -80,6 +102,13 @@ The logic is `ufw-docker selfheal`, a normal subcommand, not a shell one-liner i
   Driven by `tests/cold-boot-check.sh`, which installs a one-shot unit ordered
   `After=docker.service Before=ufw-docker-selfheal.service` to recreate the ordering a
   late-starting Docker daemon produces.
+
+- **the same thing, per push, on every distro in the matrix.** `tests/leg-coldboot.sh`
+  arms that identical saboteur inside a leg and restarts the container's init — which
+  re-runs every unit and re-evaluates ordering, because a leg runs systemd as pid 1. It
+  asserts the unit *saw* the broken chain (`DOCKER-USER unwired`) rather than merely
+  finding a healthy one, which is the distinction the hardware test learned the hard way.
+  It is an init boot, not a kernel boot; `cold-boot-check.sh` is still the real thing.
 
 **That run also validated the 20-second delay, which until then was a guess.** The chain
 was emptied at boot and the unit caught it exactly twenty seconds later — so the delay is

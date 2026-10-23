@@ -32,7 +32,8 @@ This used to be found the hard way: `ufw reload` would fail, by which point `aft
 was already on disk and ufw was half-built, with only the rollback between the operator
 and a lockout.
 
-**What `--test` catches, and it depends on the backend:**
+**What `--test` catches — and the second row is a property of the iptables VERSION, not
+of the backend:**
 
 | rule | iptables-nft | iptables-legacy |
 |---|---|---|

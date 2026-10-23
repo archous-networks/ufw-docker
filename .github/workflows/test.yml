@@ -28,7 +28,7 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh; do
+          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: the operator-rule invariant actually fires
@@ -56,6 +56,14 @@ jobs:
         # unattended at boot. Pure logic, no firewall -- it belongs here.
         run: tests/ssh-detect-selftest.sh
 
+      - name: Docker's firewall backend is classified correctly
+        # moby's nftables backend has NO DOCKER-USER chain -- setupUserChains()
+        # returns early when nftables is enabled -- so the whole design is
+        # inert there and the tool must refuse. That refusal path cannot be
+        # exercised in a leg (it needs a daemon restart with a changed
+        # daemon.json), so the classification is tested as pure logic here.
+        run: tests/firewall-backend-selftest.sh
+
       - name: the platform matrix and the docs agree
         # Two copies of the matrix exist on purpose -- the heredoc in
         # `ufw-docker`, because the preflight must read it on a host that
@@ -70,7 +78,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh
+        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh
 
   bats:
     runs-on: ubuntu-latest
@@ -253,7 +261,11 @@ jobs:
     # fewer cores, so this is deliberately generous -- the failure mode to avoid
     # is a cancelled job, which takes the diagnostics with it and tells you
     # nothing. That has already cost this project two runs.
-    timeout-minutes: 45
+    #
+    # Raised from 45 when the three post-suite phases landed. They add a few
+    # minutes each: the rootless phase installs packages, the cold-boot phase
+    # restarts the container init and waits for systemd twice.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

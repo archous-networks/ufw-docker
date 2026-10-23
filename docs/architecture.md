@@ -96,5 +96,29 @@ Measured on a real reboot:
 
 ufw runs **before** Docker. So `DOCKER-USER` does not exist when `after.rules` is applied —
 our `:DOCKER-USER - [0:0]` creates it, and Docker then starts and adopts the populated
-chain rather than clobbering it. That adoption is verified empirically across both a
-daemon restart and a cold boot, but is [not known to be contractual](../TODO.md).
+chain rather than clobbering it.
+
+**That adoption is by design, not luck**, and moby says so in the source. `setupUserChain()`
+in `daemon/libnetwork/firewall_linux.go`:
+
+> This chain allows users to configure firewall policies in a way that persist daemon
+> operations/restarts. The daemon does not delete or modify any pre-existing rules from
+> the `DOCKER-USER` filter chain.
+
+The code matches the comment, at v26.1.4, v28.0.0 and master:
+
+| call | behaviour | why it matters here |
+|---|---|---|
+| `NewChain` | `-n -L` first, `-N` only if absent | **never flushes** a populated chain |
+| `AddReturnRule` | appends a bare `-j RETURN` if none exists | lands after our rules, harmless — and **removed on master**, which is why Docker 29 creates the chain empty |
+| `EnsureJumpRule` | `-D` the existing jump, then `-I` at position 1 | re-asserts `DOCKER-USER` **first in FORWARD** on every daemon start and every firewall reload |
+
+That last row is the useful one: Docker actively re-hooks the chain rather than merely
+leaving it alone, which is why the wiring survives a reload. It also means a brief window
+on each restart where the jump is absent — the reason `status` checks reachability
+separately from chain contents.
+
+> **One backend removes all of this.** With `"firewall-backend": "nftables"` in
+> `daemon.json`, moby's `setupUserChains()` returns immediately — *"There's no equivalent
+> to DOCKER-USER in the nftables implementation."* No chain, no jump, nothing for this
+> design to attach to. `install` refuses; see [caveats.md](caveats.md).
