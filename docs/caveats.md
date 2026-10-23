@@ -148,6 +148,44 @@ are understood, correctly unaffected, and governed by plain ufw `INPUT` rules. C
 that "unsupported" would spend the word on something harmless, and then it would not be
 read in the cases where it means real danger.
 
+## macvlan and ipvlan networks are not governed — and are now excluded
+
+A `macvlan` or `ipvlan` container talks to the LAN through the parent interface directly.
+Its traffic never traverses `FORWARD`, so it never reaches `DOCKER-USER`, so **no rule on
+this host applies to it** — not ufw's and not ours. Filter it upstream.
+
+The behaviour worth knowing about is what we do with the **subnet**. `subnets()` used to
+take every network's IPAM range regardless of driver, which on a macvlan network sitting
+on a real LAN would have put this at the very top of `FORWARD`:
+
+```
+-A DOCKER-USER -s 192.168.1.0/24 -j RETURN                   # exempts the whole LAN
+-A DOCKER-USER -d 192.168.1.0/24 -j ufw-user-input           # judges the whole LAN
+-A DOCKER-USER -d 192.168.1.0/24 -j ufw-docker-logging-deny  # and drops what did not match
+```
+
+An entire real network exempted from forward filtering in one direction and default-denied
+in the other, for containers this tool cannot govern anyway — all of the hazard and none
+of the benefit. **Only `bridge` networks go into the stanza now**, and anything excluded is
+listed by `status` and `ufw-docker containers` rather than silently dropped.
+
+An allowlist, not a denylist: an unknown third-party driver is exactly the case where
+guessing is wrong.
+
+## `ufw default allow incoming` does not extend to containers
+
+ufw expresses its default policy as the **policy on the built-in chain**, not as a
+terminal rule inside `ufw-user-input` — and our jump enters `ufw-user-input` directly, so
+the default is never consulted on the container path. Unmatched container traffic falls
+through to `ufw-docker-logging-deny` and is dropped.
+
+So on an allow-incoming host, **installing this tool takes every published container port
+from open to closed**, with nothing in `ufw status` explaining why. `install` warns before
+it writes, and `status` keeps saying so.
+
+That asymmetry is defensible — default-deny for forwarded traffic is the whole point — but
+it is a real behaviour change at install time, and it is an outage if nobody said so first.
+
 ## Swarm is NOT supported — do not assume it works
 
 **Untested, deliberately, and not on the roadmap.** This is a statement of scope, not a

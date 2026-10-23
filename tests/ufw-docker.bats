@@ -268,6 +268,31 @@ teardown() {
         reinstall || true
     fi
 
+    # Same contract as before.init above: a test that loosens ufw's DEFAULT
+    # policy, or unhooks DOCKER-USER from FORWARD, records that up front so a
+    # failed assertion cannot leave the host that way. teardown always runs;
+    # the rest of a test after a failed assertion does not.
+    if [ -f "$BATS_FILE_TMPDIR/restore-default-incoming" ]; then
+        sudo ufw default deny incoming >/dev/null 2>&1 || true
+        rm -f "$BATS_FILE_TMPDIR/restore-default-incoming"
+    fi
+    if [ -f "$BATS_FILE_TMPDIR/restore-forward-jump" ]; then
+        sudo iptables -C FORWARD -j DOCKER-USER 2>/dev/null \
+            || sudo iptables -I FORWARD 1 -j DOCKER-USER 2>/dev/null || true
+        rm -f "$BATS_FILE_TMPDIR/restore-forward-jump"
+    fi
+    if [ -f "$BATS_FILE_TMPDIR/restore-stanza" ]; then
+        local sv; sv="$(cat "$BATS_FILE_TMPDIR/restore-stanza")"
+        [ -f "$sv" ] && sudo cp -a "$sv" "$AFTER4"
+        rm -f "$sv" "$BATS_FILE_TMPDIR/restore-stanza"
+        reinstall || true
+    fi
+    if [ -f "$BATS_FILE_TMPDIR/restore-dummy-net" ]; then
+        sudo docker network rm ufwmacvlan >/dev/null 2>&1 || true
+        sudo ip link del ufwdummy0 >/dev/null 2>&1 || true
+        rm -f "$BATS_FILE_TMPDIR/restore-dummy-net"
+    fi
+
     local rc=0
 
     if [ "$(ssh_rule)" -eq 0 ]; then
@@ -1134,7 +1159,11 @@ STUB
     run sudo env "$(unsup_env)" "$REPO/ufw-docker" install --unsupported
     [ "$status" -eq 1 ]
     echo "$output" | grep -q 'alone is not enough'
-    sudo grep -q 'INSTALLED IN UNSUPPORTED MODE' "$AFTER4" && false || true
+    # `cmd && false || true` is ALWAYS TRUE -- when cmd succeeds, `false`
+    # runs and `|| true` swallows it; when cmd fails, `||` runs `true`. This
+    # assertion was vacuous in both directions for its whole life. `! cmd` is
+    # the form that can fail.
+    ! sudo grep -q 'INSTALLED IN UNSUPPORTED MODE' "$AFTER4"
 }
 
 @test "--unsupported --force installs, and says so FOREVER afterwards" {
@@ -1330,6 +1359,107 @@ assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
         echo "$output" | grep -q "ufw-docker $sub" \
             || { echo "help for $sub does not name it" >&3; return 1; }
     done
+}
+
+@test "an ORPHANED DOCKER-USER is reported, not called wired" {
+    # THE FALSE GREEN. Everything else in this suite asks what is INSIDE
+    # DOCKER-USER. Nothing asked whether a packet ever gets there -- so a host
+    # with no `-A FORWARD -j DOCKER-USER` had a byte-perfect stanza, three
+    # jumps into ufw-user-input, a green `status`, and zero filtering.
+    #
+    # Real trigger: `"iptables": false` in daemon.json, or a third-party
+    # firewall rebuilding FORWARD.
+    reinstall
+    [ "$(jumps)" -gt 0 ]                      # wired, by the old definition
+
+    echo yes > "$BATS_FILE_TMPDIR/restore-forward-jump"
+    sudo iptables -D FORWARD -j DOCKER-USER
+
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 1 ]                        # must go RED, not merely warn
+    echo "$output" | grep -q 'NOT reached from FORWARD'
+    # ...and it must still be able to say the chain itself is intact, so the
+    # operator can tell "orphaned" from "unwired" -- different fixes.
+    echo "$output" | grep -q 'IPv4 wired'
+
+    sudo iptables -I FORWARD 1 -j DOCKER-USER
+    rm -f "$BATS_FILE_TMPDIR/restore-forward-jump"
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+}
+
+@test "selfheal says UNWIRED when the stanza is gone, even with nothing to repair" {
+    # The unit used to report "ufw healthy at boot" here. Its whole job is to
+    # notice an unfiltered host, and this is one: ufw is genuinely fine, the
+    # stanza is simply absent. after.rules is a dpkg conffile, so an ufw
+    # package upgrade can do exactly this.
+    reinstall
+    local saved="$BATS_FILE_TMPDIR/after4.stanza-test"
+    sudo cp -a "$AFTER4" "$saved"
+    echo "$saved" > "$BATS_FILE_TMPDIR/restore-stanza"
+
+    sudo "$REPO/ufw-docker" remove --force >/dev/null 2>&1
+    ! sudo grep -q 'BEGIN UFW-DOCKER' "$AFTER4"          # genuinely gone
+
+    local mark; mark=$(date +%s)
+    sudo SELFHEAL_DELAY=0 "$REPO/ufw-docker" selfheal
+    run sudo journalctl -t ufw-docker-selfheal --since "@$mark" --no-pager
+    echo "$output" | grep -q 'UNWIRED'
+    echo "$output" | grep -vq 'ufw healthy at boot'
+
+    sudo cp -a "$saved" "$AFTER4"
+    rm -f "$saved" "$BATS_FILE_TMPDIR/restore-stanza"
+    reinstall
+}
+
+@test "a macvlan network is EXCLUDED from the stanza and named in status" {
+    # subnets() used to take every network regardless of driver. A macvlan on
+    # a real LAN would then put `-d <LAN> -j ufw-user-input` and
+    # `-s <LAN> -j RETURN` at the very top of FORWARD -- judging and exempting
+    # an entire real network whose traffic never reaches DOCKER-USER anyway.
+    #
+    # A dummy parent, so this touches no real interface.
+    sudo ip link add ufwdummy0 type dummy 2>/dev/null || skip "cannot create a dummy interface here"
+    echo yes > "$BATS_FILE_TMPDIR/restore-dummy-net"
+    sudo ip link set ufwdummy0 up
+    sudo docker network create -d macvlan -o parent=ufwdummy0 \
+        --subnet 192.168.237.0/24 ufwmacvlan >/dev/null 2>&1 \
+        || skip "macvlan networks are not creatable here"
+
+    run sudo "$REPO/ufw-docker" install --dry-run $(install_args)
+    [ "$status" -eq 0 ]
+    # The subnet must appear NOWHERE in the stanza we would write.
+    ! echo "$output" | grep -q '192.168.237.0/24'
+
+    run sudo "$REPO/ufw-docker" status
+    echo "$output" | grep -q 'does NOT govern'
+    echo "$output" | grep -q 'ufwmacvlan'
+
+    sudo docker network rm ufwmacvlan >/dev/null 2>&1 || true
+    sudo ip link del ufwdummy0 >/dev/null 2>&1 || true
+    rm -f "$BATS_FILE_TMPDIR/restore-dummy-net"
+}
+
+@test "a default-ALLOW-incoming host is warned that containers are still default-deny" {
+    # Installing here takes every published port from open to closed, because
+    # our jump enters ufw-user-input directly and ufw keeps the default policy
+    # on the built-in chain. That is an outage caused by the install, so it
+    # has to be said out loud before and after.
+    echo yes > "$BATS_FILE_TMPDIR/restore-default-incoming"
+    sudo ufw default allow incoming >/dev/null 2>&1
+
+    run sudo "$REPO/ufw-docker" status
+    echo "$output" | grep -q 'default incoming policy is ALLOW'
+    echo "$output" | grep -q 'default-DENY'
+
+    run sudo "$REPO/ufw-docker" install --dry-run $(install_args)
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'will be DROPPED for containers'
+
+    sudo ufw default deny incoming >/dev/null 2>&1
+    rm -f "$BATS_FILE_TMPDIR/restore-default-incoming"
+    run sudo "$REPO/ufw-docker" status
+    ! echo "$output" | grep -q 'default incoming policy is ALLOW'
 }
 
 @test "remove returns DOCKER-USER to stock" {

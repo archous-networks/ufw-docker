@@ -134,6 +134,23 @@ backend_rules() {   # $1 = iptables-legacy | iptables-nft
     printf '%s' "${n:-0}"
 }
 
+# Is DOCKER-USER actually REACHED by anything?
+#
+# Everything else in this tool checks what is INSIDE DOCKER-USER -- the jumps
+# we add, the subnets they cover, whether ufw rebuilt them. None of that means
+# a packet ever arrives. Docker puts `-A FORWARD -j DOCKER-USER` at the top of
+# FORWARD, and if that jump is absent the chain is an orphan: our stanza is
+# byte-perfect, `status` counts three jumps into ufw-user-input, and nothing
+# is filtered at all.
+#
+# That is the exact failure this whole design exists to prevent, and until now
+# it was the one case nothing looked for. It is not hypothetical -- `"iptables":
+# false` in daemon.json tells Docker not to manage iptables, and then the jump
+# is never created.
+forward_reaches_docker_user() {   # $1 = iptables|ip6tables
+    "$1" -S FORWARD 2>/dev/null | grep -q -- '-j DOCKER-USER'
+}
+
 preflight() {
     PF_FAILED=""; PF_DETAIL=""
 
@@ -177,7 +194,16 @@ preflight() {
             "not supported — run a rootful daemon, or see docs/caveats.md" ;;
     esac
 
-    # 5. Is this platform one anything has actually proven? Deliberately last,
+    # 5. Is the chain we are about to fill actually reachable? Gated on Docker
+    #    being up, because a stopped daemon has no FORWARD jump and that is not
+    #    a misconfiguration -- there is simply nothing to govern yet.
+    if docker info >/dev/null 2>&1 && ! forward_reaches_docker_user iptables; then
+        pf_fail docker-user-unreachable \
+            "FORWARD has no jump to DOCKER-USER, so the stanza would sit in a chain no packet reaches" \
+            "Docker creates that jump; '\"iptables\": false' in daemon.json disables it, as does a third-party firewall flushing FORWARD"
+    fi
+
+    # 6. Is this platform one anything has actually proven? Deliberately last,
     #    because the four checks above name a MECHANISM that is known to break,
     #    while this one only says "nobody has tried this combination". Both
     #    refuse, but the failures above are the ones worth reading first.
@@ -186,7 +212,7 @@ preflight() {
         "no proven platform matches this host ($(host_matrix_key)); nearest verdict: $mstat" \
         "run 'ufw-docker platforms' to see the matrix, and tools/ufw-docker-survey to add a row"
 
-    # 6. ufw's own files. If these are not where we think, we write a stanza
+    # 7. ufw's own files. If these are not where we think, we write a stanza
     #    nothing reads and report success -- failing silently, which is worse
     #    than failing loudly.
     local how="Debian default — derivation from ufw.common failed"
@@ -378,6 +404,13 @@ ssh_rules_in() {   # $1 = rules file, $2 = port
     local f="$1" port="$2"
     [ -r "$f" ] || return 0
     grep -E -- "^-A ufw6?-user-input .*--dport ${port}( |$)" "$f" 2>/dev/null
+    # multiport: `ufw allow 22,2222/tcp` and any ufw APPLICATION PROFILE
+    # covering more than one port write `--dports a,b,c` instead. The port has
+    # to match a whole list ELEMENT -- a substring match would read
+    # `--dports 2222` as permitting 22, which is the opposite of safe.
+    grep -E -- "^-A ufw6?-user-input .*--dports ([0-9]+,)*${port}(,[0-9]+)*( |$)" "$f" 2>/dev/null
+    # Portless permission: an interface- or source-scoped allow. Must exclude
+    # BOTH spellings above, or every multiport rule is counted twice.
     grep -E -- '^-A ufw6?-user-input ' "$f" 2>/dev/null \
         | grep -v -- '--dport' | grep -E -- '-j (ACCEPT|ufw-user-limit-accept)'
 }
@@ -518,11 +551,43 @@ remove_selfheal() {
 # hardcoding 172.16/12: a user-defined network can sit on 10.x or 192.168.x, and
 # anything missed here would be silently dropped.
 subnets() {   # $1 = 4|6
+    # BRIDGE NETWORKS ONLY, and the filter is load-bearing.
+    #
+    # This used to take every network's subnet regardless of driver, which is
+    # wrong in the dangerous direction. A `macvlan` or `ipvlan` network sits on
+    # a REAL LAN -- 192.168.1.0/24, say -- and its traffic does not traverse
+    # DOCKER-USER at all. Sweeping that subnet in would have put four rules at
+    # the very top of FORWARD governing every packet routed towards that LAN,
+    # container or not:
+    #
+    #     -A DOCKER-USER -s 192.168.1.0/24 -j RETURN          <- exempts the LAN
+    #     -A DOCKER-USER -d 192.168.1.0/24 -j ufw-user-input  <- judges the LAN
+    #     -A DOCKER-USER -d 192.168.1.0/24 -j ufw-docker-logging-deny
+    #
+    # So: an entire real network silently exempted from forward filtering in
+    # one direction and default-denied in the other, for containers this tool
+    # cannot govern anyway. All of the hazard, none of the benefit.
+    #
+    # Allowlist rather than denylist, because an unknown third-party driver is
+    # exactly the case where guessing is wrong. Anything excluded is REPORTED
+    # by `status` and `containers` -- see nonbridge_networks -- because the one
+    # thing worse than not governing a network is not governing it quietly.
     docker network ls -q 2>/dev/null | while read -r id; do
-        docker network inspect "$id" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null
+        docker network inspect "$id" --format \
+            '{{if eq .Driver "bridge"}}{{range .IPAM.Config}}{{.Subnet}} {{end}}{{end}}' 2>/dev/null
     done | tr ' ' '\n' | grep -E '[0-9a-fA-F]' | {
         if [ "$1" = "6" ]; then grep ':'; else grep -v ':'; fi
     } | sort -u
+}
+
+# Networks this tool deliberately does NOT govern, with why. Same discipline as
+# host-network containers: name them plainly rather than letting someone
+# discover the gap by being attacked through it.
+nonbridge_networks() {
+    docker network ls -q 2>/dev/null | while read -r id; do
+        docker network inspect "$id" --format \
+            '{{if and (ne .Driver "bridge") (ne .Driver "null") (ne .Driver "host")}}{{.Name}}|{{.Driver}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}{{end}}' 2>/dev/null
+    done | grep -E '\|' | sort -u
 }
 
 # Build the stanza for one family. The chain names differ (ufw-user-input vs
@@ -534,6 +599,23 @@ subnets() {   # $1 = 4|6
 # Honest about its limit: this is read at INSTALL time and baked into the
 # stanza, so toggling ufw logging afterwards does not change ours. `status`
 # compares the two and says so rather than leaving it to be discovered.
+# ufw's DEFAULT INCOMING policy, as `allow` or `deny`.
+#
+# This matters more than it looks. ufw expresses its default policy as the
+# POLICY ON THE BUILT-IN CHAIN, not as a terminal rule inside ufw-user-input --
+# and our jump goes straight into ufw-user-input, so the default is never
+# consulted on the container path. Unmatched container traffic falls out of
+# ufw-user-input and lands on ufw-docker-logging-deny, which drops it.
+#
+# Consequence, on a host running `ufw default allow incoming`: installing this
+# tool takes every published container port from OPEN to CLOSED, with no rule
+# anywhere in `ufw status` explaining why. That is an outage, caused by the
+# install, and the operator has to be told BEFORE it happens.
+ufw_default_incoming() {
+    ufw status verbose 2>/dev/null \
+        | sed -n 's/^Default: *\([a-z]*\) (incoming).*/\1/p' | head -1
+}
+
 ufw_logging_on() {
     ufw status verbose 2>/dev/null | grep -qiE '^Logging: +on' 
 }
@@ -770,6 +852,18 @@ cmd_install() {
             warn "'ufw-docker status' run from now on."
             audit "install PROCEEDING IN UNSUPPORTED MODE ($PF_FAILED)"
         fi
+    fi
+
+    if [ "$(ufw_default_incoming)" = allow ]; then
+        say ""
+        warn "ufw's default incoming policy is ALLOW, and that changes what this install does."
+        warn "Container traffic is judged by ufw-user-input alone; the default policy lives"
+        warn "on the built-in chain, which this path never reaches. So anything without an"
+        warn "explicit 'ufw allow' will be DROPPED for containers even though the host"
+        warn "default is allow — published ports that work today will stop."
+        warn "Add the rules you need first, or accept that this is now a default-deny host"
+        warn "for container traffic."
+        audit "install on a default-ALLOW-incoming host; container traffic becomes default-deny"
     fi
 
     local v4 v6 wrote=0
@@ -1061,17 +1155,37 @@ cmd_selfheal() {
         repaired=1
     fi
 
-    # After a rescue the host is reachable but UNWIRED -- rescue strips the
-    # stanza by design, because its job is a working ufw, not a wired one. Say
-    # so loudly rather than leaving a host that looks fine and filters nothing.
+    # 3. UNWIRED, for any reason. This used to be gated on `repaired -eq 1`,
+    #    on the assumption that the only way to lose the stanza was a rescue
+    #    having just stripped it. It is not: `after.rules` is a dpkg CONFFILE,
+    #    so an ufw package upgrade can replace it, and config management can
+    #    template over it. In both cases ufw is perfectly healthy, nothing
+    #    needed repairing, and this unit logged "ufw healthy at boot" about a
+    #    host whose Docker ports were wide open.
     #
-    # Deliberately NOT auto-reinstalling: if the stanza is what broke ufw,
-    # re-applying it on every boot is a loop, and an unfiltered host that says
-    # so beats one that flaps.
-    if [ "$repaired" -eq 1 ] \
-       && ! grep -q "$MARK_BEGIN" $AFTER4 2>/dev/null; then
+    #    Noticing an unfiltered host is the entire reason this unit exists, so
+    #    the check cannot be a side effect of having repaired something else.
+    #
+    #    Deliberately NOT auto-reinstalling: if the stanza is what broke ufw,
+    #    re-applying it every boot is a loop, and an unfiltered host that says
+    #    so beats one that flaps.
+    if ! grep -q "$MARK_BEGIN" $AFTER4 2>/dev/null; then
+        if [ "$repaired" -eq 1 ]; then
+            logger -t ufw-docker-selfheal \
+                "RECOVERED but UNWIRED: ufw rules no longer affect Docker ports - run 'ufw-docker install'"
+        else
+            logger -t ufw-docker-selfheal \
+                "UNWIRED: ufw is healthy but the stanza is GONE - Docker ports are unfiltered - run 'ufw-docker install'"
+        fi
+        return 0
+    fi
+
+    # 4. Reachability. The stanza can be present and correct in a chain that
+    #    nothing jumps to; see forward_reaches_docker_user.
+    if ! forward_reaches_docker_user iptables; then
         logger -t ufw-docker-selfheal \
-            "RECOVERED but UNWIRED: ufw rules no longer affect Docker ports - run 'ufw-docker install'"
+            "UNREACHABLE: FORWARD does not jump to DOCKER-USER - the stanza is in an orphaned chain and nothing is filtered"
+        return 0
     fi
 
     [ "$repaired" -eq 0 ] && logger -t ufw-docker-selfheal "ufw healthy at boot"
@@ -1392,6 +1506,17 @@ cmd_status() {
     [ "${j4:-0}" -gt 0 ] && st wired-v4 ok "IPv4 wired ($j4 jumps into ufw-user-input)" \
         || { st wired-v4 bad "stanza present but IPv4 NOT wired — run 'install' or 'ufw reload'"; rc=1; }
 
+    # Counting jumps INSIDE the chain says nothing about whether the chain is
+    # ever entered. Both must hold, and only one of them used to be checked.
+    if forward_reaches_docker_user iptables; then
+        st reachable-v4 ok "DOCKER-USER is reached from FORWARD"
+    else
+        st reachable-v4 bad \
+            "DOCKER-USER is NOT reached from FORWARD — every rule above is in an orphaned chain and NOTHING is filtered" \
+            "Docker adds that jump; check 'iptables -S FORWARD' and daemon.json's \"iptables\" setting"
+        rc=1
+    fi
+
     # Drift check. This is the failure nobody would otherwise see.
     local want have drift stale
     want="$(subnets 4 | sort -u)"
@@ -1415,6 +1540,23 @@ cmd_status() {
     nstat=$(container_rows | grep -c 'static') || true
     [ "${ntot:-0}" -gt 0 ] && st containers info \
         "containers: $ntot running, ${nstat:-0} with a static address  ('ufw-docker containers' to list)"
+
+    if [ "$(ufw_default_incoming)" = allow ]; then
+        st default-allow warn \
+            "ufw's default incoming policy is ALLOW, but container traffic is default-DENY" \
+            "    Our jump enters ufw-user-input directly, so the default policy -- which
+    ufw keeps on the built-in chain -- is never consulted for containers.
+    A published port with no explicit 'ufw allow' is dropped."
+    fi
+
+    local nbn; nbn="$(nonbridge_networks)"
+    if [ -n "$nbn" ]; then
+        st nonbridge-networks warn \
+            "Docker network(s) this tool does NOT govern — their traffic never reaches DOCKER-USER:" \
+            "$(printf '%s' "$nbn" | sed 's/|/  /g; s/^/    /')
+    A macvlan or ipvlan container talks to the LAN directly, so NO rule on
+    this host applies to it — not ufw's and not ours. Filter it upstream."
+    fi
 
     local nhost; nhost="$(host_net_containers | grep -c . || true)"
     [ "${nhost:-0}" -gt 0 ] && st host-network info \
@@ -1472,6 +1614,10 @@ against uptime."
     if [ -n "$v6nets" ]; then
         [ "${j6:-0}" -gt 0 ] && st wired-v6 ok "IPv6 wired ($j6 jumps into ufw6-user-input)" \
             || { st wired-v6 bad "Docker has IPv6 networks but IPv6 is NOT wired — v6 is unfiltered"; rc=1; }
+        # Only meaningful where we actually write a v6 stanza; with Docker v6
+        # off there is no v6 FORWARD jump and that is correct, not a fault.
+        forward_reaches_docker_user ip6tables \
+            || { st reachable-v6 bad "DOCKER-USER is NOT reached from the IPv6 FORWARD chain — v6 rules are in an orphaned chain"; rc=1; }
     else
         st wired-v6 info "IPv6: Docker has no v6 networks; nothing to wire"
     fi

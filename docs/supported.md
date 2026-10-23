@@ -103,6 +103,7 @@ properties of the *mechanism* rather than of the OS:
 | Docker Swarm | publishes through its own ingress mesh, a path this tool does not govern |
 | rootless Docker | publishes via a userspace proxy, so traffic never traverses `DOCKER-USER` |
 | ufw's files not where ufw says | we would write a stanza nothing reads, and report success |
+| `FORWARD` not jumping to `DOCKER-USER` | the stanza would sit in a chain no packet reaches. Everything would look wired and nothing would filter — `"iptables": false` in daemon.json produces exactly this |
 
 And one thing that is explicitly **not** a failure: `--network host` containers. They are
 understood, correctly unaffected, and governed by ordinary ufw `INPUT` rules. Spending

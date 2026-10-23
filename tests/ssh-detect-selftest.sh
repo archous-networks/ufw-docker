@@ -39,6 +39,37 @@ check() {   # $1 = name, $2 = expect found|none, $3 = port, $4... = rule lines
 
 check "explicit dport rule is found"            found 22 \
     '-A ufw-user-input -p tcp --dport 22 -j ACCEPT'
+
+# ── multiport ──────────────────────────────────────────────────────────────
+# `ufw allow 22,2222/tcp`, and every ufw APPLICATION PROFILE covering more
+# than one port, write `-m multiport --dports ...` rather than `--dport`. The
+# matcher only knew the singular form, so such a host read as having no SSH
+# rule at all -- rescue then cannot replay it. That fails safe (it invents
+# nothing) but it fails: the operator's own restricted rule is not restored.
+check "multiport, port first"                   found 22 \
+    '-A ufw-user-input -p tcp -m multiport --dports 22,2222 -j ACCEPT'
+check "multiport, port last"                    found 22 \
+    '-A ufw-user-input -p tcp -m multiport --dports 2222,22 -j ACCEPT'
+check "multiport, port in the middle"           found 22 \
+    '-A ufw-user-input -p tcp -m multiport --dports 80,22,443 -j ACCEPT'
+# The near-misses that a sloppy regex would swallow. 2222 and 122 both contain
+# "22" as a substring and neither permits SSH.
+check "multiport 2222 is NOT port 22"           none  22 \
+    '-A ufw-user-input -p tcp -m multiport --dports 2222,8022 -j ACCEPT'
+check "multiport 122 is NOT port 22"            none  22 \
+    '-A ufw-user-input -p tcp -m multiport --dports 122 -j ACCEPT'
+check "singular dport 2222 is NOT port 22"      none  22 \
+    '-A ufw-user-input -p tcp --dport 2222 -j ACCEPT'
+
+# ── a RECORDED limitation, not an oversight ────────────────────────────────
+# A port RANGE covering SSH (`ufw allow 20:30/tcp`) is not matched: deciding
+# whether 22 falls inside 20:30 is arithmetic, and this matcher is a grep.
+# The consequence is bounded and safe -- rescue replays nothing it cannot
+# positively identify and says so, rather than inventing a blanket rule -- so
+# this is pinned as behaviour rather than left to be rediscovered. If it ever
+# matters, the fix is to parse the range, not to loosen the regex.
+check "KNOWN LIMIT: a port range is not matched" none 22 \
+    '-A ufw-user-input -p tcp --dport 20:30 -j ACCEPT' 
 check "source-restricted dport rule is found"   found 22 \
     '-A ufw-user-input -p tcp --dport 22 -s 10.0.0.1 -j ACCEPT'
 # THE BUG. Without this case the matcher looks fine on any host that also has
