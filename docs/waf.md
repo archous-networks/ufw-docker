@@ -134,7 +134,7 @@ In keeping with the rest of these docs, the distinction is explicit.
 | `ufw allow from <range>` is honoured for container ports | **tested** — see the source-restricted test in the suite |
 | NetFlow is UDP and not carried by an HTTP proxy | protocol fact, not measured here |
 | WebSocket behaviour through a specific WAF plan | **reasoned, not tested** — verify per plan |
-| an end-to-end origin lockdown to a real WAF's egress ranges | **not tested here.** Tracked in [TODO.md](../TODO.md) |
+| an end-to-end origin lockdown to a real WAF's egress ranges | **not tested here.** Deferred as **A12** in [FUTURE.md](../FUTURE.md) |
 
 The last row matters: the central recommendation of this page — lock the origin to the
 WAF's ranges — follows from a mechanism the suite covers, but the full arrangement has

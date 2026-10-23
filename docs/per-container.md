@@ -122,4 +122,4 @@ name-based is really *resolve name → address*, and the only question is when:
 | `ipset` + a `docker events` watcher | yes, live | a resident process |
 
 The watcher is the only option that tracks dynamic addresses, and it means shipping a
-daemon. Tracked in [`TODO.md`](../TODO.md) rather than built.
+daemon. Deferred as **A3** in [`FUTURE.md`](../FUTURE.md) rather than built.

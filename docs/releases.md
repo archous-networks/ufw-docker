@@ -51,12 +51,16 @@ it answers a question nobody asked while looking like it answered the real one.
 ## What a release guarantees
 
 The artifact is attached by `.github/workflows/release.yml`, and the publish job
-`needs:` the full test matrix — which since 2026-10-22 means the lint job, the three
-native `bats` legs (including both IPv6 configurations) **and ten distro legs**, each
-running the whole suite inside a real Debian or Ubuntu release on both iptables
-backends. **The artifact cannot exist unless every leg was green** —
-shellcheck, the five lints and self-tests, and all three bats legs including
-iptables-legacy.
+`needs:` the full test matrix — which since 2026-10-23 means the lint job, **five**
+native `bats` legs and **ten distro legs**, each running the whole suite inside a real
+Debian or Ubuntu release on both iptables backends. The five native legs span both IPv6
+configurations, both iptables backends and both pinned runner images, with a
+same-configuration pair across the two images so the kernel is an isolated axis.
+**The artifact cannot exist unless every leg was green** — shellcheck, the eight
+pure-logic gates, and all five bats legs including iptables-legacy.
+
+The coverage job runs in that matrix too but is `continue-on-error`, deliberately: it is
+advisory, and a release should not be blocked by a number no threshold is set against.
 
 That workflow *calls* `test.yml` rather than repeating its steps. A release pipeline with
 its own slightly-different checks is one that eventually ships something `main` would

@@ -42,10 +42,16 @@ traffic. Agreeing on that is not derivation.
 |---|---|---|
 | ufw chain | `ufw-user-forward` | `ufw-user-forward` **and** `ufw-user-input` |
 | how you write rules | its own CLI: `ufw-docker allow httpd 80/tcp` | plain `ufw allow 80/tcp` |
-| targets | a named container | a port, as ufw always has |
+| targets | a container, by **name** | a port, as ufw always has — **or** a container, by **address**: `ufw allow to 172.20.0.10 port 80` |
 
-Theirs targets container IPs, which sidesteps the [remapped-port caveat](docs/caveats.md),
-and is older and far more widely deployed. **Use theirs if your team will accept one new
+Both end up matching an address, because iptables matches addresses and not names. The
+difference is who resolves it: theirs takes a container name, here you write the address
+yourself. That is why static IPAM is the documented shape — see
+[per-container.md](docs/per-container.md), and `ufw-docker containers` flags containers on
+dynamic addresses, the ones a rule cannot safely name. Targeting a container's address and
+its **container** port sidesteps the [remapped-port caveat](docs/caveats.md) here too.
+
+Theirs is older and far more widely deployed. **Use theirs if your team will accept one new
 verb.** This exists for when that is the sticking point.
 
 ---
@@ -88,7 +94,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
 | [Testing](docs/testing.md) | the suite, the distro and IPv6 matrices, and two ways to break your own host |
-| [Known gaps](TODO.md) | approved for immediate work, tagged and triaged |
+| [Known gaps](TODO.md) | triaged and worked; the list is currently **empty** — what it records is what was done, and why |
 | [Deferred](FUTURE.md) | reviewed and put off, each with what would bring it forward |
 
 ---
