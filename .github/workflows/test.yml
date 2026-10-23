@@ -34,7 +34,7 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh; do
+          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/coverage-shim/sudo; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: the operator-rule invariant actually fires
@@ -105,7 +105,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh
+        run: shellcheck -S warning tests/coverage-shim/sudo ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh
 
       - name: Record this job's result for the README table
         if: always()
@@ -506,6 +506,10 @@ jobs:
     runs-on: ubuntu-22.04
     continue-on-error: true
     timeout-minutes: 40
+    env:
+      # Named once; the result row reports it, so the two cannot disagree.
+      # They already did -- the row said ubuntu-24.04 beside a 6.8 kernel.
+      COV_RUNNER: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -558,10 +562,23 @@ jobs:
         # tests invoke and /usr/local/sbin/ufw-docker that the self-heal tests
         # use. --exclude-pattern keeps the .bats file itself out, or the suite
         # would be measuring its own coverage.
+        #
+        # THE SHIM IS LOAD-BEARING. kcov follows children by ptrace and cannot
+        # follow across sudo's setuid exec, and this suite invokes the tool
+        # through `sudo` 248 times. Measured, not assumed:
+        #
+        #     bats calling the tool directly   -> 931 lines, 4.40%
+        #     bats calling it through sudo     -> 0 lines,  0.00%
+        #     through tests/coverage-shim/sudo -> 931 lines, 3.54%
+        #
+        # The first run published that 0.00% as a PASS. This job already runs
+        # as root, so sudo there is ceremony; the shim applies the VAR=value
+        # prefixes and execs directly, staying inside the trace. It is on
+        # PATH for this job ONLY -- every other job uses the real sudo.
         run: |
           set -o pipefail
           HOST_IP=$(ip -4 -br addr show scope global | awk 'NR==1{print $3}' | cut -d/ -f1)
-          sudo HOST_IP="$HOST_IP" kcov \
+          sudo env PATH="$PWD/tests/coverage-shim:$PATH" HOST_IP="$HOST_IP" kcov \
             --include-pattern=ufw-docker \
             --exclude-pattern=.bats,/tests/,/docs/ \
             --bash-dont-parse-binary-dir \
@@ -572,18 +589,26 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/result"
           json="$(find "$RUNNER_TEMP/cov" -name coverage.json 2>/dev/null | head -1)"
-          if [ -z "$json" ]; then
-            # Say so plainly rather than reporting 0%, which would read as a
-            # catastrophic regression instead of "the tool did not run".
-            printf 'coverage\tline coverage of ufw-docker\t-\tubuntu-24.04\t%s\tskip\tkcov produced no report\n' \
-              "$(uname -r)" > "$RUNNER_TEMP/result/coverage.tsv"
+          tot=0
+          [ -n "$json" ] && tot=$(grep -o '"total_lines"[^,}]*' "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
+
+          # ZERO EXECUTABLE LINES IS NOT ZERO PERCENT COVERAGE -- it is no
+          # measurement at all, and the first run published it as a green tick
+          # reading "0.00% (0 of 0 executable lines)". A number nothing
+          # produced must never render as a pass: that is the same false green
+          # this table exists to prevent, committed by the table itself.
+          if [ -z "$json" ] || [ "${tot:-0}" -eq 0 ]; then
+            why="kcov produced no report"
+            [ -n "$json" ] && why="kcov attributed 0 executable lines -- it could not trace the tool"
+            echo "COVERAGE UNAVAILABLE: $why"
+            printf 'coverage\tline coverage of ufw-docker\t-\t%s\t%s\tskip\t%s\n' \
+              "$COV_RUNNER" "$(uname -r)" "$why" > "$RUNNER_TEMP/result/coverage.tsv"
           else
             pct=$(grep -o '"percent_covered"[^,]*' "$json" | tail -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
             cov=$(grep -o '"covered_lines"[^,]*' "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
-            tot=$(grep -o '"total_lines"[^,]*'   "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
             echo "coverage: ${pct}% (${cov}/${tot} executable lines)"
-            printf 'coverage\tline coverage of ufw-docker\t-\tubuntu-24.04\t%s\tpass\t%s%% (%s of %s executable lines)\n' \
-              "$(uname -r)" "${pct:-?}" "${cov:-?}" "${tot:-?}" > "$RUNNER_TEMP/result/coverage.tsv"
+            printf 'coverage\tline coverage of ufw-docker\t-\t%s\t%s\tpass\t%s%% (%s of %s executable lines)\n' \
+              "$COV_RUNNER" "$(uname -r)" "${pct:-?}" "${cov:-?}" "$tot" > "$RUNNER_TEMP/result/coverage.tsv"
           fi
           cat "$RUNNER_TEMP/result/coverage.tsv"
 

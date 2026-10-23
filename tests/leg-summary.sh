@@ -19,13 +19,22 @@ set -uo pipefail
 LOG="${1:?usage: leg-summary.sh <leg.log>}"
 [ -r "$LOG" ] || { echo "suite=? (no log)"; exit 0; }
 
-awk '
-    # `say()` prints "-- phase: <name>"; everything after it belongs to that
-    # phase until the next one. Lines before the first phase header are the
-    # bats suite itself.
-    /^-- phase: correctness under load/          { ph = "load";     sawphase = 1; next }
-    /^-- phase: rootless alongside rootful/      { ph = "rootless"; sawphase = 1; next }
-    /^-- phase: cold boot/                       { ph = "coldboot"; sawphase = 1; next }
+# ANSI is stripped FIRST. The phase headers come from container-leg.sh's
+# say(), which prints '\033[1m== phase: ...\033[0m' -- `==`, bold, not the
+# `--` that leg-rootless.sh's own say() uses. Matching only `^-- phase:`
+# found nothing, so every leg row lost its phase counts.
+#
+# That is the second time the same mistake has been made in this file's
+# lifetime, and the first fix HID it: suppressing "load=none" noise on the
+# native job (which genuinely has no phases) also suppressed the evidence
+# that detection was broken on the legs, which do. A cosmetic fix that
+# makes a real failure look tidy is worse than the noise it removed.
+#
+# Both markers are accepted now, so either say() works.
+sed 's/\x1b\[[0-9;]*m//g' "$LOG" | awk '
+    /^(--|==) phase: correctness under load/     { ph = "load";     sawphase = 1; next }
+    /^(--|==) phase: rootless alongside rootful/ { ph = "rootless"; sawphase = 1; next }
+    /^(--|==) phase: cold boot/                  { ph = "coldboot"; sawphase = 1; next }
 
     # The suite is TAP, so count its plan and its failures from the TAP stream
     # rather than from the phase helpers, which use a different vocabulary.
@@ -62,4 +71,4 @@ awk '
         }
         print ""
     }
-' "$LOG"
+'

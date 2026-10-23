@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# A `sudo` that is not sudo, used ONLY by the coverage job.
+#
+# WHY THIS EXISTS, measured rather than guessed:
+#
+#     kcov ... bats t.bats   where t.bats runs the tool DIRECTLY
+#         -> 931 executable lines, 4.40% covered
+#     kcov ... bats s.bats   where s.bats runs it through `sudo`
+#         -> 0 lines, 0.00%
+#
+# kcov follows children by ptrace, and it cannot follow across sudo's setuid
+# exec. The suite invokes the tool through `sudo` 248 times, so coverage of
+# this project is structurally 0 for as long as a real sudo is in the way --
+# and the first run duly reported "0.00% (0 of 0 lines)" as a PASS, which is
+# a green tick for a measurement that never happened.
+#
+# The coverage job already runs as root, so sudo there is pure ceremony.
+# This shim applies the VAR=value prefixes the suite uses and execs directly,
+# which keeps the process inside kcov's trace.
+#
+# It is on PATH for that one job only. Every other job uses the real sudo,
+# so nothing about how the suite is normally exercised changes.
+set -u
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "coverage-shim/sudo: not root; refusing to pretend" >&2
+    exit 1
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        # -u asks to become a DIFFERENT user, which this cannot honour and
+        # must not silently ignore -- running as root something meant to run
+        # unprivileged is the wrong direction to be wrong in. Hand those to
+        # the real sudo and accept that they fall outside the measurement.
+        -u) exec /usr/bin/sudo "$@" ;;
+        -E|-H|-n|-S) shift ;;
+        --) shift; break ;;
+        *=*) export "${1?}"; shift ;;
+        *) break ;;
+    esac
+done
+
+[ $# -gt 0 ] || exit 0
+exec "$@"
