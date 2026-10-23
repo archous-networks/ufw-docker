@@ -40,6 +40,32 @@ is kept rather than deleted because its *limitations* section is still live.
 
 ## Implemented since this list was written
 
+- **The runner images are pinned, and the kernel is now an axis.** Every job said
+  `runs-on: ubuntu-latest`, so all fourteen shared one kernel — and that label is
+  *moving*, from 24.04 to 26.04 across a month-long window, which put a free variable
+  under a suite built to detect environment differences. Jobs are pinned and the two
+  available images are spread deliberately: every distro base now runs on both, at no
+  extra cost, and one `bats` pair is the same configuration on each as a control.
+- **Upgrading over an existing stanza is tested.** It never was — every test started from
+  a clean host, which is the one state no deployed box is in after its first install.
+  Four tests: exactly one stanza survives, an old-only rule is gone from the file *and*
+  the live chain, three installs do not accumulate jumps, and the same against the real
+  previous revision read out of git.
+- **ufw's own `IPV6=no` is named as a cause.** The tool keyed IPv6 entirely off
+  `subnets 6` and never read `/etc/default/ufw`. On a host with `IPV6=no` and Docker v6
+  networks, ufw never loads `after6.rules`, so the v6 stanza is dead text — and `status`
+  reported only the symptom, for which the obvious fix (re-run `install`) cannot work.
+  Now a named red check with its own 13-case selftest, plus a warning at install time.
+- **IPv6 runs on both iptables backends.** v6 had only ever been exercised on nf_tables,
+  so every v6 claim rested on one backend.
+- **The README carries a generated status table.** Per-combination result, the kernel each
+  leg ran on, and the per-phase counts — because two consecutive green runs once had the
+  rootless phase skipping on all ten legs, and a tick cannot tell "7 assertions passed"
+  from "skipped entirely". Text, not badges: the repo is private, and camo fetches README
+  images anonymously, so any badge service renders broken.
+- **Line coverage is reported.** `kcov`, advisory and never gating — the hardest lines to
+  cover are `rescue` and the preflight refusals, and a threshold pushes those toward tests
+  that execute a line without asserting on it.
 - **H2 answered, and it found something bigger.** `DOCKER-USER` preservation is
   contractual — moby's `setupUserChain()` states it and the code matches at v26.1.4,
   v28.0.0 and master. Reading that source also turned up Docker's **nftables firewall

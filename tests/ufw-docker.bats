@@ -297,6 +297,13 @@ teardown() {
         sudo systemctl enable ufw-docker-selfheal.service >/dev/null 2>&1 || true
         rm -f "$su" "$BATS_FILE_TMPDIR/restore-selfheal-unit"
     fi
+    # A test that set IPV6=no must not leave it set -- every v6 assertion
+    # after it would then be testing the disabled path without saying so.
+    if [ -f "$BATS_FILE_TMPDIR/restore-ufw-defaults" ]; then
+        local ud; ud="$(cat "$BATS_FILE_TMPDIR/restore-ufw-defaults")"
+        [ -f "$ud" ] && sudo cp -a "$ud" /etc/default/ufw
+        rm -f "$ud" "$BATS_FILE_TMPDIR/restore-ufw-defaults"
+    fi
     if [ -f "$BATS_FILE_TMPDIR/restore-dummy-net" ]; then
         sudo docker network rm ufwmacvlan >/dev/null 2>&1 || true
         sudo ip link del ufwdummy0 >/dev/null 2>&1 || true
@@ -1542,6 +1549,177 @@ assert d["preflight_failed"] == ["swarm"], d["preflight_failed"]
 
     sudo systemctl enable ufw-docker-selfheal.service >/dev/null 2>&1
     rm -f "$saved" "$BATS_FILE_TMPDIR/restore-selfheal-unit"
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+}
+
+# ── upgrading over an existing stanza ──────────────────────────────────────
+# Nothing tested this, and it is the single most common thing that will ever
+# happen to a deployed host: a newer `ufw-docker` run over a firewall an older
+# one already wired. Every production box gets here eventually; none of them
+# get there through a clean install.
+#
+# The hazard is specific. `strip_stanza` deletes by MARKER, so an upgrade is
+# "remove whatever is between the markers, append the new one". If that ever
+# half-works the result is two stanzas, or an orphaned rule from the old one
+# still being applied -- and in both cases `install` prints success.
+
+old_stanza_into_after4() {   # $1 = version string to claim
+    # A stanza shaped like one an older release wrote: same markers (that is
+    # what makes it ours to replace), an older version line, and one rule the
+    # current generator would never emit. That last line is the probe -- it is
+    # how we tell "replaced" from "appended alongside".
+    sudo tee -a "$AFTER4" >/dev/null <<EOF
+# BEGIN DOCKER-UFW
+# Managed by ufw-docker $1. Do not edit; re-run 'install'.
+*filter
+:ufw-user-input - [0:0]
+:ufw-user-forward - [0:0]
+:ufw-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -s 192.0.2.0/24 -j RETURN
+-A DOCKER-USER -d 192.0.2.0/24 -j ufw-user-input
+-A DOCKER-USER -j RETURN
+COMMIT
+# END DOCKER-UFW
+EOF
+}
+
+# `grep -c` PRINTS 0 and EXITS 1 on no match, so the obvious
+# `grep -c ... || echo 0` emits "0\n0" and every `-eq` against it dies with
+# "integer expression expected". This file's own CLAUDE.md documents that trap
+# and it was walked into anyway -- caught here by a test that failed loudly
+# rather than one that quietly compared the wrong thing.
+#
+# awk has one exit status and one line of output, which is the whole reason to
+# prefer it. The -f guard keeps the missing-file case to a single path too.
+stanza_count() {
+    sudo test -f "$AFTER4" || { echo 0; return 0; }
+    sudo awk '/^# BEGIN DOCKER-UFW$/ { n++ } END { print n + 0 }' "$AFTER4"
+}
+
+@test "install over an older version's stanza leaves exactly ONE stanza" {
+    reinstall
+    # Start from a known-clean single stanza, then plant an older one after it
+    # so the file genuinely has two -- the state an append-only bug produces.
+    sudo sed -i "/^# BEGIN DOCKER-UFW\$/,/^# END DOCKER-UFW\$/d" "$AFTER4"
+    [ "$(stanza_count)" -eq 0 ]
+    old_stanza_into_after4 "0.0.1-ancient"
+    [ "$(stanza_count)" -eq 1 ]
+
+    run sudo "$REPO/ufw-docker" install $(install_args)
+    [ "$status" -eq 0 ]
+
+    # ONE stanza, and its markers are balanced.
+    [ "$(stanza_count)" -eq 1 ]
+    [ "$(sudo grep -c '^# END DOCKER-UFW$' "$AFTER4")" -eq 1 ]
+
+    # The old version line is gone and the current one is there.
+    local ver; ver="$(grep '^VERSION=' "$REPO/ufw-docker" | cut -d'"' -f2)"
+    ! sudo grep -q '0.0.1-ancient' "$AFTER4"
+    sudo grep -q "Managed by ufw-docker $ver" "$AFTER4"
+}
+
+@test "an older stanza's rules do not survive the upgrade" {
+    # The probe rule from the planted stanza names 192.0.2.0/24 (TEST-NET-1),
+    # which no Docker bridge will ever use -- so if it is still in the file
+    # after the upgrade, the old stanza was appended to rather than replaced.
+    reinstall
+    sudo sed -i "/^# BEGIN DOCKER-UFW\$/,/^# END DOCKER-UFW\$/d" "$AFTER4"
+    old_stanza_into_after4 "0.0.1-ancient"
+    sudo grep -q '192.0.2.0/24' "$AFTER4"          # planted, and present
+
+    run sudo "$REPO/ufw-docker" install $(install_args)
+    [ "$status" -eq 0 ]
+
+    ! sudo grep -q '192.0.2.0/24' "$AFTER4"        # gone from the file
+    # And gone from the live chain, which is the half that actually filters.
+    ! sudo iptables -S DOCKER-USER | grep -q '192.0.2.0/24'
+}
+
+@test "upgrading does not accumulate DOCKER-USER jumps" {
+    # Three installs in a row. The jump count must be identical each time:
+    # a stanza appended rather than replaced would double it, and the host
+    # would still look healthy because MORE jumps is not an error condition
+    # anything checks for.
+    reinstall
+    local a b c
+    a=$(jumps)
+    reinstall; b=$(jumps)
+    reinstall; c=$(jumps)
+    [ "$a" -gt 0 ]
+    [ "$a" -eq "$b" ]
+    [ "$b" -eq "$c" ]
+}
+
+@test "install over the PREVIOUS revision of this tool, not a synthetic one" {
+    # The tests above plant a stanza we wrote by hand, which proves the marker
+    # logic but assumes the old format was what we think it was. This runs the
+    # actual previous revision of the file out of git, so the "before" state is
+    # one that genuinely existed.
+    #
+    # Dynamic rather than a pinned SHA: "the revision before this one" is both
+    # the realistic upgrade and a target that stays correct as history grows.
+    local prev
+    prev="$(cd "$REPO" && git log --format=%H -- ufw-docker 2>/dev/null | sed -n '2p')"
+    [ -n "$prev" ] || skip "no previous revision available (shallow clone?)"
+
+    local old="$BATS_TEST_TMPDIR/ufw-docker-prev"
+    (cd "$REPO" && git show "$prev:ufw-docker") > "$old" 2>/dev/null \
+        || skip "could not read $prev:ufw-docker"
+    chmod +x "$old"
+
+    # The old revision installs, or this test has nothing to upgrade FROM.
+    # Skip rather than fail: an old revision refusing this host is a fact about
+    # that revision, not a regression in the current one.
+    run sudo "$old" install $(install_args)
+    [ "$status" -eq 0 ] || skip "the previous revision does not install here (rc=$status)"
+    [ "$(stanza_count)" -eq 1 ]
+
+    # Now the upgrade.
+    run sudo "$REPO/ufw-docker" install $(install_args)
+    [ "$status" -eq 0 ]
+    [ "$(stanza_count)" -eq 1 ]
+
+    local ver; ver="$(grep '^VERSION=' "$REPO/ufw-docker" | cut -d'"' -f2)"
+    sudo grep -q "Managed by ufw-docker $ver" "$AFTER4"
+
+    # And the host is healthy afterwards -- an upgrade that leaves a green
+    # file and a red firewall is the failure worth catching.
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -q 'IPv4 wired'
+}
+
+# ── ufw's own IPv6 switch ──────────────────────────────────────────────────
+
+@test "ufw with IPV6=no is reported as the CAUSE, not just 'not wired'" {
+    # Only meaningful where Docker actually has v6 networks -- otherwise there
+    # is no v6 stanza to be dead, and `status` correctly says so. That makes
+    # this an ipv6=true-leg test; skipping elsewhere is honest, not a gap.
+    sudo docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null \
+        | grep -q ':' || skip "Docker has no IPv6 networks on this leg"
+
+    reinstall
+    local defaults=/etc/default/ufw
+    [ -f "$defaults" ] || skip "no $defaults on this host"
+    local saved="$BATS_FILE_TMPDIR/ufw-defaults.saved"
+    sudo cp -a "$defaults" "$saved"
+    echo "$saved" > "$BATS_FILE_TMPDIR/restore-ufw-defaults"
+
+    sudo sed -i 's/^IPV6=.*/IPV6=no/' "$defaults"
+    sudo grep -q '^IPV6=no' "$defaults"
+
+    run sudo "$REPO/ufw-docker" status
+    [ "$status" -eq 1 ]
+    echo "$output" | grep -q 'IPV6=no'
+    echo "$output" | grep -q 'UNFILTERED'
+    # It must still be specific about WHY re-running install will not help.
+    echo "$output" | grep -q 'never loads'
+
+    sudo cp -a "$saved" "$defaults"
+    rm -f "$saved" "$BATS_FILE_TMPDIR/restore-ufw-defaults"
+
     run sudo "$REPO/ufw-docker" status
     [ "$status" -eq 0 ]
 }

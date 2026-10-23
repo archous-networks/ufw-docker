@@ -55,6 +55,11 @@ AFTER4="$UFW_DIR/after.rules"
 AFTER6="$UFW_DIR/after6.rules"
 USER4="$UFW_DIR/user.rules"
 BEFORE_INIT="$UFW_DIR/before.init"
+# ufw's own switches live OUTSIDE $UFW_DIR -- ufw reads config_dir/default/ufw,
+# i.e. /etc/default/ufw, not /etc/ufw/default. IPV6= in here decides whether ufw
+# loads after6.rules AT ALL, which is why we have to read it: see
+# ufw_ipv6_enabled().
+UFW_DEFAULTS=/etc/default/ufw
 
 # ufw is a Python program, and its shebang names the interpreter that is
 # guaranteed to be able to import its modules. Using a bare `python3` instead
@@ -93,6 +98,9 @@ derive_ufw_paths() {
     AFTER6="$UFW_DIR/after6.rules"
     USER4="$UFW_DIR/user.rules"
     BEFORE_INIT="$UFW_DIR/before.init"
+    # Sibling of $UFW_DIR, not a child: config_dir is /etc, so ufw's defaults
+    # file is /etc/default/ufw while its rules are in /etc/ufw.
+    UFW_DEFAULTS="${UFW_DIR%/ufw}/default/ufw"
 }
 
 # Which of ufw's files we require, and whether they are all there. Used by the
@@ -737,6 +745,22 @@ ufw_logging_on() {
     ufw status verbose 2>/dev/null | grep -qiE '^Logging: +on' 
 }
 
+# Is ufw itself doing IPv6?
+#
+# This matters more than it looks. With IPV6=no, ufw never loads after6.rules
+# and never creates ufw6-user-input -- so a v6 stanza we write is DEAD TEXT.
+# `status` would have reported the symptom ("IPv6 is NOT wired") and left the
+# operator to guess the cause, which is exactly the silent-failure shape this
+# tool exists to avoid.
+#
+# Unreadable file -> report enabled, because that is ufw's own default. The
+# failure we must not produce is a false all-clear about v6 being handled;
+# claiming it IS on when we cannot tell keeps the v6 checks live.
+ufw_ipv6_enabled() {
+    [ -r "$UFW_DEFAULTS" ] || return 0
+    ! grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*"?no"?[[:space:]]*$' "$UFW_DEFAULTS"
+}
+
 stanza() {   # $1 = 4|6
     local fam="$1" chain fchain nets
     if [ "$fam" = "6" ]; then
@@ -988,6 +1012,18 @@ cmd_install() {
     say "IPv4 Docker subnets: $(echo "$v4" | tr '\n' ' ')"
     say "IPv6 Docker subnets: $(echo "$v6" | tr '\n' ' ')${v6:+}"
     [ -z "$v6" ] && say "  (none — Docker IPv6 is off; the v6 stanza is skipped)"
+
+    # Write the v6 stanza anyway when ufw has IPV6=no -- it costs nothing and
+    # becomes live the moment someone flips the switch -- but say plainly that
+    # it is inert until then. Silently writing a file ufw does not read is how
+    # an operator ends up believing v6 is filtered when it is not.
+    if [ -n "$v6" ] && ! ufw_ipv6_enabled; then
+        warn "ufw has IPV6=no in $UFW_DEFAULTS, so it never loads after6.rules.
+    The IPv6 stanza below will be written but NOT consulted, and v6 traffic into
+    containers stays unfiltered. 'status' will report this red until it is fixed:
+        sudo sed -i 's/^IPV6=.*/IPV6=yes/' $UFW_DEFAULTS
+        sudo ufw reload && sudo ufw-docker install"
+    fi
 
     # Generate and PARSE both stanzas before touching anything. `remove`
     # previews by default and `install` did not, which was an inconsistent
@@ -1805,8 +1841,23 @@ against uptime."
     v6nets="$(subnets 6)"
     j6=$(ip6tables -S DOCKER-USER 2>/dev/null | grep -c 'ufw6-user-input') || true
     if [ -n "$v6nets" ]; then
-        [ "${j6:-0}" -gt 0 ] && st wired-v6 ok "IPv6 wired ($j6 jumps into ufw6-user-input)" \
-            || { st wired-v6 bad "Docker has IPv6 networks but IPv6 is NOT wired — v6 is unfiltered"; rc=1; }
+        # Check ufw's own IPv6 switch FIRST. If it is off, "not wired" is the
+        # symptom and this is the cause -- and no amount of re-running install
+        # fixes it, because ufw will not read the file we write.
+        if ! ufw_ipv6_enabled; then
+            st wired-v6 bad \
+                "Docker has IPv6 networks but ufw has IPV6=no in $UFW_DEFAULTS — ufw never loads
+    after6.rules, so our IPv6 stanza is dead text and v6 INTO CONTAINERS IS UNFILTERED" \
+                "Re-running install will not fix this; ufw has to be doing v6 first:
+    sudo sed -i 's/^IPV6=.*/IPV6=yes/' $UFW_DEFAULTS
+    sudo ufw reload && sudo ufw-docker install"
+            rc=1
+        elif [ "${j6:-0}" -gt 0 ]; then
+            st wired-v6 ok "IPv6 wired ($j6 jumps into ufw6-user-input)"
+        else
+            st wired-v6 bad "Docker has IPv6 networks but IPv6 is NOT wired — v6 is unfiltered"
+            rc=1
+        fi
         # Only meaningful where we actually write a v6 stanza; with Docker v6
         # off there is no v6 FORWARD jump and that is correct, not a fault.
         forward_reaches_docker_user ip6tables \

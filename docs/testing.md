@@ -150,13 +150,157 @@ own, so an old iptables is tested beside the old Docker that ships with it — w
 combination that exists in the wild. Ubuntu 22.04 is the useful outlier, pairing iptables
 1.8.7 with a *modern* daemon.
 
-### What is NOT real in there
+### The runner image is the kernel axis
+
+Every job in `test.yml` used to say `runs-on: ubuntu-latest`. That had two consequences,
+one obvious and one not.
+
+The obvious one: **all fourteen jobs shared a single kernel.** Ten distro legs, three
+bats legs, one lint job, one `uname -r`.
+
+The other one surfaced while this was being written. `ubuntu-latest` is a *moving label* —
+GitHub is rolling it from Ubuntu 24.04 to 26.04 across a month-long window — so the kernel
+underneath the entire suite changes without any commit, and during a partial rollout **two
+jobs in the same run can land on different images**. For a suite whose stated purpose is
+detecting environment differences, that is a free variable nothing in the logs explains.
+
+Every job is now pinned, and the two images available are spent deliberately:
+
+| job | runner | why that one |
+|---|---|---|
+| `distro`, `nft` legs | `ubuntu-24.04` | — |
+| `distro`, `legacy` legs | `ubuntu-22.04` | every base therefore runs on **both** kernels, at no extra cost |
+| `bats` ipv6=off/nft | **both** | same configuration, two kernels: the control |
+| other `bats` legs | split | so neither backend nor IPv6 is locked to one kernel |
+
+> ⚠️ **The distro split confounds backend with kernel, on purpose.** A single red leg
+> cannot by itself say which caused it. Two things resolve that: a kernel-specific fault
+> hits all five legs of one backend, which is a distinctive signature; and the `bats`
+> control pair is the same configuration on both images, so it isolates the kernel with
+> nothing else moving.
+
+Both images are modern kernels. **Debian 10's own 4.19 is not reachable this way at all** —
+that needs a booted VM, which is the one remaining item in [FUTURE.md](../FUTURE.md).
+
+### Upgrading over an existing stanza
+
+The most common thing that will ever happen to a deployed host is a newer `ufw-docker` run
+over a firewall an older one already wired. Nothing tested it until now; every test started
+from a clean host, which is the one state no production box is in after its first install.
+
+The hazard is specific. `strip_stanza` deletes **by marker**, so an upgrade is "remove
+what is between the markers, append the new one". A half-working version of that leaves
+two stanzas or an orphaned old rule still being applied — and `install` prints success
+either way.
+
+Four tests, in increasing order of how much they assume:
+
+| test | what it proves |
+|---|---|
+| exactly ONE stanza | a planted older stanza is replaced, not appended beside |
+| no surviving rules | a rule only the old stanza had (`192.0.2.0/24`, TEST-NET-1, which no bridge will ever use) is gone from the file **and** from the live chain |
+| no jump accumulation | three installs in a row leave the `DOCKER-USER` jump count identical — more jumps is not an error any check looks for |
+| the real previous revision | the same thing with the actual prior revision of `ufw-docker`, read out of git, so the "before" state is one that genuinely existed |
+
+The last one takes `git log -- ufw-docker | sed -n 2p` rather than a pinned SHA: "the
+revision before this one" is both the realistic upgrade and a target that stays correct as
+history grows. It needs `fetch-depth: 0` — a shallow clone has no previous revision, and
+the test would skip silently on every run.
+
+### Nothing identifying is committed
+
+`tests/lint-sanitize.sh` gates, alongside the other pure-logic checks. It refuses a real
+routable IPv4 or global IPv6 address, an email, a MAC, a personal home directory, and a
+few obvious credential shapes — with the RFC 5737 documentation ranges
+(`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), `2001:db8::/32`, ULA `fd00::/8`,
+`/home/runner` and `/home/unms` all allowed.
+
+It gates rather than advises because **a one-time scan before going public is the wrong
+shape for the problem**. What puts a real address in a file is pasting real terminal
+output into a doc, and that happens continuously — so the check has to run as often as
+the mistake can be made.
+
+It found three on its first run, every one of them pasted output nobody intended to
+commit:
+
+| value | where | why it mattered |
+|---|---|---|
+| the dev host's own public address | hardcoded `HOSTIP=` in an early probe script | names the maintainer's box |
+| an SSH source address | a sample `status` transcript in `operations.md` | published as *"this address may SSH to us"* |
+| a real routable address | the internet end of a DNAT diagram | a documentation range belongs there |
+
+The first two were already out of the working tree but still in **history**, which is the
+part a scan of `git ls-files` misses and the part that going public exposes.
+
+> The four-octet requirement is what keeps this from flagging version strings:
+> `iptables 1.8.10` and `docker 18.09.1` have three parts and never match. The planted-
+> canary test in the commit that added it proves all six categories actually fire — a
+> sanitizer that cannot fail is the same vacuous-check problem as everywhere else here.
+
+### The README status table
+
+Every job writes one TSV row — group, the two axis values, the runner image, the kernel,
+pass/fail, and a notes field — and uploads it as an artifact. A final job collects them
+and rewrites the block between the markers in `README.md`, committing with `[skip ci]`
+only on a push to `main`.
+
+**The notes column is the point of the whole mechanism**, not decoration. Two consecutive
+CI runs were fully green while the rootless phase skipped on all ten legs: the run said
+*success* and the feature had zero coverage. A tick cannot distinguish "7 assertions
+passed" from "skipped entirely", so the table reports the counts — `rootless=7` versus
+`rootless=SKIPPED` — and `tests/leg-summary.sh` derives them by parsing the same log a
+human reads, so the two cannot disagree.
+
+Two deliberate choices:
+
+- **The cells are text, not badge images.** A single workflow badge at the top of the
+  README is worth having and is a GitHub-native URL — no third party. The *cells* are text
+  because a badge carries one bit, and one bit is precisely what failed: two green runs
+  with the rootless phase skipped on all ten legs. `rootless=7` versus `rootless=SKIPPED`
+  is the distinction, and no tick expresses it. Two lesser reasons that also hold: README
+  images are proxied and **cached** by GitHub's camo, so a badge can show a stale state;
+  and text diffs, so `git log -p -- README.md` is a record of when a leg started failing.
+- **`render-matrix.sh` refuses to write an empty table.** A failed artifact download would
+  otherwise blank it silently, and a README that says nothing reads as *nothing is tested*
+  — strictly worse than a table that is one run stale.
+- **It commits only when a result actually moves.** The block carries a
+  `<!-- matrix-signature: … -->` hash over the result rows *alone*, deliberately excluding
+  the header's timestamp and run link — which differ every run and would otherwise produce
+  a bot commit on `main` after every single push. With the signature, `README.md`'s history
+  is a log of status **changes**, not a log of CI having run.
+
+### Coverage
+
+`kcov` traces bash through bats' subshells, so the number is the real suite exercising the
+real tool. The HTML report is uploaded as an artifact on every run.
+
+It is **advisory, never gating**, and that is a choice rather than an omission. The lines
+hardest to cover here are `rescue`, the preflight refusals and the error paths — exactly
+the code whose tests need a broken host to mean anything. A threshold would push those
+toward tests that execute a line without asserting on it, which is how a suite starts
+looking healthier than it is. The number is published so a **drop** is visible; it is not
+allowed to fail a build.
+
+### What a leg does not cover
 
 Stated plainly because a matrix that overstates its reach is worse than a small one.
 
 - **The kernel is the runner's**, shared by every leg. `debian:10` means Debian 10
   *userspace* on a 6.x kernel, not the 4.19 a real Debian 10 box runs. A distro whose own
-  kernel lacks an nftables feature would not be caught here.
+  kernel lacks an nftables feature would not be caught here. This is not a gap in the
+  harness — **a container image has no kernel in it**, which is checkable in one line:
+
+  ```
+  $ uname -r                              6.1.0-52-amd64
+  $ docker run --rm debian:10 uname -r    6.1.0-52-amd64     <- the HOST's
+  $ docker run --rm debian:10 ls /boot | wc -l            0  <- nothing to boot
+  ```
+
+  Note which direction the resulting pairing errs in. The legs run **old userspace on a
+  new kernel**, and Linux's standing rule is that the kernel does not break userspace —
+  so that is generally the forgiving combination. The risky one is new userspace on an old
+  kernel, which is a real production shape (Docker CE from Docker's own repo on an old
+  distro) and is **not** what these legs build.
 - **No *kernel* boot.** The init boot is covered — see the three post-suite phases below
   — but nothing here brings up an initramfs, loads modules or waits on a real NIC.
   `tests/cold-boot-check.sh` on real hardware is still the only evidence for those.

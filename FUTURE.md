@@ -234,6 +234,31 @@ that needs the distro's own kernel is not caught, and no amount of containers fi
 provider. Not prototypable on the development host, which has no `/dev/kvm`. Deferred
 again, and now the only gap of the three.
 
+**Narrowed, not closed.** Two things have changed since this was written.
+
+First, the pinned-runner split means the suite now spans **two** kernels rather than one,
+with a same-configuration control pair to isolate that axis. Both are modern; this buys
+breadth, not age.
+
+Second, the direction of the risk is clearer than the paragraph above implies, and the
+original framing overstated it. These legs run **old userspace on a new kernel**, and
+Linux's standing rule is that the kernel does not break userspace — so that is generally
+the *forgiving* combination. The pairing that actually worries is the reverse: new
+userspace on an old kernel, which is a genuine deployment shape (Docker CE from Docker's
+own apt repo on an old distro) and which no container leg builds.
+
+**Routes, ranked by what they cost:**
+
+| route | cost | reaches |
+|---|---|---|
+| QEMU under TCG | free, slow — no `/dev/kvm` here, so software emulation | a chosen kernel **and** a true power-on boot; too slow per-push, fine as a pre-tag gate |
+| a cloud box as a self-hosted runner | small, recurring | real kernels and real power cycles, per push |
+| GitHub larger runners | paid | nested virt, if standard runners indeed lack `/dev/kvm` — unconfirmed, and one `ls -l /dev/kvm` in a run settles it |
+| user-mode Linux | low | probably nothing: Docker inside UML is dubious |
+
+A VM is the only thing that closes **both** this and the remaining half of cold boot, so
+whichever route is taken, it should be one job that does both.
+
 ---
 
 ## F3 · A `.deb` package

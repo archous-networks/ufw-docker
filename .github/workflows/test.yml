@@ -22,13 +22,19 @@ permissions:
 
 jobs:
   shellcheck:
-    runs-on: ubuntu-latest
+    # PINNED, like every other job here. `ubuntu-latest` is a moving label --
+    # GitHub is rolling it from 24.04 to 26.04 through November 2026 -- so it
+    # silently changes the kernel and the toolchain under a suite whose entire
+    # purpose is detecting environment differences. Worse, during a partial
+    # rollout two jobs in the SAME run can land on different images, which is
+    # a variable nothing in the logs would have explained.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh; do
+          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: the operator-rule invariant actually fires
@@ -64,6 +70,27 @@ jobs:
         # daemon.json), so the classification is tested as pure logic here.
         run: tests/firewall-backend-selftest.sh
 
+      - name: ufw's own IPv6 switch is read correctly
+        # With IPV6=no in /etc/default/ufw, ufw never loads after6.rules -- so
+        # a v6 stanza we write is dead text and v6 into containers is
+        # unfiltered. `status` used to report only the symptom ("IPv6 is NOT
+        # wired"), leaving the operator to guess. The interesting cases are
+        # malformed config lines, which are text, so they are tested here
+        # rather than by editing a live host's ufw config per case.
+        run: tests/ufw-ipv6-selftest.sh
+
+      - name: nothing identifying is committed
+        # This repository is going PUBLIC, and a one-time scan before the flip
+        # is not enough -- what puts a real address in a file is pasting real
+        # terminal output into a doc, which happens continuously. So it gates.
+        #
+        # It found three on the first run, all pasted output nobody meant to
+        # commit: the dev host's own public address hardcoded as HOSTIP=, the
+        # maintainer's SSH source address in a sample `status` transcript
+        # (published as "this address may SSH to us"), and a real routable
+        # address used as the internet end of a DNAT diagram.
+        run: tests/lint-sanitize.sh
+
       - name: the platform matrix and the docs agree
         # Two copies of the matrix exist on purpose -- the heredoc in
         # `ufw-docker`, because the preflight must read it on a host that
@@ -78,10 +105,31 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh
+        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh
+
+      - name: Record this job's result for the README table
+        if: always()
+        # LAST in this job on purpose. `job.status` reflects the steps that
+        # have already run, so placing this before the shellcheck step would
+        # have recorded `pass` for a job shellcheck was about to fail.
+        run: |
+          st=pass; [ "${{ job.status }}" = success ] || st=fail
+          mkdir -p "$RUNNER_TEMP/result"
+          printf 'lint\t%s\t-\t%s\t%s\t%s\t%s\n' \
+            'shellcheck, syntax and 8 pure-logic gates' 'ubuntu-24.04' "$(uname -r)" "$st" \
+            'invariant, functions, version, SSH matcher, firewall backend, ufw IPv6 switch, nothing identifying, platform matrix' \
+            > "$RUNNER_TEMP/result/lint.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-lint
+          path: ${{ runner.temp }}/result/*.tsv
+          retention-days: 7
+          if-no-files-found: warn
 
   bats:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     # Was 15, and a run that failed late then spent 13 minutes in teardown got
     # CANCELLED instead of reporting -- losing the diagnostics that would have
     # explained the failure. The teardown is now bounded too (see run.sh).
@@ -99,21 +147,59 @@ jobs:
       #                      can still select on 12. Everything this project has
       #                      ever verified ran on nf_tables, and at least one
       #                      measured behaviour differs between them (see below).
+      #   ipv6 ON  / legacy  NEW. v6 had only ever run on nf_tables, so every v6
+      #                      claim this project makes rested on one backend.
       #
-      # The backend is orthogonal to IPv6, so one legacy leg proves the backend
-      # and pairing it with the simpler v6-off config isolates the variable.
+      # THE `runner` AXIS IS THE KERNEL AXIS. Every leg in this workflow used to
+      # say `ubuntu-latest`, which meant all fourteen jobs shared one kernel --
+      # and a container leg cannot vary it, because a container has no kernel of
+      # its own. Pinning two different images is the only kernel breadth
+      # available without booting a VM, so it is spent deliberately:
+      #
+      #   - legs 1 and 2 are the SAME configuration on different runners. That
+      #     pair is the control: a failure on exactly one of them is a kernel
+      #     difference and nothing else.
+      #   - the rest spread backend and IPv6 across both images so neither is
+      #     locked to a single kernel.
+      #
+      # Both are still modern kernels. Debian 10's own 4.19 is not reachable
+      # this way -- see docs/testing.md.
       fail-fast: false
       matrix:
         include:
           - docker_ipv6: false
             iptables: nft
+            runner: ubuntu-24.04
+          - docker_ipv6: false
+            iptables: nft
+            runner: ubuntu-22.04
           - docker_ipv6: true
             iptables: nft
+            runner: ubuntu-24.04
+          - docker_ipv6: true
+            iptables: legacy
+            runner: ubuntu-22.04
           - docker_ipv6: false
             iptables: legacy
-    name: bats (ipv6=${{ matrix.docker_ipv6 }}, iptables=${{ matrix.iptables }})
+            runner: ubuntu-24.04
+    name: bats (ipv6=${{ matrix.docker_ipv6 }}, iptables=${{ matrix.iptables }}, ${{ matrix.runner }})
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The upgrade test installs THE PREVIOUS REVISION of ufw-docker out
+          # of git and runs the current one over it. A shallow clone has no
+          # previous revision, so the test would skip -- quietly, on every run,
+          # which is the shape of untested-but-green this suite keeps finding.
+          fetch-depth: 0
+
+      - name: Record the kernel this leg actually ran on
+        # Printed AND recorded. The README table carries this column because
+        # "which kernel was that?" is otherwise unanswerable after the fact,
+        # and it is the one axis these legs cannot vary.
+        run: |
+          echo "runner image : ${{ matrix.runner }}"
+          echo "kernel       : $(uname -r)"
+          echo "KERNEL=$(uname -r)" >> "$GITHUB_ENV"
 
       - name: Select the iptables backend
         # FIRST, before ufw is enabled and before Docker builds any chains --
@@ -167,10 +253,27 @@ jobs:
           sleep 10
           docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'
 
-      - name: Install ufw and bats
+      - name: Install ufw, and ONE pinned bats
+        # The distro legs have pinned bats v1.11.1 from source since they were
+        # written (see tests/containers/Dockerfile, which lists the per-distro
+        # drift: debian:10 ships bats 0.4.0, which is not even bats-core).
+        # This job used apt's, which was fine while it only ever ran on one
+        # runner image -- but apt gives 1.10.0 on ubuntu-24.04 and **1.2.1 on
+        # ubuntu-22.04**, and this suite needs $BATS_FILE_TMPDIR, which arrived
+        # in 1.4.0. So the moment a 22.04 leg was added, apt's bats would have
+        # failed the whole suite for a reason that has nothing to do with the
+        # tool.
+        #
+        # Pinning here also removes an inconsistency that already existed: the
+        # legs and this job were running the same tests under two different
+        # measuring instruments.
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw bats
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw
+          git clone --depth 1 --branch v1.11.1 \
+            https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+          rm -rf /tmp/bats-core
           bats --version
 
       - name: Install ufw-docker
@@ -215,9 +318,36 @@ jobs:
           # The runner's own primary address — what the netns probe targets.
           HOST_IP: ""
         run: |
+          # pipefail, or `tee` would hand back its own exit status and a
+          # failing suite would report success. The log is teed because the
+          # README table reports the TAP counts, and deriving them from the
+          # same text a human reads means the two cannot disagree.
+          set -o pipefail
           HOST_IP=$(ip -4 -br addr show scope global | awk 'NR==1{print $3}' | cut -d/ -f1)
           echo "probing $HOST_IP"
-          sudo HOST_IP="$HOST_IP" tests/run.sh --tap
+          sudo HOST_IP="$HOST_IP" tests/run.sh --tap 2>&1 | tee "$RUNNER_TEMP/suite.log"
+
+      - name: Record this leg's result for the README table
+        if: always()
+        # always(), so a FAILING leg still reports -- a status table that only
+        # ever records passes is decoration. `continue-on-error` is deliberately
+        # NOT set: this step must not be able to turn a red leg green.
+        run: |
+          st=pass; [ "${{ job.status }}" = success ] || st=fail
+          notes="$(tests/leg-summary.sh "$RUNNER_TEMP/suite.log" 2>/dev/null || echo 'no log')"
+          mkdir -p "$RUNNER_TEMP/result"
+          printf 'native\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            '${{ matrix.docker_ipv6 }}' '${{ matrix.iptables }}' '${{ matrix.runner }}' \
+            "${KERNEL:-unknown}" "$st" "$notes" > "$RUNNER_TEMP/result/native.tsv"
+          cat "$RUNNER_TEMP/result/native.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-native-${{ matrix.docker_ipv6 }}-${{ matrix.iptables }}-${{ matrix.runner }}
+          path: ${{ runner.temp }}/result/*.tsv
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Firewall state on failure
         if: failure()
@@ -255,7 +385,22 @@ jobs:
     # The legs are not interchangeable with the `bats` job and do not replace
     # it: that one has the IPv6 coverage, which needs daemon-level `ip6tables`
     # and is left on the native runner.
-    runs-on: ubuntu-latest
+    #
+    # THE RUNNER IS THE KERNEL, and a container cannot bring its own. Splitting
+    # on the backend gives every base BOTH kernels (each base runs nft and
+    # legacy), at zero extra cost -- no added jobs, no longer wall clock.
+    #
+    # The confound is real and worth stating: backend and kernel now vary
+    # together, so a single red leg cannot by itself tell you which one did it.
+    # Two things resolve that. A kernel-specific fault hits all five legs of one
+    # backend, which is a distinctive signature; and the `bats` job runs the
+    # identical configuration on both images as a deliberate control.
+    runs-on: ${{ matrix.backend == 'nft' && 'ubuntu-24.04' || 'ubuntu-22.04' }}
+    env:
+      # The same expression is needed by `runs-on`, the kernel banner and the
+      # result row. Written once here so the three cannot drift -- `runs-on`
+      # itself cannot read a job-level env, so that one copy is unavoidable.
+      RUNNER_IMAGE: ${{ matrix.backend == 'nft' && 'ubuntu-24.04' || 'ubuntu-22.04' }}
     # MEASURED on the development host: ~12 min for a leg, of which roughly two
     # are the image build and the rest is the suite itself. A GitHub runner has
     # fewer cores, so this is deliberately generous -- the failure mode to avoid
@@ -287,6 +432,16 @@ jobs:
     name: distro (${{ matrix.base }}, ${{ matrix.backend }})
     steps:
       - uses: actions/checkout@v4
+        with:
+          # So the leg's upgrade test can read the previous revision of the
+          # tool out of git rather than skipping.
+          fetch-depth: 0
+
+      - name: Record the kernel this leg actually ran on
+        run: |
+          echo "runner image : $RUNNER_IMAGE"
+          echo "kernel       : $(uname -r)   <- SHARED with the container; ${{ matrix.base }} does not bring its own"
+          echo "KERNEL=$(uname -r)" >> "$GITHUB_ENV"
 
       - name: Run the suite inside ${{ matrix.base }} / ${{ matrix.backend }}
         # No marker file and no `sudo ufw --force enable` on the RUNNER: the
@@ -294,4 +449,183 @@ jobs:
         # per-namespace, and everything the suite does is confined to it. This
         # job never touches the runner's own firewall, which is why it needs
         # none of the native job's guard rails.
-        run: tests/container-leg.sh '${{ matrix.base }}' '${{ matrix.backend }}'
+        run: |
+          set -o pipefail
+          tests/container-leg.sh '${{ matrix.base }}' '${{ matrix.backend }}' 2>&1 \
+            | tee "$RUNNER_TEMP/leg.log"
+
+      - name: Record this leg's result for the README table
+        if: always()
+        # The notes column is the point of this whole mechanism. Two
+        # consecutive runs were green while the rootless phase skipped on ALL
+        # TEN legs -- "success" and zero coverage are indistinguishable from a
+        # tick. leg-summary.sh reports the per-phase counts so they are not.
+        run: |
+          st=pass; [ "${{ job.status }}" = success ] || st=fail
+          notes="$(tests/leg-summary.sh "$RUNNER_TEMP/leg.log" 2>/dev/null || echo 'no log')"
+          mkdir -p "$RUNNER_TEMP/result"
+          printf 'distro\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            '${{ matrix.base }}' '${{ matrix.backend }}' "$RUNNER_IMAGE" \
+            "${KERNEL:-unknown}" "$st" "$notes" > "$RUNNER_TEMP/result/distro.tsv"
+          cat "$RUNNER_TEMP/result/distro.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-distro-${{ matrix.base }}-${{ matrix.backend }}
+          path: ${{ runner.temp }}/result/*.tsv
+          retention-days: 7
+          if-no-files-found: warn
+
+  coverage:
+    # ── LINE COVERAGE OF `ufw-docker` ──────────────────────────────────────
+    # kcov traces bash through bats' subshells (verified), so this is the real
+    # suite exercising the real tool, not a proxy.
+    #
+    # ADVISORY, NOT GATING, and that is a deliberate choice rather than
+    # laziness. A coverage threshold on a tool like this rewards the wrong
+    # thing: the lines hardest to cover are `rescue`, the preflight refusals
+    # and the error paths -- exactly the code whose tests need a broken host to
+    # be meaningful. Chasing a number would push those toward shallow tests
+    # that execute a line without asserting anything, which is how a suite
+    # starts looking healthier than it is. The number is reported so a DROP is
+    # visible; it is not allowed to fail the build.
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ufw, kcov, and the same pinned bats
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw kcov
+          git clone --depth 1 --branch v1.11.1 \
+            https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+          rm -rf /tmp/bats-core
+          bats --version
+          kcov --version
+
+      - name: Install ufw-docker
+        run: sudo install -m 0755 ufw-docker /usr/local/sbin/ufw-docker
+
+      - name: Allow SSH and enable ufw
+        run: |
+          sudo ufw allow 22/tcp
+          sudo ufw --force enable
+
+      - name: Mark this runner as safe to disrupt
+        run: sudo touch /etc/ufw-docker-tests-allowed
+
+      - name: Run the suite under kcov
+        id: cov
+        # --include-pattern catches BOTH copies of the tool: the repo one most
+        # tests invoke and /usr/local/sbin/ufw-docker that the self-heal tests
+        # use. --exclude-pattern keeps the .bats file itself out, or the suite
+        # would be measuring its own coverage.
+        run: |
+          set -o pipefail
+          HOST_IP=$(ip -4 -br addr show scope global | awk 'NR==1{print $3}' | cut -d/ -f1)
+          sudo HOST_IP="$HOST_IP" kcov \
+            --include-pattern=ufw-docker \
+            --exclude-pattern=.bats,/tests/,/docs/ \
+            --bash-dont-parse-binary-dir \
+            "$RUNNER_TEMP/cov" tests/run.sh --tap 2>&1 | tail -40 || true
+
+      - name: Report the number
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/result"
+          json="$(find "$RUNNER_TEMP/cov" -name coverage.json 2>/dev/null | head -1)"
+          if [ -z "$json" ]; then
+            # Say so plainly rather than reporting 0%, which would read as a
+            # catastrophic regression instead of "the tool did not run".
+            printf 'coverage\tline coverage of ufw-docker\t-\tubuntu-24.04\t%s\tskip\tkcov produced no report\n' \
+              "$(uname -r)" > "$RUNNER_TEMP/result/coverage.tsv"
+          else
+            pct=$(grep -o '"percent_covered"[^,]*' "$json" | tail -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            cov=$(grep -o '"covered_lines"[^,]*' "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
+            tot=$(grep -o '"total_lines"[^,]*'   "$json" | tail -1 | grep -oE '[0-9]+' | head -1)
+            echo "coverage: ${pct}% (${cov}/${tot} executable lines)"
+            printf 'coverage\tline coverage of ufw-docker\t-\tubuntu-24.04\t%s\tpass\t%s%% (%s of %s executable lines)\n' \
+              "$(uname -r)" "${pct:-?}" "${cov:-?}" "${tot:-?}" > "$RUNNER_TEMP/result/coverage.tsv"
+          fi
+          cat "$RUNNER_TEMP/result/coverage.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-coverage
+          path: ${{ runner.temp }}/result/*.tsv
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-html
+          path: ${{ runner.temp }}/cov
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Always leave the runner sane
+        if: always()
+        timeout-minutes: 5
+        run: sudo timeout 180 /usr/local/sbin/ufw-docker rescue || true
+
+  matrix-table:
+    # ── THE README STATUS TABLE ────────────────────────────────────────────
+    # Collects every job's result row and rewrites the block between the
+    # markers in README.md.
+    #
+    # The cells are text rather than badge images because a badge carries one
+    # bit, and one bit is what already failed here -- two green runs with the
+    # rootless phase skipped on all ten legs. See tests/render-matrix.sh.
+    needs: [ shellcheck, bats, distro, coverage ]
+    # always(), or the table would only ever record runs in which nothing
+    # failed -- and a status table that cannot show a failure is decoration.
+    # Restricted to pushes on main: a PR must not write to the branch, and the
+    # workflow_call from release.yml should publish nothing.
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # Two pushes landing together would otherwise race to commit the same
+    # file. Serialise, and do not cancel: the later run has the newer results.
+    concurrency:
+      group: matrix-table
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+
+      - name: Render the table
+        run: |
+          find results -name '*.tsv' -exec cat {} +
+          tests/render-matrix.sh results README.md
+
+      - name: Commit it, if it changed
+        run: |
+          if git diff --quiet -- README.md; then
+            echo "no change to the table"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          # [skip ci] or this commit triggers the workflow that produced it,
+          # which would then produce an identical table, find no diff and
+          # stop -- correct, but one wasted full matrix run every push.
+          git commit -m "README: test matrix for ${GITHUB_SHA:0:7} [skip ci]"
+          # Rebase rather than force: a concurrent push is someone's work.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main

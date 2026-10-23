@@ -116,6 +116,45 @@ has them and we are not wired — a v4-only setup that looks complete is worse t
 > correctly blocked port. That cost a real debugging round here: the firewall was working
 > the entire time and the service was not listening.
 
+## ufw's own `IPV6=no` makes the v6 stanza dead text
+
+There are **two** IPv6 switches, and they fail differently. The section above is about
+Docker's. This one is about ufw's, in `/etc/default/ufw`:
+
+```
+IPV6=no
+```
+
+With that set, ufw never loads `after6.rules` at all and never creates `ufw6-user-input`.
+So the v6 stanza is written correctly, parses correctly, and **is never read** — while
+Docker happily forwards v6 into containers.
+
+The combination is not exotic. `IPV6=no` is a common hardening default on hosts that
+believe they are v4-only, and Docker acquires v6 networks later, when someone enables
+`"ipv6": true` for one compose stack.
+
+**`status` used to report only the symptom** — *"Docker has IPv6 networks but IPv6 is NOT
+wired"* — which is true, and leaves the operator to guess. The obvious response is to
+re-run `install`, which cannot possibly help: ufw will not read the file either time.
+
+It is now named:
+
+```
+[BAD] Docker has IPv6 networks but ufw has IPV6=no in /etc/default/ufw — ufw never loads
+      after6.rules, so our IPv6 stanza is dead text and v6 INTO CONTAINERS IS UNFILTERED
+      -> Re-running install will not fix this; ufw has to be doing v6 first:
+             sudo sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+             sudo ufw reload && sudo ufw-docker install
+```
+
+`install` warns about the same thing at the moment it writes the stanza, and writes it
+anyway — it costs nothing and becomes live the instant the switch is flipped.
+
+> An unreadable or absent `/etc/default/ufw` is treated as **enabled**, because that is
+> ufw's own default and because the failure that must never happen is a false all-clear
+> about v6. Reporting "enabled" keeps the v6 checks live; reporting "disabled" would
+> silence them.
+
 ## Subnets are frozen at install time
 
 A Docker network created after `install` is covered by nothing. `status` detects this and
