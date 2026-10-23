@@ -59,6 +59,9 @@ if [ ! -e "$MARKER" ]; then
       - open and close ports on this host    (brief exposure)
       - DELETE YOUR RULES on ports it drives (brief OUTAGE)
       - add and remove Docker networks and containers
+      - set ufw's default incoming policy to ALLOW, briefly, and put it back
+      - unhook DOCKER-USER from FORWARD, briefly, and put it back
+      - create and delete a dummy interface and a macvlan network
 
     That fourth one is the one people do not expect. The suite deletes rules
     on every port in TEST_PORTS, so if you have a rule on one of those ports
