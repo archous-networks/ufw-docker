@@ -19,11 +19,9 @@ Not a rule, but these have real dependencies on each other:
    the actual `v1.0.0` tag is a decision, not a task**, and is left to the maintainer.
 5. ~~**D3 last**~~ — **Done**, see *Implemented* below.
 
-**Everything approved is now done except `B1`**, which needs a deliberate reboot into a
-broken firewall on a real host — a decision about a production box, not a task.
-`tests/cold-boot-check.sh` reduces it to `arm` → `reboot` → `verify` for whenever that
-moment comes. Two of its three parts are already verified on a real reboot; only the
-repair path is outstanding.
+**Everything on this list is done.** The table below is empty; what remains is in
+[FUTURE.md](FUTURE.md), reviewed and deliberately deferred, each with what would bring
+it forward.
 
 ---
 
@@ -31,7 +29,6 @@ repair path is outstanding.
 
 | # | | | |
 |---|---|---|---|
-| **B1** | **The self-heal unit's REPAIR path has still never run at a cold boot.** Two of three parts are now verified by observation rather than declaration, on a real reboot of the development host: the wiring survives a cold boot (a no-rule port still returned `000` afterwards, so it is filtering and not merely absent), and the unit runs at boot, in the boot environment, and correctly does nothing to a healthy firewall. What remains is the repair itself. **The first attempt reported PASS having exercised nothing** — emptying `DOCKER-USER` before a reboot proves nothing, because it is runtime state and ufw rewires it from the stanza at boot, long before the unit looks; the unit logged `ufw healthy at boot` and the test counted that as success. `arm` now installs a one-shot saboteur ordered `After=docker.service Before=ufw-docker-selfheal.service`, recreating the ordering a Docker daemon starting after ufw produces, and `verify` reports **INCONCLUSIVE** rather than PASS unless self-heal logged the repair. Needs one more reboot. | [suspected] | S2 |
 
 ---
 
@@ -308,6 +305,37 @@ repair path is outstanding.
   the next real occurrence is now **self-reporting**: 3b writes a syslog line and dumps
   the nft table into the rescue snapshot before repairing, so whoever hits it has the
   evidence we currently lack instead of just a repaired host.
+
+- **B1 — the self-heal unit has now repaired a real cold boot, with the log line to
+  prove it.** Verified on the development host over three reboots:
+
+  ```
+  17:43:42  saboteur emptied DOCKER-USER
+  17:43:42  ufw-docker-selfheal starts (sleeps 20s by design)
+  17:44:02  "stanza installed but DOCKER-USER unwired - reloading ufw"
+  17:44:06  finished — jumps: 3, status healthy
+  ```
+
+  Three separate properties moved from *declared* to *observed*:
+  the wiring survives a cold boot (a no-rule port still returned `000` afterwards, so it
+  is filtering rather than merely absent); the unit runs at boot, in the boot
+  environment, and correctly leaves a healthy firewall alone; and it detects and repairs
+  the one failure with no other symptom.
+
+  **It also validated the 20-second `SELFHEAL_DELAY`,** which until now was a guess. The
+  saboteur fired at boot and the unit caught it twenty seconds later — so the delay is
+  what gives a late-starting Docker daemon time to do its damage before the unit looks.
+  Without it the unit would have checked too early and found everything fine.
+
+  **The first attempt at this reported PASS having exercised nothing**, and that is the
+  more useful half of the story. Emptying `DOCKER-USER` before a reboot proves nothing:
+  it is runtime state, and ufw rewires it from the stanza at boot long before the unit
+  looks. The unit logged `ufw healthy at boot`, the test counted the healthy firewall as
+  proof the unit had fixed it, and two bugs hid the evidence — a non-persistent arming
+  method, and `verify` grepping journal tag `ufw-docker` when `cmd_selfheal` logs as
+  `ufw-docker-selfheal`. `verify` now reports **INCONCLUSIVE** rather than PASS unless
+  the saboteur fired *and* self-heal logged the repair, with `healthy at boot` called out
+  explicitly as the trap it is.
 
 ## Fixed while compiling this list
 
