@@ -530,19 +530,27 @@ jobs:
           rm -rf /tmp/bats-core
           bats --version
 
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kcov || true
-          if ! command -v kcov >/dev/null; then
-            echo "kcov not in the archive; building v43 from source"
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-              cmake binutils-dev libcurl4-openssl-dev zlib1g-dev \
-              libdw-dev libiberty-dev libelf-dev || true
-            git clone --depth 1 --branch v43 https://github.com/SimonKagstrom/kcov.git /tmp/kcov || true
-            if [ -d /tmp/kcov ]; then
-              cmake -S /tmp/kcov -B /tmp/kcov/build >/dev/null 2>&1 \
-                && make -C /tmp/kcov/build -j"$(nproc)" >/dev/null 2>&1 \
-                && sudo make -C /tmp/kcov/build install >/dev/null 2>&1 || true
-            fi
+          # BUILD v43, do not take the archive's.
+          #
+          # ubuntu-22.04 ships kcov 38, and 38 attributed ZERO executable
+          # lines here even with the sudo shim in place, where v43 attributes
+          # 931 locally against the same tool. Rather than keep guessing at
+          # the difference, pin the version that was actually verified. apt
+          # is the fallback, not the preference -- the reverse of the usual
+          # order, because here "whatever the distro has" is the variable
+          # that broke it.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            cmake binutils-dev libcurl4-openssl-dev zlib1g-dev \
+            libdw-dev libiberty-dev libelf-dev pkg-config || true
+          git clone --depth 1 --branch v43 https://github.com/SimonKagstrom/kcov.git /tmp/kcov || true
+          if [ -d /tmp/kcov ]; then
+            cmake -S /tmp/kcov -B /tmp/kcov/build \
+              && make -C /tmp/kcov/build -j"$(nproc)" \
+              && sudo make -C /tmp/kcov/build install \
+              || echo "kcov v43 build failed; falling back to the archive"
           fi
+          command -v kcov >/dev/null \
+            || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kcov || true
           command -v kcov && kcov --version || echo "NO KCOV -- coverage will report as skipped"
 
       - name: Install ufw-docker
@@ -583,6 +591,14 @@ jobs:
             --exclude-pattern=.bats,/tests/,/docs/ \
             --bash-dont-parse-binary-dir \
             "$RUNNER_TEMP/cov" tests/run.sh --tap 2>&1 | tail -40 || true
+
+          # Diagnostics, because "0 of 0 lines" tells you nothing about WHY.
+          # Which kcov ran, whether the shim was the sudo on PATH, and what
+          # the report actually contains.
+          echo "--- kcov: $(command -v kcov) $(kcov --version 2>&1 | head -1)"
+          echo "--- sudo on PATH during the run would have been: $PWD/tests/coverage-shim/sudo"
+          echo "--- report files:"; find "$RUNNER_TEMP/cov" -name 'coverage.json' 2>/dev/null | head -3
+          find "$RUNNER_TEMP/cov" -name 'coverage.json' -exec head -c 400 {} \; 2>/dev/null; echo
 
       - name: Report the number
         if: always()
