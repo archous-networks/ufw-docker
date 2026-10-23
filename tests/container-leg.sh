@@ -104,15 +104,30 @@ say "boot systemd in $NAME"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # /sys/fs/cgroup rw and --cgroupns=host are what let systemd manage units. The
 # tmpfs mounts keep systemd's runtime state off the image layer.
-# -v /var/lib/docker is an ANONYMOUS VOLUME, and it is a speedup rather than
-# tidiness. Without it the nested daemon's graph root sits on this container's
-# own overlay layer, overlay2 refuses to stack there, and dockerd silently
-# falls back to vfs -- which copies the whole filesystem per layer. A volume
-# is ordinary filesystem, so overlay2 is selected and used.
+# BOTH graph roots need an ANONYMOUS VOLUME, and this is not tidiness.
+#
+# /var/lib/docker  -- without it the nested daemon's graph root sits on this
+#   container's own overlay layer, overlay2 refuses to stack there, and
+#   dockerd silently falls back to vfs, which copies the whole filesystem per
+#   layer. Measured: eleven tests in eight minutes against twelve for all 51.
+#
+# /var/lib/containerd -- required from Docker 29 onwards, which stores images
+#   in the CONTAINERD image store rather than the daemon's own graph driver.
+#   `docker info` reports `overlayfs` instead of `overlay2`, the daemon starts
+#   cleanly, and then every `docker run` dies with exit 125:
+#
+#     failed to mount /tmp/containerd-mountNNN: ... fstype: overlay ...
+#     workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/...
+#     err: invalid argument
+#
+#   Volume one does nothing for it, because the snapshots are not under
+#   /var/lib/docker at all. This is exactly why the Ubuntu 22.04 and 24.04
+#   legs (docker.io 29.1.3) failed while Debian 11 and 12 (20.10) passed --
+#   a split that looks like a distro difference and is a Docker-29 one.
 docker run -d --name "$NAME" \
     --privileged --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -v /var/lib/docker \
+    -v /var/lib/docker -v /var/lib/containerd \
     --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
     "$IMAGE" >/dev/null || exit 1
 trap cleanup EXIT INT TERM
