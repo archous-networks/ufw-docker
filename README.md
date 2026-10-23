@@ -2,12 +2,12 @@
 
 [![test](https://github.com/archous-networks/ufw-docker/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/archous-networks/ufw-docker/actions/workflows/test.yml)
 
-<!-- The badge above is a GitHub-native URL, so it needs no third party. It
-     renders as a broken image while this repository is PRIVATE -- GitHub
-     proxies README images through camo, which fetches anonymously -- and
-     starts working by itself the moment the repo goes public. Nothing to
-     change at that point. The per-combination results below are text on
-     purpose; see docs/testing.md. -->
+<!-- The badge above is a GitHub-native URL, so it needs no third party.
+     It reports one bit: did the last run of the whole matrix pass. The
+     per-combination results below are text rather than a wall of badges
+     on purpose -- a tick cannot distinguish "7 assertions passed" from
+     "skipped entirely", and that difference has gone unnoticed here
+     before. See docs/testing.md. -->
 
 Make plain `ufw allow` and `ufw deny` actually govern **Docker-published ports**.
 

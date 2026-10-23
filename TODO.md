@@ -61,8 +61,9 @@ is kept rather than deleted because its *limitations* section is still live.
 - **The README carries a generated status table.** Per-combination result, the kernel each
   leg ran on, and the per-phase counts — because two consecutive green runs once had the
   rootless phase skipping on all ten legs, and a tick cannot tell "7 assertions passed"
-  from "skipped entirely". Text, not badges: the repo is private, and camo fetches README
-  images anonymously, so any badge service renders broken.
+  from "skipped entirely". Text, not badges -- and that still holds now the repo is
+  public: the objection was never that badges would not render, it was that a tick
+  carries one bit where the interesting failure needs a count.
 - **Line coverage is reported.** `kcov`, advisory and never gating — the hardest lines to
   cover are `rescue` and the preflight refusals, and a threshold pushes those toward tests
   that execute a line without asserting on it.
@@ -297,9 +298,11 @@ is kept rather than deleted because its *limitations* section is still live.
   and there is not one yet. A checksum presented as provenance is worse than none,
   because it looks like it answered the question it did not.
 
-  **Not done, deliberately:** no tag has been cut. `VERSION` is still `0.9.0`. Choosing
-  when `v1.0.0` happens is the maintainer's call, and `lint-version.sh` will refuse a
-  tag that disagrees with the file.
+  **`VERSION` is `1.0.0`, bumped 2026-10-23; the tag itself is the maintainer's call
+  and has not been cut here.** It waited on the matrix being green and runnable, which
+  it was not while the repo was private and Actions was billing-blocked.
+  `lint-version.sh` gates the tag against the file, in the suite and again in the
+  publish job that names the artifact, so the two cannot disagree.
 
 - **A7, A10, B5, C5, D3, E8, X3, X4, X5 — the S3 batch.**
   - **A7** host-network containers are listed in their own section of `containers`, and
