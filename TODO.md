@@ -22,7 +22,8 @@ Not a rule, but these have real dependencies on each other:
 **Everything approved is now done except `B1`**, which needs a deliberate reboot into a
 broken firewall on a real host — a decision about a production box, not a task.
 `tests/cold-boot-check.sh` reduces it to `arm` → `reboot` → `verify` for whenever that
-moment comes.
+moment comes. Two of its three parts are already verified on a real reboot; only the
+repair path is outstanding.
 
 ---
 
@@ -30,7 +31,7 @@ moment comes.
 
 | # | | | |
 |---|---|---|---|
-| **B1** | **The self-heal unit has never repaired anything at a real cold boot.** Much reduced: the unit is now driven by systemd against a genuinely broken firewall and verified to repair it, restore a *restricted* SSH rule, log what it did, and leave a healthy firewall alone; its enablement and ordering are asserted declaratively. What remains is only the boot race, which is verified **by declaration rather than observation** — and the only honest way to test a boot race is to boot. **`tests/cold-boot-check.sh` now makes this two commands with a reboot between them** (`arm` → `reboot` → `verify`); it refuses to arm if the unit is not enabled, and refuses to pass if `boot_id` is unchanged. Deliberately not in the suite: nothing should reboot a host as a side effect of running tests. **This is a decision about a production box, not a task** — it needs someone to choose a moment. | [suspected] | S2 |
+| **B1** | **The self-heal unit's REPAIR path has still never run at a cold boot.** Two of three parts are now verified by observation rather than declaration, on a real reboot of the development host: the wiring survives a cold boot (a no-rule port still returned `000` afterwards, so it is filtering and not merely absent), and the unit runs at boot, in the boot environment, and correctly does nothing to a healthy firewall. What remains is the repair itself. **The first attempt reported PASS having exercised nothing** — emptying `DOCKER-USER` before a reboot proves nothing, because it is runtime state and ufw rewires it from the stanza at boot, long before the unit looks; the unit logged `ufw healthy at boot` and the test counted that as success. `arm` now installs a one-shot saboteur ordered `After=docker.service Before=ufw-docker-selfheal.service`, recreating the ordering a Docker daemon starting after ufw produces, and `verify` reports **INCONCLUSIVE** rather than PASS unless self-heal logged the repair. Needs one more reboot. | [suspected] | S2 |
 
 ---
 

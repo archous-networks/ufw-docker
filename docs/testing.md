@@ -239,17 +239,50 @@ sudo reboot
 sudo tests/cold-boot-check.sh verify   # did the unit put it back?
 ```
 
-`arm` states the cost before doing anything and requires you to type `break it`:
+### Why the obvious way to break it does not work
 
-- it empties `DOCKER-USER`, so **Docker-published ports are unfiltered** from that moment
-  until the unit repairs them after the reboot;
-- it does **not** touch SSH, which arrives on `INPUT` — there is no lockout risk here,
-  only an exposure window, and it lasts as long as you delay the reboot.
+The first version of this simply emptied `DOCKER-USER` and rebooted. **It reported PASS
+having exercised nothing**, and the only reason that was caught is that the self-heal
+unit's log line said `ufw healthy at boot`.
 
-It refuses to arm if the self-heal unit is not enabled, since nothing would then repair
-it. `verify` refuses to pass if `/proc/sys/kernel/random/boot_id` is unchanged — a check
-that "survived a reboot" without a reboot is the purest form of a test that passes for
-the wrong reason, and this suite has shipped three of those already.
+`DOCKER-USER` is **runtime state, not configuration**. At boot ufw starts, applies
+`after.rules`, and the stanza in it rewires the chain — so the damage is undone by the
+very reboot it was supposed to survive, long before the self-heal unit looks. The unit
+found a healthy firewall, correctly did nothing, and the test counted the healthy
+firewall as proof that the unit had fixed it.
+
+The condition the unit actually exists for is: **ufw applies the stanza, and then
+something flushes `DOCKER-USER` afterwards** — which is exactly what a Docker daemon
+starting after ufw does. So `arm` now installs a one-shot saboteur unit ordered
+`After=docker.service` and `Before=ufw-docker-selfheal.service`, which recreates that
+ordering on the next boot and nothing else.
+
+Consequences for how it behaves:
+
+- **`arm` changes nothing immediately.** Your firewall is untouched until the reboot.
+- On the next boot, Docker-published ports are unfiltered for the seconds between the
+  saboteur firing and the unit repairing — and if the unit does *not* repair, they stay
+  that way until you run `install`. That is the finding the test exists to get.
+- SSH is never affected; it arrives on `INPUT`.
+- `sudo tests/cold-boot-check.sh disarm` cancels before rebooting, and `verify` removes
+  the saboteur whether it passed or failed — a test fixture that survives the test is a
+  trap for the next boot.
+
+`verify` demands positive evidence and reports **INCONCLUSIVE**, never PASS, when it does
+not have it:
+
+- the saboteur did not run → nothing was broken, so nothing was proven;
+- self-heal logged `healthy at boot` → something else repaired it first and the unit's
+  repair path was not exercised (this is precisely the trap above);
+- only `stanza installed but DOCKER-USER unwired` counts as a pass.
+
+It also refuses to pass if `/proc/sys/kernel/random/boot_id` is unchanged — "survived a
+reboot" without a reboot is the purest form of a test that passes for the wrong reason,
+and this suite has now shipped four of those.
+
+**And it reads the right journal tag.** `cmd_selfheal` logs as `ufw-docker-selfheal`, not
+`ufw-docker`; the first version grepped the latter, printed "No entries", and hid the one
+piece of evidence that mattered.
 
 A failure here is a *finding*, not an inconvenience: it would mean the unit's ordering is
 wrong on a real boot, which is the single scenario it was written for.
