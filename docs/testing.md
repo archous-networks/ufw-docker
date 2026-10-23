@@ -585,7 +585,7 @@ removed afterwards only if the suite created it.
 something a real service plausibly listens on. Every port in `TEST_PORTS` is a port the
 suite will *delete a rule for*, which is the whole reason this matters.
 
-## The part of cold boot that still cannot be automated
+## The part of cold boot that is not automated yet
 
 The self-heal unit is verified in almost every respect by the suite — systemd drives it
 against a genuinely broken firewall, it repairs it, it restores a *restricted* SSH rule
@@ -599,6 +599,20 @@ initramfs, no module loading, no real NIC, and the kernel never restarts.
 
 So the remaining gap is narrow and specific: **a real cold start, with ufw at ~3.7s and
 Docker at ~8.1s on actual hardware.** The only honest way to test that is to boot.
+
+**That is now possible in CI, and is not done.** `tests/vm-leg.sh` boots a real VM under
+KVM on a free runner — a genuine power-on, with an initramfs, module loading and a kernel
+that actually starts — so the mechanism this section says is missing exists. What the VM
+legs do *not* yet do is run the cold-boot phase inside the guest: they boot once and run
+the bats suite, rather than sabotaging `DOCKER-USER` and power-cycling the machine to
+watch the self-heal unit repair it against a real boot ordering.
+
+Wiring `leg-coldboot.sh` into the VM leg is the obvious next step and the reason the VM
+work is worth more than one gap: a VM is the only thing that closes this *and* the kernel
+axis, so it should be one job doing both. Until that is written, this paragraph describes
+a gap that is reachable rather than one that is structural — a distinction worth keeping,
+because the version of this heading that said "cannot be automated" was true when written
+and stopped being true without anybody editing it.
 
 `tests/cold-boot-check.sh` makes it two commands with a reboot between them. It is
 deliberately **not** part of the suite: nothing should reboot a host as a side effect of

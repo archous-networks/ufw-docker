@@ -34,7 +34,7 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/coverage-shim/sudo tests/kcov-summary.sh; do
+          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/vm-leg.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/coverage-shim/sudo tests/kcov-summary.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: the operator-rule invariant actually fires
@@ -105,7 +105,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning tests/coverage-shim/sudo tests/kcov-summary.sh ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh
+        run: shellcheck -S warning tests/coverage-shim/sudo tests/kcov-summary.sh ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/firewall-backend-selftest.sh tests/ufw-ipv6-selftest.sh tests/lint-sanitize.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh tests/leg-coldboot.sh tests/leg-rootless.sh tests/leg-load.sh tests/leg-summary.sh tests/render-matrix.sh tests/vm-leg.sh
 
       - name: Record this job's result for the README table
         if: always()
@@ -486,6 +486,83 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+  vm:
+    # ── REAL VIRTUAL MACHINES: EACH DISTRO ON ITS OWN KERNEL ───────────────
+    # The distro legs above give us each release's USERSPACE on the runner's
+    # kernel, which is where most behaviour lives. These give us its KERNEL.
+    #
+    # GitHub's standard runners expose /dev/kvm -- nested virtualisation is
+    # on, and standard runners are free and unmetered on public repos, so a
+    # leg costs wall clock and nothing else. That is MEASURED, not promised:
+    # see FUTURE.md. tests/vm-leg.sh REFUSES to run if /dev/kvm is missing
+    # rather than falling back to software emulation, because a silent
+    # fallback would turn a 10-minute leg into a multi-hour one that looks
+    # like a hang.
+    #
+    # Two things live only here:
+    #   1. the netfilter stack that shipped WITH the release -- debian:10 in a
+    #      container is Debian 10 tooling on a 6.x kernel, not the 4.19 a real
+    #      Debian 10 box runs;
+    #   2. configurations a modern kernel makes unbuildable. Debian 10's own
+    #      docker.io is 18.09.1, which predates cgroup v2 and cannot start on
+    #      the runner's kernel at all -- so the container leg substitutes
+    #      docker-ce (see tests/containers/Dockerfile). On a 4.19 guest
+    #      cgroups are v1 and it runs. That is the most ordinary old host
+    #      there is, and nothing tested it until this job existed.
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ debian-10, debian-11, debian-12 ]
+        backend: [ nft, legacy ]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The upgrade test reads the previous revision of `ufw-docker` out
+          # of git; a shallow clone has none and the test skips SILENTLY.
+          fetch-depth: 0
+
+      - name: The leg
+        run: |
+          set -o pipefail
+          VM_FACTS_FILE="$RUNNER_TEMP/vm-facts" \
+            tests/vm-leg.sh '${{ matrix.distro }}' '${{ matrix.backend }}' distro 2>&1 \
+            | tee "$RUNNER_TEMP/leg.log"
+
+      - name: Record this leg's result for the README table
+        if: always()
+        # LAST in the job on purpose: `job.status` reflects the steps that
+        # have already run, so placing this earlier would record `pass` for a
+        # job that was about to fail.
+        run: |
+          st=pass; [ "${{ job.status }}" = success ] || st=fail
+          notes="$(tests/leg-summary.sh "$RUNNER_TEMP/leg.log" 2>/dev/null || echo 'no log')"
+          # The GUEST's kernel, read from the facts file the leg writes -- not
+          # $(uname -r), which would print the runner's and quietly turn this
+          # table into a copy of the container one.
+          k=unknown
+          if [ -r "$RUNNER_TEMP/vm-facts" ]; then
+            k="$(awk -F= '$1 == "kernel" { v = $2 } END { print (v == "" ? "unknown" : v) }' \
+                 "$RUNNER_TEMP/vm-facts")"
+          fi
+          mkdir -p "$RUNNER_TEMP/result"
+          # No slug step here, unlike the distro legs: these names are
+          # `debian-10`, not `debian:10`, and an artifact name may not contain
+          # a colon.
+          printf 'vm\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            '${{ matrix.distro }}' '${{ matrix.backend }}' 'ubuntu-24.04' \
+            "$k" "$st" "$notes" > "$RUNNER_TEMP/result/vm.tsv"
+          cat "$RUNNER_TEMP/result/vm.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-vm-${{ matrix.distro }}-${{ matrix.backend }}
+          path: ${{ runner.temp }}/result/*.tsv
+          retention-days: 7
+          if-no-files-found: warn
+
   coverage:
     # ── LINE COVERAGE OF `ufw-docker` ──────────────────────────────────────
     # kcov traces bash through bats' subshells (verified), so this is the real
@@ -669,7 +746,7 @@ jobs:
     # The cells are text rather than badge images because a badge carries one
     # bit, and one bit is what already failed here -- two green runs with the
     # rootless phase skipped on all ten legs. See tests/render-matrix.sh.
-    needs: [ shellcheck, bats, distro, coverage ]
+    needs: [ shellcheck, bats, distro, vm, coverage ]
     # always(), or the table would only ever record runs in which nothing
     # failed -- and a status table that cannot show a failure is decoration.
     # Restricted to pushes on main: a PR must not write to the branch, and the

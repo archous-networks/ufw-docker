@@ -230,9 +230,9 @@ A leg is that distro's **userspace** on whatever kernel the runner boots. `debia
 is Debian 10 tooling on a 6.x kernel, not the 4.19 a real Debian 10 box runs. A failure
 that needs the distro's own kernel is not caught, and no amount of containers fixes it.
 
-**What would close it:** real VMs per distro — self-hosted runners or a nested-virt
-provider. Not prototypable on the development host, which has no `/dev/kvm`. Deferred
-again, and now the only gap of the three.
+**What would close it:** real VMs per distro. This was recorded as needing self-hosted
+runners or a nested-virt provider, and **that turned out to be false** — see *Measured:
+the free runners can do this* below.
 
 **Narrowed, not closed.** Two things have changed since this was written.
 
@@ -247,17 +247,46 @@ the *forgiving* combination. The pairing that actually worries is the reverse: n
 userspace on an old kernel, which is a genuine deployment shape (Docker CE from Docker's
 own apt repo on an old distro) and which no container leg builds.
 
-**Routes, ranked by what they cost:**
+### Measured: the free runners can do this
 
-| route | cost | reaches |
+The routes table that used to sit here ranked four options by cost, and ranked them
+against the assumption that hardware virtualisation was the paid tier's privilege. The
+table said the point was "unconfirmed, and one `ls -l /dev/kvm` in a run settles it".
+
+**It was run, on 2026-10-23, and it settles it the other way.** On *standard*,
+free-for-public-repos runners:
+
+| | `ubuntu-24.04` | `ubuntu-22.04` |
 |---|---|---|
-| QEMU under TCG | free, slow — no `/dev/kvm` here, so software emulation | a chosen kernel **and** a true power-on boot; too slow per-push, fine as a pre-tag gate |
-| a cloud box as a self-hosted runner | small, recurring | real kernels and real power cycles, per push |
-| GitHub larger runners | paid | nested virt, if standard runners indeed lack `/dev/kvm` — unconfirmed, and one `ls -l /dev/kvm` in a run settles it |
-| user-mode Linux | low | probably nothing: Docker inside UML is dubious |
+| `/dev/kvm` | **present** | **present** |
+| mode | `0660 root:kvm`, and `runner` is not in that group | same |
+| `kvm-ok` | `KVM acceleration can be used` | `KVM acceleration can be used` |
+
+The group membership is the only obstacle and `sudo chmod 0666 /dev/kvm` removes it. With
+that done, both of these booted under `-accel kvm` on a free runner, from a true power-on:
+
+```
+Linux version 4.19.0-21-amd64      <- Debian 10's own kernel
+Linux version 6.1.0-50-amd64       <- Debian 12's own kernel
+```
+
+That 4.19 is precisely what the paragraph above says no container can reach.
+
+**So the ranking is gone rather than reordered.** QEMU-under-TCG existed only as the free
+option when KVM looked paid; a self-hosted cloud box and larger runners both bought
+something the free tier already has; UML was never promising. There is one route now, and
+it costs nothing.
+
+**What is still unmeasured — stated, because it is the part that decides the shape.** A
+boot is not a leg. Whether a whole leg (cloud image, Docker, ufw, the suite, results
+back out) fits a per-push budget or wants to be nightly has *not* been measured. An
+attempt to time KVM against TCG in the same probe measured nothing useful: the installer
+initrd reaches a prompt and waits, so both runs hit their `timeout` ceiling and the two
+numbers that came back were the ceilings. The comparison is moot regardless, since there
+is no longer a reason to emulate.
 
 A VM is the only thing that closes **both** this and the remaining half of cold boot, so
-whichever route is taken, it should be one job that does both.
+it should be one job that does both.
 
 ---
 

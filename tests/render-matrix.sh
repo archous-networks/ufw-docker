@@ -25,7 +25,7 @@
 # RESULT FILE FORMAT -- one TSV line per job:
 #   group<TAB>col1<TAB>col2<TAB>runner<TAB>kernel<TAB>status<TAB>notes
 #
-# group is one of: lint native distro coverage
+# group is one of: lint native distro vm coverage
 # status is one of: pass fail skip
 set -uo pipefail
 
@@ -71,7 +71,7 @@ echo "collected $(wc -l < "$ALL") result rows" >&2
 # The empty-collection guard above did not catch it: there were plenty of
 # rows, just none of the ones that matter most. So check per GROUP.
 missing=""
-for g in ${MATRIX_EXPECT_GROUPS:-lint native distro}; do
+for g in ${MATRIX_EXPECT_GROUPS:-lint native distro vm}; do
     awk -F'\t' -v g="$g" '$1 == g { found = 1 } END { exit !found }' "$ALL" \
         || missing="$missing $g"
 done
@@ -138,6 +138,23 @@ BODY="$(mktemp)"
     [ -n "${GITHUB_RUN_ID:-}" ] && run_line=" · [run ${GITHUB_RUN_NUMBER:-?}](https://github.com/${GITHUB_REPOSITORY:-archous-networks/ufw-docker}/actions/runs/${GITHUB_RUN_ID})"
     echo "Every combination below runs on **every push**. Last updated $(date -u '+%Y-%m-%d %H:%M UTC')${run_line}, commit \`$(printf '%.7s' "${GITHUB_SHA:-unknown}")\`."
     echo
+
+    # ── the real-VM legs ───────────────────────────────────────────────────
+    # First, deliberately. This is the strongest claim the matrix makes, and
+    # the distro section immediately below it is the SAME distros on a
+    # different kernel -- putting them adjacent is the whole comparison.
+    if has vm; then
+        echo '#### Virtual-machine legs — each distro'"'"'s own kernel, booted under KVM'
+        echo
+        echo '| distro | iptables | runner | guest kernel | result | suite |'
+        echo '|---|---|---|---|---|---|'
+        rows_for vm matrix
+        echo
+        echo 'The kernel column here is the **guest'"'"'s** — the kernel that release actually'
+        echo 'ships. In the container table below it is the *runner'"'"'s*, because a container'
+        echo 'image carries no kernel. That difference is the reason both tables exist.'
+        echo
+    fi
 
     # ── the distro legs ────────────────────────────────────────────────────
     if has distro; then
