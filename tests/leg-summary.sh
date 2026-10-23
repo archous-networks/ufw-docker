@@ -40,7 +40,17 @@ sed 's/\x1b\[[0-9;]*m//g' "$LOG" | awk '
     # rather than from the phase helpers, which use a different vocabulary.
     ph == "" && /^ok [0-9]/                      { okc++ }
     ph == "" && /^not ok [0-9]/                  { nokc++ }
-    ph == "" && /^# skip|# SKIP/                 { skipc++ }
+    # A TAP skip is `ok 38 <name> # skip <reason>` -- the directive is at the
+    # END of the ok line, not the start of a line of its own. The rule here
+    # used to be /^# skip/, which TAP never emits, so skipc was ALWAYS zero
+    # and every row read "suite=63/63" for a run that passed 60 and skipped 3.
+    #
+    # That is this file being caught by the thing it was written to catch: the
+    # header above complains that a tick cannot distinguish "7 assertions
+    # passed" from "skipped entirely", and the summary meant to fix that was
+    # doing the same thing one level down. TAP counts a skip as ok, so the
+    # total stays 63 and the skipped count is reported beside it.
+    ph == "" && /^ok [0-9]+.*# *[Ss][Kk][Ii][Pp]/ { skipc++ }
 
     ph != "" && /^pass  /                        { p[ph]++ }
     ph != "" && /^FAIL  /                        { f[ph]++ }
