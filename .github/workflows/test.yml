@@ -193,7 +193,7 @@ jobs:
         run: sudo touch /etc/ufw-docker-tests-allowed
 
       - name: Run the suite
-        # MEASURED, not guessed: ~4.5 min per nft leg for 44 tests (runs
+        # MEASURED, not guessed: ~4.5 min per nft leg for the suite (runs
         # 39863384004 and later). The old comment here said "~2 minutes", which
         # had quietly stopped being true -- and the whole point of this note is
         # to tell the next person whether a slow run means a hang.
@@ -249,7 +249,7 @@ jobs:
     # and is left on the native runner.
     runs-on: ubuntu-latest
     # MEASURED on the development host: ~12 min for a leg, of which roughly two
-    # are the image build and the rest is the 51-test suite. A GitHub runner has
+    # are the image build and the rest is the suite itself. A GitHub runner has
     # fewer cores, so this is deliberately generous -- the failure mode to avoid
     # is a cancelled job, which takes the diagnostics with it and tells you
     # nothing. That has already cost this project two runs.

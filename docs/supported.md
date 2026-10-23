@@ -17,14 +17,54 @@ ufw-docker platforms      # the matrix, plus where this host sits in it
 
 | label | distro | ver | ufw | backend | docker | verified by | status |
 |---|---|---|---|---|---|---|---|
-| `dev-00` | debian | 12 | 0.36.2 | nf_tables | 29.7.1 | full suite, every run | **supported** |
-| `site-00` | debian | 12 | 0.36.2 | nf_tables | 29.9.2 | survey; same class as `dev-00` | **supported** |
-| `ci-nft` | ubuntu | 24 | 0.36.x | nf_tables | ci | CI, both IPv6 legs green | **supported** |
-| `ci-legacy` | ubuntu | 24 | 0.36.x | legacy | ci | CI, green on run 39868550084 | **supported** |
+| `deb10-nft` | debian | 10 | 0.36 | nf_tables | 26.1.4 | CI leg `distro (debian:10, nft)` | **supported** |
+| `deb10-legacy` | debian | 10 | 0.36 | legacy | 26.1.4 | CI leg `distro (debian:10, legacy)` | **supported** |
+| `deb11-nft` | debian | 11 | 0.36 | nf_tables | 20.10.5 | CI leg `distro (debian:11, nft)` | **supported** |
+| `deb11-legacy` | debian | 11 | 0.36 | legacy | 20.10.5 | CI leg `distro (debian:11, legacy)` | **supported** |
+| `deb12-nft` | debian | 12 | 0.36.2 | nf_tables | 20.10.24 | CI leg, plus full suite on a 29.7.1 host | **supported** |
+| `deb12-legacy` | debian | 12 | 0.36.2 | legacy | 20.10.24 | CI leg `distro (debian:12, legacy)` | **supported** |
+| `ubu22-nft` | ubuntu | 22 | 0.36.1 | nf_tables | 29.1.3 | CI leg `distro (ubuntu:22.04, nft)` | **supported** |
+| `ubu22-legacy` | ubuntu | 22 | 0.36.1 | legacy | 29.1.3 | CI leg `distro (ubuntu:22.04, legacy)` | **supported** |
+| `ubu24-nft` | ubuntu | 24 | 0.36.2 | nf_tables | 29.1.3 | CI legs `bats` nft ×2, and `distro` nft | **supported** |
+| `ubu24-legacy` | ubuntu | 24 | 0.36.2 | legacy | 29.1.3 | CI legs `bats` legacy, and `distro` legacy | **supported** |
 
 Matching is on **distro + major version + iptables backend**. ufw and Docker versions are
 recorded but deliberately *not* matched on — they move constantly, and gating on them
 would turn every routine upgrade into a refusal.
+
+**Every one of those rows is re-proven on every push.** A leg runs the whole
+suite inside that actual distribution, with its own systemd and its own Docker daemon —
+see [testing.md](testing.md#the-distro-matrix--real-distributions-in-containers). The
+range covered is iptables **1.8.2 → 1.8.10**, ufw **0.36 → 0.36.2**, Docker **20.10 →
+29.1**, on both backends.
+
+## What the legs cannot prove
+
+Stated here rather than buried, because a matrix that overstates its reach is worse than
+a small one.
+
+| not covered | why |
+|---|---|
+| **each distro's own kernel** | a leg is that distro's *userspace* on the runner's kernel. `deb10-*` is Debian 10 tooling on a 6.x kernel, not the 4.19 a real Debian 10 box runs |
+| **cold boot** | the self-heal unit exists for a real machine coming up with ufw at ~3.7s and Docker at ~8.1s. `tests/cold-boot-check.sh` on real hardware, still manual |
+| **real load** | a leg is a clean room with one container; a production host has dozens |
+
+## Hosts this has actually run on
+
+An **inventory, not evidence** — these are machines we have seen, and they are listed
+separately so they are never mistaken for a reason a platform is supported. The matrix
+above is the evidence.
+
+| host | distro | ufw | backend | docker | how we know |
+|---|---|---|---|---|---|
+| dev-00 | Debian 12 | 0.36.2 | nf_tables | 29.7.1 | full suite on demand, plus a verified cold boot |
+| site-00 | Debian 12 | 0.36.2 | nf_tables | 29.9.2 | `tools/ufw-docker-survey` only |
+
+> An earlier version of this page had both of those **in the matrix**, as two rows with
+> one key, and justified the second with *"same class as `dev-00`"*. That is precisely the
+> family-resemblance argument the rule below forbids, written into the table the rule
+> governs. A third row claimed "full suite, every run" for something run by hand.
+> Customer names are still kept out of this repo; the `site-NN` mapping lives outside it.
 
 ## The rule for adding a row
 
@@ -37,12 +77,20 @@ because this project has twice been wrong about which was which.
 To add one:
 
 1. Run `sudo tools/ufw-docker-survey` on the host and keep the output.
-2. Get a green CI leg for that distro/version/backend combination, or run the full suite
-   on a host of that class.
-3. Add the row, with the evidence named.
+2. **Add a CI leg for it** — a `base` and `backend` pair in the `distro` job of
+   `.github/workflows/test.yml` — and get it green. Try it locally first with
+   `tests/container-leg.sh <base-image> <nft|legacy>`, which is the same script.
+3. Add the row, naming that leg as the evidence.
 
-Labels are opaque on purpose: **customer names do not belong in a public repo.** The
-`site-NN` mapping is kept outside it.
+Step 2 used to read "or run the full suite on a host of that class", which is how a row
+ended up justified by a family resemblance. A one-off run proves the day it ran; a leg
+proves every push. Take the manual route only where a leg genuinely cannot reach — a
+distro-specific kernel is the real example — and then say so in the **verified by**
+column instead of implying CI covers it.
+
+A row is a **platform**, not a machine. Hosts you have surveyed go in *Hosts this has
+actually run on* above, which is an inventory. **Customer names do not belong in a
+public repo**; the `site-NN` mapping is kept outside it.
 
 ## What is deliberately not in the matrix
 
