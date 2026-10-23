@@ -137,7 +137,7 @@ tested". It now prints `A9 IS NOT COVERED BY THIS LEG` whenever it skips.
 | base | rootless |
 |---|---|
 | Debian 11 / 12 | **covered** — `docker.io` ships the upstream wrapper |
-| Debian 10 | no wrapper on the docker-ce install the leg uses |
+| Debian 10 | no — `rootlesskit`/`slirp4netns` are not in the buster archive |
 | Ubuntu 22.04 / 24.04 | **not covered.** `docker.io` 29.x ships neither `dockerd-rootless.sh` nor `docker-ce-rootless-extras`, and invoking `rootlesskit` directly gets a daemon that panics inside its own `Shutdown` path during `NewDaemon` |
 
 The tool's behaviour does not depend on the distro — it is reading a socket path and a

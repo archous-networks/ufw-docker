@@ -207,9 +207,22 @@ Where it can and cannot run, measured:
 
 | base | rootless |
 |---|---|
-| Debian 11 / 12 | **yes** — `docker.io` ships `/usr/share/docker.io/contrib/dockerd-rootless.sh` |
-| Debian 10 | no wrapper on the docker-ce install the leg uses |
-| Ubuntu 22.04 / 24.04 | **no.** `docker.io` 29.x ships neither the wrapper nor `docker-ce-rootless-extras`, and invoking `rootlesskit` directly gets a daemon that **panics inside its own `Shutdown` path** during `NewDaemon` — a nil-pointer deref that hides whatever actually failed to initialise |
+| Debian 11 / 12 | **covered** — `docker.io` ships `/usr/share/docker.io/contrib/dockerd-rootless.sh` |
+| Debian 10 | no — `rootlesskit`/`slirp4netns` are not in the buster archive |
+| Ubuntu 22.04 / 24.04 | **no.** `docker.io` 29.x ships neither the wrapper nor `docker-ce-rootless-extras`, and invoking `rootlesskit` directly gets a daemon that **panics inside its own `Shutdown` path** during `NewDaemon` — a nil-pointer deref that hides whatever actually failed to initialise. Not a cgroup problem; it persists with the driver forced |
+
+> **Rootless Docker defaults to the systemd cgroup driver**, which resolves container
+> cgroups under `/sys/fs/cgroup/user.slice/user-<uid>.slice` — a path that exists only
+> where `systemd-logind` has made a session for that user. A leg runs with
+> `--cgroupns=host` and so sees the *runner's* cgroup tree, where it does not exist, and
+> every `docker run` died with `cgroup.controllers: no such file or directory`.
+>
+> It passed on the development box **for the worst possible reason**: that host has a
+> `user-1000.slice` from the maintainer's own login session, and the rootless user
+> happened to get uid 1000 too. The phase was passing on state it had not established —
+> the same shape as the `nf_log_all_netns` mistake. Fixed with
+> `--exec-opt native.cgroupdriver=cgroupfs`, and the rootless user is now pinned to the
+> deliberately unusual **uid 4242** so a local run cannot borrow a slice it did not make.
 
 The fallback that invokes `rootlesskit` directly is kept even though Ubuntu 29.x cannot
 use it: it is what the wrapper does, so a docker-ce host without the extras package is

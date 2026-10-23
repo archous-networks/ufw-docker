@@ -65,7 +65,8 @@ says() {   # says <substring> <command...>
 
 cleanup() {
     dexec sh -c '
-        su - rootless -c "XDG_RUNTIME_DIR=/run/user/1000 DOCKER_HOST=unix:///run/user/1000/docker.sock PATH=/usr/sbin:/usr/bin:/sbin:/bin docker rm -f rl-web" >/dev/null 2>&1
+        u=$(id -u rootless 2>/dev/null || echo 0)
+        su - rootless -c "XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock PATH=/usr/sbin:/usr/bin:/sbin:/bin docker rm -f rl-web" >/dev/null 2>&1
         pkill -u rootless -f dockerd >/dev/null 2>&1
         pkill -u rootless -f rootlesskit >/dev/null 2>&1
         loginctl disable-linger rootless >/dev/null 2>&1
@@ -92,6 +93,27 @@ if ! dexec sh -c 'command -v rootlesskit >/dev/null && command -v slirp4netns >/
     exit 0
 fi
 
+# --iptables=false: a rootless daemon has no business writing host netfilter
+#   rules, and inside a privileged container it would be allowed to try.
+#
+# native.cgroupdriver=cgroupfs: ROOTLESS DOCKER DEFAULTS TO THE SYSTEMD DRIVER,
+#   which resolves container cgroups under /sys/fs/cgroup/user.slice/
+#   user-<uid>.slice -- a path that only exists if systemd-logind has made a
+#   session for that user. A leg runs with --cgroupns=host, so it sees the
+#   RUNNER's cgroup tree, where no such slice exists, and every `docker run`
+#   died with:
+#
+#     open /sys/fs/cgroup/user.slice/user-1000.slice/cgroup.controllers:
+#     no such file or directory
+#
+#   It worked on the development box for the worst possible reason: that host
+#   has a user-1000.slice from the maintainer's OWN login session, and the
+#   rootless user happened to get uid 1000 too. The phase was passing on state
+#   it had not established -- the same shape as the nf_log_all_netns mistake.
+#   Hence also the deliberately unusual uid 4242 below: a local run must not
+#   be able to borrow a slice it did not create.
+DOCKERD_FLAGS="--iptables=false --exec-opt native.cgroupdriver=cgroupfs"
+
 say "how will we start the rootless daemon on this base?"
 # Debian's docker.io ships the upstream wrapper at
 # /usr/share/docker.io/contrib/dockerd-rootless.sh, and a docker-ce host has it
@@ -112,7 +134,7 @@ RLSH="$(dexec sh -c 'ls /usr/share/docker.io/contrib/dockerd-rootless.sh /usr/bi
 if [ -n "$RLSH" ]; then
     echo "using the distro's own wrapper: $RLSH"
     START="export PATH=$(dirname "$RLSH"):/usr/sbin:/usr/bin:/sbin:/bin
-           nohup dockerd-rootless.sh --iptables=false > /tmp/rootless.log 2>&1 &"
+           nohup dockerd-rootless.sh $DOCKERD_FLAGS > /tmp/rootless.log 2>&1 &"
 else
     echo "no dockerd-rootless.sh on this base — invoking rootlesskit directly"
     START="export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -120,13 +142,13 @@ else
                --net=slirp4netns --mtu=65520 --disable-host-loopback \
                --port-driver=builtin \
                --copy-up=/etc --copy-up=/run --propagation=rslave \
-               dockerd --iptables=false > /tmp/rootless.log 2>&1 &"
+               dockerd $DOCKERD_FLAGS > /tmp/rootless.log 2>&1 &"
 fi
 
 say "stand up a rootless daemon beside the rootful one"
 dexec sh -c '
     set -e
-    id rootless >/dev/null 2>&1 || useradd -m -s /bin/bash rootless
+    id rootless >/dev/null 2>&1 || useradd -m -u 4242 -s /bin/bash rootless
     grep -q "^rootless:" /etc/subuid || echo "rootless:100000:65536" >> /etc/subuid
     grep -q "^rootless:" /etc/subgid || echo "rootless:100000:65536" >> /etc/subgid
     loginctl enable-linger rootless
