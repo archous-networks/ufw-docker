@@ -130,6 +130,20 @@ development box, which reported `rspaeth` while the daemon was inside a test con
 Still refused: a **rootless-only** host, where nothing published traverses `DOCKER-USER`
 and there is nothing for the stanza to do.
 
+**Where the per-push coverage actually reaches, stated because the first CI run hid it.**
+That run skipped the phase on all ten legs and went green, which reads as "rootless is
+tested". It now prints `A9 IS NOT COVERED BY THIS LEG` whenever it skips.
+
+| base | rootless |
+|---|---|
+| Debian 11 / 12 | **covered** — `docker.io` ships the upstream wrapper |
+| Debian 10 | no wrapper on the docker-ce install the leg uses |
+| Ubuntu 22.04 / 24.04 | **not covered.** `docker.io` 29.x ships neither `dockerd-rootless.sh` nor `docker-ce-rootless-extras`, and invoking `rootlesskit` directly gets a daemon that panics inside its own `Shutdown` path during `NewDaemon` |
+
+The tool's behaviour does not depend on the distro — it is reading a socket path and a
+process list — so Debian coverage is the substance. The gap is in the *fixture*, not in
+what is being asserted, and it is recorded rather than papered over.
+
 ---
 
 ## A12 · Origin lockdown to a WAF's egress ranges

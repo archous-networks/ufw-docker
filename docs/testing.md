@@ -182,7 +182,7 @@ has already failed on produces cascade noise that buries the real failure.
 
 | phase | script | what it proves |
 |---|---|---|
-| `load` | `tests/leg-load.sh` | 200 concurrent connections against a DENY all refused, 200 against an ALLOW all succeed, rule set byte-identical afterwards |
+| `load` | `tests/leg-load.sh` | 200 concurrent connections against a DENY all refused, 200 against an ALLOW all succeed, rule set byte-identical afterwards (counters normalised — see below) |
 | `rootless` | `tests/leg-rootless.sh` | a rootless daemon beside a rootful one is NAMED by `status` and `containers`, its port appears in no iptables rule, and plain `ufw deny` does block it |
 | `coldboot` | `tests/leg-coldboot.sh` | with `DOCKER-USER` emptied after ufw applies the stanza, the self-heal unit notices at the next init boot and repairs it |
 
@@ -198,13 +198,39 @@ It is not a machine starting.
 > `--tmpfs`, recreated on container start, so a marker surviving it means the init did
 > not actually restart.
 
-The rootless phase **skips rather than fails** where rootless cannot be stood up — an
-older base without `rootlesskit` or the `dockerd-rootless.sh` contrib script. A skip
-prints as a skip; it must never read as a pass.
+The rootless phase **skips rather than fails** where rootless cannot be stood up, and
+says so in two lines — the reason, and `A9 IS NOT COVERED BY THIS LEG`. The first CI run
+skipped on **all ten legs** and the run was green, which reads as "rootless is tested"
+to anyone who does not open the log. A skip must never be mistaken for coverage.
+
+Where it can and cannot run, measured:
+
+| base | rootless |
+|---|---|
+| Debian 11 / 12 | **yes** — `docker.io` ships `/usr/share/docker.io/contrib/dockerd-rootless.sh` |
+| Debian 10 | no wrapper on the docker-ce install the leg uses |
+| Ubuntu 22.04 / 24.04 | **no.** `docker.io` 29.x ships neither the wrapper nor `docker-ce-rootless-extras`, and invoking `rootlesskit` directly gets a daemon that **panics inside its own `Shutdown` path** during `NewDaemon` — a nil-pointer deref that hides whatever actually failed to initialise |
+
+The fallback that invokes `rootlesskit` directly is kept even though Ubuntu 29.x cannot
+use it: it is what the wrapper does, so a docker-ce host without the extras package is
+covered, and the attempt is recorded rather than silently skipped.
+
+> **Ask the daemon, do not look for its socket.** rootlesskit creates
+> `$XDG_RUNTIME_DIR/docker.sock` before dockerd finishes initialising, and the file
+> survives dockerd dying — so `test -S` succeeded against a daemon that had already
+> panicked, and the phase printed `pass rootless daemon up:` with an **empty version**.
+> Poll `docker version --format {{.Server.Version}}` until it answers.
 
 > One trap worth keeping: inside `rootlesskit`, `dockerd` is not on a normal user's
 > `PATH`. It lives in `/usr/sbin`, so the failure is a bare `exec: dockerd: not found`
 > that reads like a rootless problem and is a `PATH` one.
+
+The load phase **normalises packet counters before comparing rule sets**. `iptables-save`
+writes each chain's policy as `:PREROUTING ACCEPT [pkts:bytes]`, and sending 400
+connections through the box is the entire point — so comparing them failed with a
+one-line diff of exactly those numbers. It was also nondeterministic, passing on seven
+legs and failing on three, which is the signature of a flaky test rather than of the bug
+it was meant to catch.
 
 ### Three traps, all of which produced a confident wrong answer first
 

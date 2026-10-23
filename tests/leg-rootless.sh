@@ -32,7 +32,13 @@ say() { printf '\n-- %s\n' "$*"; }
 rc=0
 fail() { echo "FAIL  $*"; rc=1; }
 pass() { echo "pass  $*"; }
-skip() { echo "SKIP  $*"; }
+# A skip must never read as coverage. The first CI run skipped on all ten
+# legs and the run was green, which says "rootless is tested" to anyone who
+# does not read the log.
+skip() {
+    echo "SKIP  $*"
+    echo "      A9 IS NOT COVERED BY THIS LEG — a green leg does not mean rootless was tested."
+}
 
 # A HELPER, NOT A STYLE CHOICE. `cmd | grep -q pattern` under `set -o pipefail`
 # is wrong in TWO independent ways, and this phase hit both before it worked:
@@ -80,21 +86,41 @@ says 'IPv4 wired' dexec /usr/local/sbin/ufw-docker status \
     || { echo "FAIL  the tool is not installed and wired — status returns early and reports nothing. Not a pass."
          dexec /usr/local/sbin/ufw-docker status 2>&1 | tail -20; exit 1; }
 
-say "is rootless installable on this base?"
-# dockerd-rootless.sh ships in the distro's own docker packaging on Debian
-# (/usr/share/docker.io/contrib) and in docker-ce-rootless-extras on a
-# docker-ce host. Find it rather than hardcoding one of those.
-RLSH="$(dexec sh -c 'ls /usr/share/docker.io/contrib/dockerd-rootless.sh /usr/bin/dockerd-rootless.sh /usr/libexec/docker/cli-plugins/../dockerd-rootless.sh 2>/dev/null | head -1' 2>/dev/null)"
-if [ -z "$RLSH" ]; then
-    skip "no dockerd-rootless.sh on this base — rootless cannot be stood up here"
-    exit 0
-fi
-echo "found: $RLSH"
-
 dexec sh -c 'apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rootlesskit slirp4netns uidmap dbus-user-session >/dev/null 2>&1' || true
 if ! dexec sh -c 'command -v rootlesskit >/dev/null && command -v slirp4netns >/dev/null'; then
     skip "rootlesskit/slirp4netns not available on this base"
     exit 0
+fi
+
+say "how will we start the rootless daemon on this base?"
+# Debian's docker.io ships the upstream wrapper at
+# /usr/share/docker.io/contrib/dockerd-rootless.sh, and a docker-ce host has it
+# from docker-ce-rootless-extras. UBUNTU'S docker.io 29.x SHIPS NEITHER --
+# verified on 24.04, where contrib holds only check-config.sh and
+# nuke-graph-directory.sh, and docker-ce-rootless-extras is not in the archive.
+#
+# Skipping there costs four of the ten legs, so fall back to invoking
+# rootlesskit directly. That is not a reimplementation: the wrapper's whole job
+# is this one exec, and the flags below are the ones it passes. The port
+# driver matters most and is stated explicitly rather than left to default,
+# because `builtin` is what makes a published port a USERSPACE LISTENER -- the
+# single fact every assertion in this phase rests on.
+#
+# Which path was used is printed, because "rootless worked" means something
+# slightly different in each case and a reader should not have to guess.
+RLSH="$(dexec sh -c 'ls /usr/share/docker.io/contrib/dockerd-rootless.sh /usr/bin/dockerd-rootless.sh 2>/dev/null | head -1' 2>/dev/null)"
+if [ -n "$RLSH" ]; then
+    echo "using the distro's own wrapper: $RLSH"
+    START="export PATH=$(dirname "$RLSH"):/usr/sbin:/usr/bin:/sbin:/bin
+           nohup dockerd-rootless.sh --iptables=false > /tmp/rootless.log 2>&1 &"
+else
+    echo "no dockerd-rootless.sh on this base — invoking rootlesskit directly"
+    START="export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+           nohup rootlesskit \
+               --net=slirp4netns --mtu=65520 --disable-host-loopback \
+               --port-driver=builtin \
+               --copy-up=/etc --copy-up=/run --propagation=rslave \
+               dockerd --iptables=false > /tmp/rootless.log 2>&1 &"
 fi
 
 say "stand up a rootless daemon beside the rootful one"
@@ -115,27 +141,51 @@ UID_R="$(dexec id -u rootless)"
 # rootlesskit and reads like a rootless problem rather than a PATH one.
 dexec sh -c "su - rootless -c '
     export XDG_RUNTIME_DIR=/run/user/$UID_R
-    export PATH=$(dirname "$RLSH"):/usr/sbin:/usr/bin:/sbin:/bin
-    nohup dockerd-rootless.sh --iptables=false > /tmp/rootless.log 2>&1 &
+    $START
 '" || true
-for _ in $(seq 1 30); do
-    dexec test -S "/run/user/$UID_R/docker.sock" && break
+# ASK THE DAEMON, do not look for its socket file.
+#
+# rootlesskit creates the socket before dockerd has finished initialising, and
+# it survives dockerd dying. Waiting on `test -S` therefore succeeds on a
+# daemon that is already dead -- which is exactly what happened on Ubuntu
+# 24.04, where docker.io 29.1.3 panics inside its own Shutdown path during
+# NewDaemon. The phase printed `pass rootless daemon up:` with an EMPTY
+# version and carried on. A readiness check that cannot fail is not one.
+rlver() {
+    dexec sh -c "su - rootless -c 'XDG_RUNTIME_DIR=/run/user/$UID_R DOCKER_HOST=unix:///run/user/$UID_R/docker.sock docker version --format {{.Server.Version}}'" 2>/dev/null
+}
+RLVER=""
+for _ in $(seq 1 40); do
+    RLVER="$(rlver)"
+    [ -n "$RLVER" ] && break
     sleep 1
 done
-if ! dexec test -S "/run/user/$UID_R/docker.sock"; then
-    skip "rootless dockerd did not come up on this base"
-    dexec sh -c 'tail -5 /tmp/rootless.log' 2>/dev/null || true
+if [ -z "$RLVER" ]; then
+    skip "rootless dockerd did not come up on this base (no version from the socket)"
+    dexec sh -c 'grep -nE "level=(error|fatal)|^panic|error:" /tmp/rootless.log | tail -10' 2>/dev/null | sed 's/^/      /' || true
     exit 0
 fi
-pass "rootless daemon up: $(dexec sh -c "su - rootless -c 'XDG_RUNTIME_DIR=/run/user/$UID_R DOCKER_HOST=unix:///run/user/$UID_R/docker.sock docker info --format {{.ServerVersion}}'" 2>/dev/null)"
+pass "rootless daemon up: $RLVER"
 
 say "publish a port from a rootless container"
-dexec sh -c "docker save python:3-alpine | su - rootless -c 'XDG_RUNTIME_DIR=/run/user/$UID_R DOCKER_HOST=unix:///run/user/$UID_R/docker.sock PATH=/usr/sbin:/usr/bin:/sbin:/bin docker load'" >/dev/null 2>&1 \
-    || { skip "could not side-load the image into the rootless daemon"; exit 0; }
-dexec sh -c "su - rootless -c '
+if ! out="$(dexec sh -c "docker save python:3-alpine | su - rootless -c 'XDG_RUNTIME_DIR=/run/user/$UID_R DOCKER_HOST=unix:///run/user/$UID_R/docker.sock PATH=/usr/sbin:/usr/bin:/sbin:/bin docker load'" 2>&1)"; then
+    skip "could not side-load the image into the rootless daemon"
+    printf '%s\n' "$out" | tail -10 | sed 's/^/      /'
+    exit 0
+fi
+# SAY WHY. The first CI run skipped here on every leg that got this far, and
+# the message alone -- "rootless container would not start" -- was useless:
+# ten green legs, zero A9 coverage, and nothing to act on.
+if ! out="$(dexec sh -c "su - rootless -c '
     export XDG_RUNTIME_DIR=/run/user/$UID_R DOCKER_HOST=unix:///run/user/$UID_R/docker.sock PATH=/usr/sbin:/usr/bin:/sbin:/bin
     docker run -d --name rl-web -p $PORT:80 python:3-alpine python -m http.server 80
-'" >/dev/null 2>&1 || { skip "rootless container would not start"; exit 0; }
+'" 2>&1)"; then
+    skip "rootless container would not start"
+    printf '%s\n' "$out" | tail -10 | sed 's/^/      /'
+    echo "      --- rootless daemon log ---"
+    dexec sh -c 'tail -15 /tmp/rootless.log' 2>/dev/null | sed 's/^/      /' || true
+    exit 0
+fi
 sleep 4
 
 LEGIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$NAME")"

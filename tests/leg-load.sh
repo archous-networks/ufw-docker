@@ -113,7 +113,25 @@ echo "allow: ok=$ok blocked=$blocked"
     && pass "every connection succeeded under load with an ALLOW in place" \
     || fail "$blocked of $TOTAL were dropped while the rule said allow"
 
-rules_before="$(dexec sh -c 'iptables-save 2>/dev/null | grep -v "^#" | grep -vE "^\[" ')"
+# NORMALISE THE COUNTERS, or this assertion is self-defeating.
+#
+# `iptables-save` prints each chain's policy line as `:PREROUTING ACCEPT
+# [pkts:bytes]`. Sending 400 connections through the box is the entire point
+# of this phase, so those numbers MUST change -- and comparing them made the
+# check fail with a diff of exactly one line:
+#
+#     < :PREROUTING ACCEPT [2743:391817]
+#     > :PREROUTING ACCEPT [3748:452117]
+#
+# Worse than simply wrong: it was nondeterministic, passing on seven legs and
+# failing on three, which is the signature of a flaky test rather than of the
+# bug it was meant to find. The question is whether the RULES changed.
+save_rules() {
+    dexec sh -c 'iptables-save 2>/dev/null' \
+        | grep -v '^#' \
+        | sed 's/\[[0-9]\{1,\}:[0-9]\{1,\}\]/[0:0]/'
+}
+rules_before="$(save_rules)"
 
 say "$TOTAL requests at concurrency $CONC against a DENY"
 dexec sh -c "ufw delete allow $PORT/tcp; ufw deny $PORT/tcp" >/dev/null 2>&1
@@ -135,7 +153,7 @@ echo "deny: ok=$ok blocked=$blocked"
     || fail "$ok of $TOTAL LEAKED THROUGH a deny rule under concurrency"
 
 say "the firewall did not rewrite itself under load"
-rules_after="$(dexec sh -c 'iptables-save 2>/dev/null | grep -v "^#" | grep -vE "^\[" ')"
+rules_after="$(save_rules)"
 # The deny itself is an expected difference; compare everything EXCEPT rules
 # mentioning the test port.
 b="$(printf '%s\n' "$rules_before" | grep -v "$PORT" | sort)"
