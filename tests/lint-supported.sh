@@ -56,15 +56,41 @@ done < <(rows)
 
 [ "$n" -gt 0 ] || { echo "### NO MATRIX ROWS FOUND — did the heredoc marker change?"; rc=1; }
 
-# And the reverse: a label documented that the tool does not know about.
+# And the reverse: a label documented AS A MATRIX ROW that the tool does not
+# know about.
+#
+# Scoped to the `## The matrix` section, not the whole page. An earlier version
+# grepped the entire file for `(dev|site|ci)-[a-z0-9]+`, which (a) could not
+# see a label containing a second hyphen and (b) would flag any host named
+# anywhere on the page -- so the page could not carry a fleet inventory beside
+# the matrix without the lint calling every host a missing row. The matrix and
+# "machines we happen to have seen" are different claims and the page says so;
+# the lint has to agree.
+# The leading backtick is required, not cosmetic: it is what distinguishes a
+# data row from the `| label | distro | ... |` HEADER, which otherwise comes
+# back as a label named "label".
+doc_matrix_labels() {
+    awk '/^## The matrix/{f=1; next} /^## /{f=0} f' "$DOC" \
+        | awk -F'|' '/^\| *`/ {gsub(/[ `]/, "", $2); if ($2 ~ /^[a-z][a-z0-9-]+$/) print $2}'
+}
+
+n_doc=0
 while read -r lbl; do
     [ -n "$lbl" ] || continue
+    n_doc=$((n_doc+1))
     rows | grep -q -- "$lbl" || {
         echo "### IN THE DOCS BUT NOT IN THE MATRIX: $lbl"
         echo "    the preflight will never match it; remove it or add the row"
         rc=1
     }
-done < <(grep -oE '\b(dev|site|ci)-[a-z0-9]+\b' "$DOC" | sort -u)
+done < <(doc_matrix_labels | sort -u)
+
+# A section heading that got renamed would silently disable the check above.
+[ "$n_doc" -gt 0 ] || {
+    echo "### NO ROWS FOUND under '## The matrix' in $DOC"
+    echo "    the reverse check is doing nothing; did the heading change?"
+    rc=1
+}
 
 if [ "$rc" -eq 0 ]; then
     echo "ok  platform matrix and docs/supported.md agree ($n rows)"

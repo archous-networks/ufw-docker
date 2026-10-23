@@ -321,8 +321,14 @@ detect_ssh_ports() {
         SSH_SRC="sshd -T"
     fi
     if [ -z "$ports" ]; then
+        # `split()` RETURNS the element count; do not reach for `length(a)`.
+        # Debian 10's mawk rejects length() on an array outright -- `awk: line
+        # 1: illegal reference to array a` -- so this whole branch produced
+        # nothing there, silently, and SSH port detection fell through to the
+        # port-22 guess. Found by the Debian 10 CI leg, which is the entire
+        # reason that leg exists.
         ports="$(ss -tlnp 2>/dev/null \
-            | awk '/sshd/{split($4,a,":"); print a[length(a)]}' | sort -u)"
+            | awk '/sshd/{n=split($4,a,":"); print a[n]}' | sort -u)"
         SSH_SRC="listening sockets"
     fi
     if [ -z "$ports" ]; then

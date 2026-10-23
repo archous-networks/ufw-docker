@@ -110,39 +110,53 @@ honestly in its measured-vs-reasoned table, so the page does not claim more than
 
 ---
 
-## X2 · Support for the other environments
+## X2 · Support for the other environments — **DONE**
 **S2 · the other half of X1**
 
-Once the preflight refuses on unverified setups, "supporting" a new environment becomes a
-defined piece of work: verify it, add a green CI leg, add a matrix row. One entry per
-environment, each gated behind its own proof:
+Moved out of "deferred" on 2026-10-22: the real CI matrix was built. It is kept here
+rather than deleted because the *reasoning* about what is and is not covered is still
+live, and because the kernel caveat below is a standing limitation, not a finished task.
 
 | environment | status |
 |---|---|
-| iptables-legacy | **done.** A11 green; `ubuntu 24 / legacy` is a `supported` row, evidenced by run 39868550084 |
-| Debian 10 / 11 | **unblocked — see below.** Still unproven, but no longer expensive |
-| rootless Docker | A9 above |
+| iptables-legacy | **done.** A11 green; evidenced by run 39868550084, and now by a `legacy` leg per distro |
+| Debian 10 / 11 / 12, Ubuntu 22.04 / 24.04 | **done.** `tests/container-leg.sh`, run per distro × backend on every push |
+| rootless Docker | A9 above — still open |
 | Swarm | closed as out of scope — see `caveats.md` |
 
-### The blocker on Debian legs turned out not to be real
+### What it turned out to cost
 
-This said "no GitHub Debian runners", which is true and was taken to mean VMs, DinD or
-self-hosted infrastructure. **Measured on the dev host, it means none of those.** A
-privileged `debian:12` container with `systemd-sysv`, `--cgroupns=host` and dockerd
-inside gives systemd as pid1, a working Docker daemon, its own network namespace, and
-**iptables v1.8.9** — the exact version the fleet runs and the one CI cannot reach today.
-`install`, the netns probe and the filtering tests all passed inside it.
+The blocker was recorded here as "no GitHub Debian runners", which is true and was read
+as meaning VMs, DinD or self-hosted infrastructure. It meant none of those: a privileged
+container with `systemd-sysv`, `--cgroupns=host` and dockerd inside gives a real init, a
+real daemon, its own network namespace and **that distro's own iptables**. One day, as
+estimated.
 
-That turns the matrix from one distro into Debian 10/11/12 + Ubuntu × {nft, legacy},
-covering iptables **1.8.2 / 1.8.7 / 1.8.9 / 1.8.10**, on stock runners.
+It paid for itself the same day, on the oldest leg:
 
-Worth stating plainly while it is still deferred: **CI tests Ubuntu 24.04 / iptables
-1.8.10 only, and nothing in the fleet runs that.** Debian 12 is verified by full suite
-runs on a real host, which is strong evidence but not per-push — so a Debian-only
-regression would reach `main` green.
+- **a real portability bug** — `awk 'length(a)'` on an array, which Debian 10's mawk
+  rejects outright, so SSH port detection silently fell through to guessing port 22 on
+  every Debian 10 host. `rescue` depends on that detection.
+- **Docker 18.09 cannot start on a cgroup v2 kernel at all** (`Devices cgroup isn't
+  mounted`), so Debian 10's own `docker.io` is not a configuration that exists in the
+  field — the leg uses docker-ce, which is what such a host must run.
+- **iptables 1.8.2 prints `-p 6`, not `-p tcp`.** Anything matching rule text by protocol
+  name reads an old host as having no rule.
 
-**Brings it forward:** a survey result, or a customer, on an environment we refuse — or
-simply the decision to spend a day on it before tagging `v1.0.0`.
+### The standing limitation: the kernel is always the runner's
+
+A leg is that distro's **userspace** on whatever kernel the runner boots. `debian:10`
+is Debian 10 tooling on a 6.x kernel, not the 4.19 a real Debian 10 box runs. A failure
+that needs the distro's own kernel is not caught, and no amount of containers fixes it.
+
+Also not covered, and listed so nobody assumes otherwise: **cold boot** (the self-heal
+unit's entire purpose, still `tests/cold-boot-check.sh` on real hardware, still manual)
+and **real load** (a leg is a clean room; the development host runs sixteen containers
+and a live UISP stack).
+
+**What would close the kernel gap:** real VMs per distro — self-hosted runners or a
+nested-virt provider. Deferred again, and now a much smaller gap than it was: everything
+reachable without a distro kernel is already covered per push.
 
 ---
 

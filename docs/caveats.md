@@ -129,9 +129,17 @@ Worth running `status` from cron for exactly this reason.
 
 ## The untested cases below are now REFUSED, not merely documented
 
-Everything in this file used to be a caveat you had to read. Swarm, rootless Docker and
-a non-nf_tables backend are now **preflight failures**: `install` refuses, and `status`
+Everything in this file used to be a caveat you had to read. Swarm, rootless Docker, a
+mixed iptables backend, ufw's files not being where ufw says, and any platform the
+matrix does not cover are now **preflight failures**: `install` refuses, and `status`
 reports them on every run. A caveat in a document protects nobody who has not read it.
+
+> This used to say "a non-nf_tables backend" was itself a failure. **It is not, and the
+> standalone check that said so is gone.** iptables-legacy is supported and has its own
+> CI leg per distro; the backend is one of the three fields the platform matrix matches
+> on, so an unproven *combination* is refused while a proven legacy host installs
+> normally. Keeping both the hardcoded rule and the matrix column was two answers to one
+> question, and they disagreed within hours of being written.
 
 `--unsupported --force` overrides it, loudly and permanently — see the README.
 

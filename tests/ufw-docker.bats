@@ -533,11 +533,23 @@ teardown_file() {
     for i in $(seq 1 12); do
         probe 19089 >/dev/null
         sleep 5
-        if sudo journalctl -k --since "@$mark" --no-pager 2>/dev/null | grep -q 'UFW DOCKER BLOCK'; then
+        # MATCH OUR OWN PACKET, not merely the prefix. The kernel ring buffer
+        # is global -- it is not namespaced the way the rules are -- so a run
+        # inside tests/container-leg.sh reads the HOST's dmesg and can see the
+        # host's own `[UFW DOCKER BLOCK]` lines. Grepping the prefix alone
+        # would pass on evidence this test did not produce, which is the exact
+        # shape of failure this suite keeps finding in itself.
+        if sudo journalctl -k --since "@$mark" --no-pager 2>/dev/null \
+            | grep 'UFW DOCKER BLOCK' | grep -q "SRC=10.97.0.2 .*DPT=19089 "; then
             return 0
         fi
     done
-    echo "no [UFW DOCKER BLOCK] line in 60s" >&2
+    # Name the non-obvious cause. Inside a nested namespace the rule fires and
+    # the packet IS dropped, but the kernel discards the log line unless
+    # `net.netfilter.nf_log_all_netns=1` -- so this reads as "logging broken"
+    # when nothing about logging is broken. container-leg.sh sets it.
+    echo "no [UFW DOCKER BLOCK] line for SRC=10.97.0.2 DPT=19089 in 60s" >&2
+    echo "  (in a nested netns, check net.netfilter.nf_log_all_netns on the HOST)" >&2
     return 1
 }
 

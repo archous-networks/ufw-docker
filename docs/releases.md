@@ -51,7 +51,10 @@ it answers a question nobody asked while looking like it answered the real one.
 ## What a release guarantees
 
 The artifact is attached by `.github/workflows/release.yml`, and the publish job
-`needs:` the full test matrix. **The artifact cannot exist unless every leg was green** —
+`needs:` the full test matrix — which since 2026-10-22 means the lint job, the three
+native `bats` legs (including both IPv6 configurations) **and ten distro legs**, each
+running the whole suite inside a real Debian or Ubuntu release on both iptables
+backends. **The artifact cannot exist unless every leg was green** —
 shellcheck, the five lints and self-tests, and all three bats legs including
 iptables-legacy.
 

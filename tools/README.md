@@ -76,7 +76,7 @@ answers that matter most:
 
 | section | why |
 |---|---|
-| **iptables backend** | `nf_tables` vs `legacy`. Only nf_tables has ever been verified, and Debian 10/11 default to legacy |
+| **iptables backend** | `nf_tables` vs `legacy`. Both are now verified and both are matched on, so this decides WHICH matrix row a host lands in rather than whether it is refused outright |
 | **mixed backends** | rules present in *both* subsystems. Both are evaluated by the kernel and a `DROP` in either wins, so filtering breaks in ways neither ruleset explains |
 | **Swarm / rootless** | both take packet paths this tool does not hook. `install` would appear to succeed and filter nothing |
 | **ufw version + default policy** | `deny (incoming)` is assumed throughout |

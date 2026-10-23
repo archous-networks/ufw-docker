@@ -28,6 +28,7 @@ rule chains into Docker's `DOCKER-USER` hook.
 | running or writing tests | [docs/testing.md](docs/testing.md) ← **read before running the suite** |
 | what is still missing, approved to build | [TODO.md](TODO.md) |
 | what was deferred, and what would un-defer it | [FUTURE.md](FUTURE.md) |
+| changing a firewall on a host you are SSH'd into | [.claude/skills/firewall-safety/SKILL.md](.claude/skills/firewall-safety/SKILL.md) |
 
 ## Invariants — do not break these
 
@@ -112,6 +113,14 @@ installed.
 | `SELFHEAL_DELAY` (20s) | load-bearing, and now validated: a chain emptied at boot was caught exactly 20s later. Checking immediately would find everything fine every time, and the unit would be useless without ever looking broken |
 | cold boot | verified by observation, not declaration: wiring survives, the unit runs in the boot environment, leaves a healthy firewall alone, **and repairs a broken one**. `tests/cold-boot-check.sh` |
 | `ufw`'s shebang | `#! /usr/bin/python3` — so the interpreter that can import `ufw.common` is guaranteed wherever ufw runs. That is what makes deriving ufw's paths safe (D5) |
-| Debian iptables/ufw by release | 10 → 1.8.2 / 0.36 · 11 → 1.8.7 / 0.36 · 12 → 1.8.9 / 0.36.2 · Ubuntu 24.04 (CI) → 1.8.10. **CI tests only the last of these**, so a Debian-only regression reaches `main` green |
-| systemd inside a privileged container | **works**, and is the route to a real CI matrix. `debian:12` + `systemd-sysv` + `--privileged --cgroupns=host`, dockerd inside, own netns → `install`, the netns probe and the filtering tests all pass, on iptables **1.8.9**. Measured on the dev host |
-| `grep -c` | PRINTS `0` and EXITS 1 on no match. `x=$(... | grep -c y) || true`, never `|| printf 0` — that emits `0\n0` and breaks every arithmetic test downstream. Bitten twice: the survey and the preflight |
+| Debian/Ubuntu iptables, ufw and docker.io by release | 10 → 1.8.2 / 0.36 / 18.09.1 · 11 → 1.8.7 / 0.36 / 20.10.5 · 12 → 1.8.9 / 0.36.2 / 20.10.24 · Ubuntu 22.04 → 1.8.7 / 0.36.1 / **29.1.3** · Ubuntu 24.04 → 1.8.10 / 0.36.2 / 29.1.3. Measured from the leg images, not looked up |
+| systemd inside a privileged container | **works**, and is now the CI distro matrix. `systemd-sysv` + `--privileged --cgroupns=host` + dockerd inside gives a real init, a real daemon and its own netns. 51/51 green on `debian:12` / iptables **1.8.9** — the fleet's version, which a GitHub runner cannot reach. `tests/container-leg.sh` |
+| what a nested leg does NOT cover | the kernel (always the runner's, so `debian:10` is Debian 10 *userspace* on a 6.x kernel), cold boot, and real load. The container legs are the per-push gate; the host run is still what proves boot behaviour |
+| netfilter `LOG` in a non-initial netns | **silently discarded** unless `net.netfilter.nf_log_all_netns=1`. The rule fires, the packet drops, no line appears — indistinguishable from broken logging. A GLOBAL sysctl: it is absent from the container's own `/proc/sys`, so it cannot be set from inside even with `--privileged` |
+| the kernel ring buffer is not namespaced | a leg's `journalctl -k` reads the HOST's dmesg. The drop-logging test used to grep the `[UFW DOCKER BLOCK]` prefix alone and would have passed on the host's lines; it now requires its own packet (`SRC=10.97.0.2 … DPT=19089`) |
+| `--tmpfs /tmp` is **noexec** | so a `PATH` stub placed under `/tmp` is found by `command -v` and silently NOT executed — the real binary runs instead. Four tests failed with nothing pointing at a filesystem. Mount it `exec` |
+| iptables 1.8.2 (Debian 10) prints `-p 6` | not `-p tcp`. Anything that matches rule TEXT by protocol name reads an old host as having no such rule. `rescue`'s SSH replay handles it; new matchers must |
+| bats by release | debian:10 → **0.4.0** (the original bats: no `setup_file`/`teardown_file`, and it does not error, it simply never calls them) · debian:11 and ubuntu:22.04 → 1.2.1 · debian:12 → 1.8.2 · ubuntu:24.04 → 1.10.0. The leg images pin one bats-core so a red leg means the DISTRO differs, not the harness |
+| Docker 18.09 on a cgroup v2 host | **cannot start at all**: `Error starting daemon: Devices cgroup isn't mounted`. cgroup v2 support arrived in Docker 20.10, so Debian 10's own `docker.io` is unusable on any current kernel and the Debian 10 leg uses docker-ce from Docker's own buster repo |
+| editing a bash script while it runs | bash reads the file by BYTE OFFSET. An edit mid-run shifts the file underneath the running shell, which resumes mid-token — observed as `line 184: he: command not found` followed by the whole suite running a second time. Looked like a tool bug for several minutes |
+| `grep -c` | PRINTS `0` and EXITS 1 on no match. `x=$(... | grep -c y) || true`, never `|| printf 0` — that emits `0\n0` and breaks every arithmetic test downstream. Bitten **three** times: the survey, the preflight, and the leg runner's rule counts. Prefer `awk '/re/{n++} END{print n+0}'`, which has one exit status and one line of output |

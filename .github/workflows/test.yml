@@ -28,7 +28,7 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: syntax
         run: |
-          for f in ufw-docker tests/netns-probe.sh; do
+          for f in ufw-docker tests/netns-probe.sh tests/container-leg.sh; do
             bash -n "$f" && echo "ok  $f"
           done
       - name: the operator-rule invariant actually fires
@@ -70,7 +70,7 @@ jobs:
         # the build -- and the file is clean at this level, so there is nothing
         # to grandfather in. Lower the severity rather than restoring `|| true`
         # if that ever stops being true.
-        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/lint-version.sh tests/cold-boot-check.sh
+        run: shellcheck -S warning ufw-docker tools/ufw-docker-survey tests/netns-probe.sh tests/run.sh tests/invariant-selftest.sh tests/lint-functions.sh tests/lint-supported.sh tests/ssh-detect-selftest.sh tests/lint-version.sh tests/cold-boot-check.sh tests/container-leg.sh
 
   bats:
     runs-on: ubuntu-latest
@@ -229,3 +229,57 @@ jobs:
         # cancelled, taking the diagnostics with it.
         timeout-minutes: 5
         run: sudo timeout 180 /usr/local/sbin/ufw-docker rescue || true
+
+  distro:
+    # ── THE REAL-WORLD MATRIX ──────────────────────────────────────────────
+    # The `bats` job above tests ONE environment: Ubuntu 24.04 with iptables
+    # 1.8.10, because that is what a GitHub runner is. Nothing in the fleet
+    # runs it. Debian 12 / iptables 1.8.9 was verified only by a human running
+    # the suite by hand on one host -- strong evidence, but not per-push, so a
+    # Debian-only regression reached `main` green.
+    #
+    # Each leg here boots a REAL distribution with systemd as pid 1 and its own
+    # Docker daemon, inside one privileged container, and runs the identical
+    # suite. See tests/containers/Dockerfile for what is real in there and what
+    # is not -- the kernel is shared, and that limit is stated in
+    # docs/supported.md rather than papered over.
+    #
+    # The legs are not interchangeable with the `bats` job and do not replace
+    # it: that one has the IPv6 coverage, which needs daemon-level `ip6tables`
+    # and is left on the native runner.
+    runs-on: ubuntu-latest
+    # MEASURED on the development host: ~12 min for a leg, of which roughly two
+    # are the image build and the rest is the 51-test suite. A GitHub runner has
+    # fewer cores, so this is deliberately generous -- the failure mode to avoid
+    # is a cancelled job, which takes the diagnostics with it and tells you
+    # nothing. That has already cost this project two runs.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full cross product of the distributions anyone actually runs this on
+        # against both iptables backends. The pairing matters as much as either
+        # axis: the daemon is the DISTRO'S own, so an old iptables is tested
+        # with the old Docker that ships beside it, which is the combination
+        # that exists in the wild.
+        #
+        #   debian:10   iptables 1.8.2   the oldest thing plausibly still out there
+        #   debian:11   iptables 1.8.7
+        #   debian:12   iptables 1.8.9   dev-00 and site-00 -- the fleet
+        #   ubuntu:22.04 iptables 1.8.7
+        #   ubuntu:24.04 iptables 1.8.10 the same version the native job runs,
+        #                                which is the point: it cross-checks
+        #                                the harness against a known result.
+        base: [ 'debian:10', 'debian:11', 'debian:12', 'ubuntu:22.04', 'ubuntu:24.04' ]
+        backend: [ nft, legacy ]
+    name: distro (${{ matrix.base }}, ${{ matrix.backend }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the suite inside ${{ matrix.base }} / ${{ matrix.backend }}
+        # No marker file and no `sudo ufw --force enable` on the RUNNER: the
+        # nested container has its own network namespace, netfilter state is
+        # per-namespace, and everything the suite does is confined to it. This
+        # job never touches the runner's own firewall, which is why it needs
+        # none of the native job's guard rails.
+        run: tests/container-leg.sh '${{ matrix.base }}' '${{ matrix.backend }}'

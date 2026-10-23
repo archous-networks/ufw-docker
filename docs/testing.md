@@ -94,6 +94,101 @@ measuring a failure is a trap.
   opens it" tests fail *and* the "blocked" tests pass vacuously — they would stay green
   even if the tool did nothing. This is why `start_testsvc()` publishes `19089:19089`.
 
+## The distro matrix — real distributions, in containers
+
+```bash
+tests/container-leg.sh debian:12 nft        # one leg, the same command CI runs
+tests/container-leg.sh ubuntu:22.04 legacy
+```
+
+Each leg boots a **real distribution with systemd as pid 1 and its own Docker daemon**
+inside one privileged container, copies the working tree in, and runs the identical
+suite. CI runs these legs with the identical script — there is no CI-only path through
+it, which is deliberate: a behaviour that differs between CI and a developer's machine
+is the exact shape of bug that has cost this project two cancelled runs.
+
+### Why it exists
+
+Before it, CI tested **one** environment: Ubuntu 24.04 with iptables 1.8.10, because that
+is what a GitHub runner is. Nothing in the fleet runs that. Debian 12 / iptables 1.8.9
+was verified only by a human running the suite by hand on one host — strong evidence, but
+not per-push, so **a Debian-only regression reached `main` green**.
+
+The blocker was believed to be "GitHub has no Debian runners", which is true, and was
+taken to mean VMs, DinD services or self-hosted infrastructure. It does not.
+
+### What each leg actually covers
+
+| leg | ufw | iptables | docker.io |
+|---|---|---|---|
+| `debian:10` | 0.36 | **1.8.2** | 18.09.1 |
+| `debian:11` | 0.36 | 1.8.7 | 20.10.5 |
+| `debian:12` | 0.36.2 | **1.8.9** — the fleet's version | 20.10.24 |
+| `ubuntu:22.04` | 0.36.1 | 1.8.7 | **29.1.3** |
+| `ubuntu:24.04` | 0.36.2 | 1.8.10 | 29.1.3 |
+
+× `{nft, legacy}`. The pairing matters as much as either axis: the daemon is the distro's
+own, so an old iptables is tested beside the old Docker that ships with it — which is the
+combination that exists in the wild. Ubuntu 22.04 is the useful outlier, pairing iptables
+1.8.7 with a *modern* daemon.
+
+### What is NOT real in there
+
+Stated plainly because a matrix that overstates its reach is worse than a small one.
+
+- **The kernel is the runner's**, shared by every leg. `debian:10` means Debian 10
+  *userspace* on a 6.x kernel, not the 4.19 a real Debian 10 box runs. A distro whose own
+  kernel lacks an nftables feature would not be caught here.
+- **No cold boot.** The self-heal unit exists for a real machine coming up with ufw at
+  ~3.7s and Docker at ~8.1s. A container cannot reproduce that; `tests/cold-boot-check.sh`
+  on real hardware remains the only evidence, and it is still manual.
+- **No real load.** A leg is a clean room with one container. The development host has
+  sixteen and a live UISP stack, where `install` costs ~8s against ~1s here.
+- **A non-initial network namespace is not a host**, and that is not a theoretical
+  reservation — see the logging trap below.
+
+So these legs are the **per-push gate**, and the host run is what you do before a release
+and after anything that touches boot or self-heal. They do not retire it.
+
+### Three traps, all of which produced a confident wrong answer first
+
+**`--tmpfs /tmp` is `noexec`.** Several tests shadow `docker` with a stub on `PATH` to
+simulate a Swarm host. `command -v docker` found the stub, and executing `docker` silently
+ran the **real** one, because `command -v` checks the executable bit and the kernel checks
+the mount. Four tests failed with no hint of a filesystem being involved. The leg mounts
+`/tmp` with `exec` now, which is also what a real host has.
+
+**`net.netfilter.nf_log_all_netns` defaults to 0.** Netfilter `LOG` calls reach the kernel
+ring buffer **only from the initial network namespace**. So inside a leg the stanza's
+`[UFW DOCKER BLOCK]` rule fires, the packet is correctly dropped, and *nothing is ever
+logged*. It reads exactly like broken logging. It is a global sysctl that does not exist
+inside the container's `/proc/sys` at all, so `container-leg.sh` sets it on the host and
+puts it back afterwards.
+
+**The kernel ring buffer is not namespaced.** Which means a leg's `journalctl -k` reads
+the *host's* dmesg, including the host's own `[UFW DOCKER BLOCK]` lines. The logging test
+used to grep for the prefix alone and would have passed on evidence it did not produce.
+It now requires its own packet (`SRC=10.97.0.2 … DPT=19089`), and `container-leg.sh` takes
+`/var/lock/ufw-docker-leg` so two legs cannot run side by side on one machine and pass on
+each other's log lines. In CI each leg gets its own runner, so the lock never engages
+there — it is for the developer running several by hand, which is precisely when it would
+have been missed.
+
+### It does not touch the host's firewall
+
+Unlike `tests/run.sh`, this needs no `/etc/ufw-docker-tests-allowed` marker. Netfilter
+state is **per network namespace**, and the container has its own — so a leg enabling ufw,
+flushing chains and restarting a daemon is confined to it. Verified by running
+`ufw-docker status` on the development host mid-leg: healthy and unchanged throughout.
+
+The two things that *are* host-wide are named above: the `nf_log_all_netns` sysctl, which
+is set and restored, and the kernel ring buffer, which is read-only here.
+
+> ⚠️ **Do not edit a script while it is running.** Bash reads a script by byte offset, so
+> editing `container-leg.sh` mid-leg shifted the file under the running shell: it resumed
+> mid-token (`line 184: he: command not found`) and re-ran the whole suite a second time.
+> The run looked like a bizarre tool bug for several minutes. Let the leg finish.
+
 ## The IPv6 matrix
 
 CI runs the whole suite **twice**: once with Docker's daemon `ip6tables` off, once on.
@@ -187,8 +282,17 @@ If the fingerprint does not match, the diff is printed, **the run exits non-zero
 snapshot is kept with the two commands needed to put it back by hand.
 
 The fingerprint covers declared *and* live state — `ufw status verbose`, both `DOCKER-USER`
-chains, and checksums of every file in `/etc/ufw`. Neither half alone is enough: `user.rules`
-can be correct while the chains are not, which is the whole failure mode `rescue` exists for.
+chains, checksums of every file in `/etc/ufw`, **and the self-heal systemd unit plus whether
+it is enabled**. Neither of the first two halves alone is enough: `user.rules` can be correct
+while the chains are not, which is the whole failure mode `rescue` exists for.
+
+> ⚠️ **The unit was missing from this list, and the restore reported success anyway.** Five
+> consecutive runs printed `host state matches the pre-suite snapshot` while
+> `ufw-docker-selfheal.service` was gone from the host, because a fingerprint cannot notice
+> what it does not hash. It was found by asking "is this host ready to reboot?", not by any
+> test. **If you give the suite the power to change something new, add it to `fingerprint()`
+> in the same commit** — a restore that silently under-reports is worse than no restore,
+> because it is believed.
 
 **This runs in CI too, deliberately.** Making it local-only would leave the restore path
 untested by the one thing that runs on every push, and a behaviour that differs between CI

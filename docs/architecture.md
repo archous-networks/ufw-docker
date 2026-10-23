@@ -50,7 +50,9 @@ it should not have.
 
 Two kinds of check. The **platform matrix** (distro + major version + iptables backend)
 must match a row that real evidence put there — a green CI leg, or a full suite run on a
-host of that class. And four **mechanism** checks that fail regardless of platform:
+host of that class. Every row is backed by a leg that runs the whole suite inside that
+actual distribution on every push (`tests/container-leg.sh`), so "proven" means proven
+this commit, not proven once by hand. And four **mechanism** checks that fail regardless of platform:
 rules present in *both* iptables backends, Docker Swarm, rootless Docker, and ufw's
 files not being where ufw says they are.
 

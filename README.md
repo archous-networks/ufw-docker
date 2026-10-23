@@ -78,7 +78,7 @@ The firewall reports a rule that does nothing. → [How it is fixed](docs/archit
 | **[Supported platforms](docs/supported.md)** | what this is proven on, how a row earns `supported`, and the override |
 | [Caveats](docs/caveats.md) | things that are true and will surprise you |
 | [Troubleshooting](docs/troubleshooting.md) | symptom → cause → fix |
-| [Testing](docs/testing.md) | the suite, the IPv6 matrix, and two ways to break your own host |
+| [Testing](docs/testing.md) | the suite, the distro and IPv6 matrices, and two ways to break your own host |
 | [Known gaps](TODO.md) | approved for immediate work, tagged and triaged |
 | [Deferred](FUTURE.md) | reviewed and put off, each with what would bring it forward |
 
@@ -186,9 +186,19 @@ port. → [rescue.md](docs/rescue.md)
 
 ## Requirements
 
-Debian/Ubuntu with `ufw`, Docker, `iptables`, and root. Tested on Debian 12 with
-ufw 0.36.2, Docker 29.7.1, nftables-backed iptables 1.8.9 — including across a real
-reboot, where ufw starts before Docker and the wiring survives intact.
+Debian/Ubuntu with `ufw`, Docker, `iptables`, and root.
+
+**Every push runs the full suite against Debian 10, 11 and 12 and Ubuntu 22.04 and
+24.04, each on both iptables backends** — ten combinations covering iptables 1.8.2
+through 1.8.10 and Docker 18.09 through 29.1. On top of that, Debian 12 with
+ufw 0.36.2, Docker 29.7.1 and nftables-backed iptables 1.8.9 is exercised on real
+hardware, including across a real reboot, where ufw starts before Docker and the wiring
+survives intact.
+
+`install` refuses anything outside that set rather than filtering silently — see
+[supported.md](docs/supported.md). The one thing CI cannot give you is each distro's
+**own kernel**: a leg is that distro's userspace on the runner's kernel.
+→ [testing.md](docs/testing.md)
 
 **IPv4 and IPv6.** v6 filtering is real but needs the Docker daemon to be doing v6
 itself — `"ipv6": true, "ip6tables": true` in `daemon.json`. Without that, Docker drops
