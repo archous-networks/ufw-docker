@@ -1660,13 +1660,20 @@ stanza_count() {
     #
     # Dynamic rather than a pinned SHA: "the revision before this one" is both
     # the realistic upgrade and a target that stays correct as history grows.
-    local prev
+    local old="$BATS_TEST_TMPDIR/ufw-docker-prev" prev
     prev="$(cd "$REPO" && git log --format=%H -- ufw-docker 2>/dev/null | sed -n '2p')"
-    [ -n "$prev" ] || skip "no previous revision available (shallow clone?)"
-
-    local old="$BATS_TEST_TMPDIR/ufw-docker-prev"
-    (cd "$REPO" && git show "$prev:ufw-docker") > "$old" 2>/dev/null \
-        || skip "could not read $prev:ufw-docker"
+    if [ -n "$prev" ]; then
+        (cd "$REPO" && git show "$prev:ufw-docker") > "$old" 2>/dev/null \
+            || skip "could not read $prev:ufw-docker"
+    elif [ -s "$REPO/tests/.prev-ufw-docker" ]; then
+        # A distro leg gets tracked files only, with no .git -- so
+        # container-leg.sh drops the previous revision here instead. Without
+        # this branch the test skipped on all ten legs and ran only on the
+        # five native ones, quietly.
+        cp "$REPO/tests/.prev-ufw-docker" "$old"
+    else
+        skip "no previous revision available (shallow clone, and no .prev-ufw-docker)"
+    fi
     chmod +x "$old"
 
     # The old revision installs, or this test has nothing to upgrade FROM.

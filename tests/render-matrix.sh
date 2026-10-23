@@ -58,6 +58,30 @@ if [ ! -s "$ALL" ]; then
 fi
 echo "collected $(wc -l < "$ALL") result rows" >&2
 
+# Refuse a table that is missing a whole SECTION.
+#
+# This is not hypothetical. On the first real run every distro leg uploaded
+# nothing -- an artifact name may not contain a colon and every base has one
+# -- so the table published with its ten distro rows simply absent. The page
+# looked healthy and said this tool is tested on the native runner only. A
+# silently truncated status table is worse than a stale one, and worse than
+# no table at all, because it is confidently wrong in the safe-looking
+# direction.
+#
+# The empty-collection guard above did not catch it: there were plenty of
+# rows, just none of the ones that matter most. So check per GROUP.
+missing=""
+for g in ${MATRIX_EXPECT_GROUPS:-lint native distro}; do
+    awk -F'\t' -v g="$g" '$1 == g { found = 1 } END { exit !found }' "$ALL" \
+        || missing="$missing $g"
+done
+if [ -n "$missing" ]; then
+    echo "REFUSING to write the table: no rows at all for:$missing" >&2
+    echo "  Those jobs did not upload a result. The existing table is left in" >&2
+    echo "  place -- stale, but complete and therefore not misleading." >&2
+    exit 1
+fi
+
 # A signature over the RESULT ROWS ONLY -- not the header, which carries a
 # timestamp and a run link and therefore differs on every single run.
 #

@@ -23,9 +23,9 @@ awk '
     # `say()` prints "-- phase: <name>"; everything after it belongs to that
     # phase until the next one. Lines before the first phase header are the
     # bats suite itself.
-    /^-- phase: correctness under load/          { ph = "load";     next }
-    /^-- phase: rootless alongside rootful/      { ph = "rootless"; next }
-    /^-- phase: cold boot/                       { ph = "coldboot"; next }
+    /^-- phase: correctness under load/          { ph = "load";     sawphase = 1; next }
+    /^-- phase: rootless alongside rootful/      { ph = "rootless"; sawphase = 1; next }
+    /^-- phase: cold boot/                       { ph = "coldboot"; sawphase = 1; next }
 
     # The suite is TAP, so count its plan and its failures from the TAP stream
     # rather than from the phase helpers, which use a different vocabulary.
@@ -45,6 +45,12 @@ awk '
         if (skipc > 0) printf " (%d skipped)", skipc
 
         if (aborted) { printf "; phases not run"; print ""; exit }
+
+        # The NATIVE job runs this too, and it has no phases at all -- so
+        # without this every native row read "load=none; rootless=none;
+        # coldboot=none", which looks like three failures rather than three
+        # things that were never part of that job.
+        if (!sawphase) { print ""; exit }
 
         n = split("load rootless coldboot", order, " ")
         for (i = 1; i <= n; i++) {

@@ -464,6 +464,15 @@ jobs:
           st=pass; [ "${{ job.status }}" = success ] || st=fail
           notes="$(tests/leg-summary.sh "$RUNNER_TEMP/leg.log" 2>/dev/null || echo 'no log')"
           mkdir -p "$RUNNER_TEMP/result"
+          # An artifact name may not contain a colon, and EVERY base has one
+          # ("debian:12"). This failed all ten legs at the final step, after
+          # each had run its full suite and all three phases green -- the job
+          # went red for a filename, and the README table silently lost its
+          # entire distro section as a result.
+          #
+          # GitHub expressions have no string-replace, so the slug is made
+          # here and handed to the upload step through the environment.
+          echo "SLUG=$(printf '%s' '${{ matrix.base }}' | tr ':' '-')" >> "$GITHUB_ENV"
           printf 'distro\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             '${{ matrix.base }}' '${{ matrix.backend }}' "$RUNNER_IMAGE" \
             "${KERNEL:-unknown}" "$st" "$notes" > "$RUNNER_TEMP/result/distro.tsv"
@@ -472,7 +481,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: result-distro-${{ matrix.base }}-${{ matrix.backend }}
+          name: result-distro-${{ env.SLUG }}-${{ matrix.backend }}
           path: ${{ runner.temp }}/result/*.tsv
           retention-days: 7
           if-no-files-found: warn
@@ -490,7 +499,11 @@ jobs:
     # that execute a line without asserting anything, which is how a suite
     # starts looking healthier than it is. The number is reported so a DROP is
     # visible; it is not allowed to fail the build.
-    runs-on: ubuntu-24.04
+    # ubuntu-22.04, because **kcov was dropped from Ubuntu 24.04** -- the
+    # first run of this job died on `E: Unable to locate package kcov`. There
+    # is a source-build fallback below, so the job no longer depends on any
+    # one image carrying it.
+    runs-on: ubuntu-22.04
     continue-on-error: true
     timeout-minutes: 40
     steps:
@@ -498,16 +511,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install ufw, kcov, and the same pinned bats
+      - name: Install ufw, the same pinned bats, and kcov
+        # kcov is advisory, so its absence must never fail this job -- the
+        # first run did exactly that, with `apt-get install kcov` returning
+        # 100 on ubuntu-24.04 where the package no longer exists. Try the
+        # archive, fall back to a source build, and if both fail carry on and
+        # report "no report" rather than going red.
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw kcov
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw
           git clone --depth 1 --branch v1.11.1 \
             https://github.com/bats-core/bats-core.git /tmp/bats-core
           sudo /tmp/bats-core/install.sh /usr/local
           rm -rf /tmp/bats-core
           bats --version
-          kcov --version
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kcov || true
+          if ! command -v kcov >/dev/null; then
+            echo "kcov not in the archive; building v43 from source"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+              cmake binutils-dev libcurl4-openssl-dev zlib1g-dev \
+              libdw-dev libiberty-dev libelf-dev || true
+            git clone --depth 1 --branch v43 https://github.com/SimonKagstrom/kcov.git /tmp/kcov || true
+            if [ -d /tmp/kcov ]; then
+              cmake -S /tmp/kcov -B /tmp/kcov/build >/dev/null 2>&1 \
+                && make -C /tmp/kcov/build -j"$(nproc)" >/dev/null 2>&1 \
+                && sudo make -C /tmp/kcov/build install >/dev/null 2>&1 || true
+            fi
+          fi
+          command -v kcov && kcov --version || echo "NO KCOV -- coverage will report as skipped"
 
       - name: Install ufw-docker
         run: sudo install -m 0755 ufw-docker /usr/local/sbin/ufw-docker

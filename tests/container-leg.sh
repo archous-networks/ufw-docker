@@ -235,6 +235,27 @@ say "copy the working tree in"
 git -C "$REPO" ls-files -z | tar -C "$REPO" --null -T - -cf - \
     | docker exec -i "$NAME" sh -c 'mkdir -p /root/ufw-docker && tar -C /root/ufw-docker -xf -' || exit 1
 
+# The tar above carries TRACKED FILES ONLY -- deliberately, so a leg gets a
+# clean checkout rather than the maintainer's working tree. The cost is that
+# there is no `.git` inside, so the upgrade test that reads the previous
+# revision out of git found nothing and skipped on all ten legs while the
+# native job ran it fine. A test that silently covers five environments and
+# skips in ten is the shape this project keeps getting caught by.
+#
+# So hand the leg the previous revision as a plain file. The test prefers git
+# and falls back to this, which keeps it working in both places without the
+# leg needing history it was intentionally not given.
+PREV_REV="$(git -C "$REPO" log --format=%H -- ufw-docker 2>/dev/null | sed -n '2p')"
+if [ -n "$PREV_REV" ]; then
+    if git -C "$REPO" show "$PREV_REV:ufw-docker" 2>/dev/null \
+        | docker exec -i "$NAME" sh -c 'cat > /root/ufw-docker/tests/.prev-ufw-docker'; then
+        dexec chmod 0755 /root/ufw-docker/tests/.prev-ufw-docker
+        say "previous revision ${PREV_REV:0:7} placed for the upgrade test"
+    fi
+else
+    say "NOTE no previous revision in git; the upgrade-from-real-release test will skip"
+fi
+
 say "prepare the suite"
 dexec sh -c '
     set -e
