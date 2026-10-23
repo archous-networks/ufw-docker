@@ -107,7 +107,10 @@ fi
 #
 #   - ufw-docker's install state. teardown_file ends in `remove --force`, so a
 #     host that HAD the stanza installed was handed back without it. That is
-#     how the development host was found unwired.
+#     how the development host was found unwired. That includes the SELF-HEAL
+#     SYSTEMD UNIT, which is not in /etc/ufw -- an earlier version of this
+#     snapshot missed it and cheerfully reported a match while the unit was
+#     gone.
 #   - rules on any port in TEST_PORTS. Those ports are now chosen so nothing
 #     real listens on them, but they were not always: the suite used to drive
 #     8089 and 443, which unms-nginx publishes, and deleted the operator's
@@ -127,6 +130,8 @@ fi
 # UFW_DOCKER_NO_RESTORE=1 to skip it.
 SNAP=""
 
+SELFHEAL_UNIT=/etc/systemd/system/ufw-docker-selfheal.service
+
 fingerprint() {
     # Declared state AND live state. Neither alone is enough: user.rules can be
     # correct while the chains are not, which is the whole failure mode
@@ -138,6 +143,20 @@ fingerprint() {
     echo "--- /etc/ufw"
     ( cd /etc/ufw && sha256sum user.rules user6.rules after.rules after6.rules \
         before.rules before6.rules before.init ufw.conf 2>/dev/null )
+    # The self-heal unit is INSTALLED STATE, and it does not live in /etc/ufw.
+    #
+    # Leaving it out is how this check reported "host state matches the
+    # pre-suite snapshot" on a host whose self-heal unit the suite had just
+    # deleted and never put back -- teardown_file runs `remove --force`, which
+    # removes it. A fingerprint that omits part of the state it claims to
+    # cover is worse than no fingerprint: it is a false all-clear.
+    echo "--- selfheal unit"
+    if [ -f "$SELFHEAL_UNIT" ]; then
+        sha256sum "$SELFHEAL_UNIT"
+        echo "enabled=$(systemctl is-enabled ufw-docker-selfheal.service 2>/dev/null || true)"
+    else
+        echo "absent"
+    fi
 }
 
 snapshot_state() {
@@ -146,6 +165,13 @@ snapshot_state() {
     tar -C /etc/ufw -cf "$SNAP/etc-ufw.tar" . 2>/dev/null
     ( cd /etc/ufw && find . -type f | sort ) > "$SNAP/manifest"
     ufw status 2>/dev/null | head -1 > "$SNAP/enabled"
+    if [ -f "$SELFHEAL_UNIT" ]; then
+        cp -a "$SELFHEAL_UNIT" "$SNAP/selfheal.unit"
+        # is-enabled PRINTS "disabled" and EXITS non-zero, so the `|| true`
+        # matters -- without it this records an empty value on a host where
+        # the unit is present but off.
+        systemctl is-enabled ufw-docker-selfheal.service 2>/dev/null > "$SNAP/selfheal.enabled" || true
+    fi
     fingerprint > "$SNAP/fingerprint"
     echo "pre-suite state snapshotted to $SNAP"
 }
@@ -164,6 +190,21 @@ restore_state() {
     # disable/enable rather than `reload` because the suite may have left ufw
     # disabled, and because enable is what replays after.rules -- which is what
     # re-wires DOCKER-USER when the stanza was part of the original state.
+    # Put the self-heal unit back, or remove one the suite introduced.
+    if [ -f "$SNAP/selfheal.unit" ]; then
+        cp -a "$SNAP/selfheal.unit" "$SELFHEAL_UNIT"
+        systemctl daemon-reload 2>/dev/null
+        if grep -qx enabled "$SNAP/selfheal.enabled" 2>/dev/null; then
+            systemctl enable ufw-docker-selfheal.service >/dev/null 2>&1
+        else
+            systemctl disable ufw-docker-selfheal.service >/dev/null 2>&1
+        fi
+    elif [ -f "$SELFHEAL_UNIT" ]; then
+        systemctl disable ufw-docker-selfheal.service >/dev/null 2>&1
+        rm -f "$SELFHEAL_UNIT"
+        systemctl daemon-reload 2>/dev/null
+    fi
+
     if grep -qi 'active' "$SNAP/enabled"; then
         ufw --force disable >/dev/null 2>&1
         ufw --force enable  >/dev/null 2>&1
