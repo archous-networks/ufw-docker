@@ -95,13 +95,19 @@ RUN set -eux; \
 # `sudo` is required by the SUITE, not by this image: the bats tests invoke
 # every privileged command through it even when already root, so that one set
 # of tests runs unchanged on a developer's host and here.
+#
+# Debian 13 (trixie) split the client out of `docker.io` (26.1.5) into
+# `docker-cli`, which `docker.io` only RECOMMENDS. Under --no-install-recommends
+# the daemon installs and starts, and `docker` is simply not on PATH -- the leg
+# then dies at its first `docker` call. Named by codename, like buster above,
+# rather than probed, so a release that changes packaging fails loudly here.
 RUN set -eux; \
     . /etc/os-release; \
-    if [ "${VERSION_CODENAME:-}" = buster ]; then \
-        DOCKER_PKGS="docker-ce docker-ce-cli containerd.io"; \
-    else \
-        DOCKER_PKGS="docker.io"; \
-    fi; \
+    case "${VERSION_CODENAME:-}" in \
+      buster) DOCKER_PKGS="docker-ce docker-ce-cli containerd.io" ;; \
+      trixie) DOCKER_PKGS="docker.io docker-cli" ;; \
+      *)      DOCKER_PKGS="docker.io" ;; \
+    esac; \
     apt-get update -qq; \
     apt-get install -y -qq --no-install-recommends \
         systemd systemd-sysv dbus \

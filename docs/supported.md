@@ -23,6 +23,8 @@ ufw-docker platforms      # the matrix, plus where this host sits in it
 | `deb11-legacy` | debian | 11 | 0.36 | legacy | 20.10.5 | CI leg `distro (debian:11, legacy)` | **supported** |
 | `deb12-nft` | debian | 12 | 0.36.2 | nf_tables | 20.10.24 | CI leg, plus full suite on a 29.7.1 host | **supported** |
 | `deb12-legacy` | debian | 12 | 0.36.2 | legacy | 20.10.24 | CI leg `distro (debian:12, legacy)` | **supported** |
+| `deb13-nft` | debian | 13 | 0.36.2 | nf_tables | 26.1.5 | CI leg `distro (debian:13, nft)` | **supported** |
+| `deb13-legacy` | debian | 13 | 0.36.2 | legacy | 26.1.5 | CI leg `distro (debian:13, legacy)` | **supported** |
 | `ubu22-nft` | ubuntu | 22 | 0.36.1 | nf_tables | 29.1.3 | CI leg `distro (ubuntu:22.04, nft)` | **supported** |
 | `ubu22-legacy` | ubuntu | 22 | 0.36.1 | legacy | 29.1.3 | CI leg `distro (ubuntu:22.04, legacy)` | **supported** |
 | `ubu24-nft` | ubuntu | 24 | 0.36.2 | nf_tables | 29.1.3 | CI legs `bats` nft ×2, and `distro` nft | **supported** |
@@ -63,6 +65,7 @@ above is the evidence.
 |---|---|---|---|---|---|
 | dev-00 | Debian 12 | 0.36.2 | nf_tables | 29.7.1 | full suite on demand — 52/52, host state restored exactly — plus a verified cold boot, which is the one thing CI cannot do |
 | site-00 | Debian 12 | 0.36.2 | nf_tables | 29.9.2 | `tools/ufw-docker-survey` only |
+| dev-01 | Debian 13 | 0.36.2 | nf_tables | 29.6.1 | survey; 1.0.0 installed with `--unsupported --force` (before the `deb13` row) governing a live reverse proxy: allow, deny and route-allow verified from outside probes, wiring intact across two `ufw reload`s |
 
 > An earlier version of this page had both of those **in the matrix**, as two rows with
 > one key, and justified the second with *"same class as `dev-00`"*. That is precisely the

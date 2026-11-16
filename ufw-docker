@@ -325,6 +325,8 @@ deb11-nft    | debian | 11 | 0.36   | nf_tables | 20.10.5 | CI leg distro (debia
 deb11-legacy | debian | 11 | 0.36   | legacy    | 20.10.5 | CI leg distro (debian:11, legacy)       | supported
 deb12-nft    | debian | 12 | 0.36.2 | nf_tables | 20.10.24| CI leg, plus full suite on a 29.7.1 host | supported
 deb12-legacy | debian | 12 | 0.36.2 | legacy    | 20.10.24| CI leg distro (debian:12, legacy)       | supported
+deb13-nft    | debian | 13 | 0.36.2 | nf_tables | 26.1.5  | CI leg distro (debian:13, nft)          | supported
+deb13-legacy | debian | 13 | 0.36.2 | legacy    | 26.1.5  | CI leg distro (debian:13, legacy)       | supported
 ubu22-nft    | ubuntu | 22 | 0.36.1 | nf_tables | 29.1.3  | CI leg distro (ubuntu:22.04, nft)       | supported
 ubu22-legacy | ubuntu | 22 | 0.36.1 | legacy    | 29.1.3  | CI leg distro (ubuntu:22.04, legacy)    | supported
 ubu24-nft    | ubuntu | 24 | 0.36.2 | nf_tables | 29.1.3  | CI legs bats nft x2, and distro nft     | supported

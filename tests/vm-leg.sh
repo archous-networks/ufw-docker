@@ -35,7 +35,7 @@
 # failure mode.
 set -uo pipefail
 
-DISTRO="${1:?usage: vm-leg.sh <debian-10|debian-11|debian-12> <nft|legacy> [distro|ce]}"
+DISTRO="${1:?usage: vm-leg.sh <debian-10|debian-11|debian-12|debian-13> <nft|legacy> [distro|ce]}"
 BACKEND="${2:?usage: vm-leg.sh <distro> <nft|legacy> [distro|ce]}"
 DOCKER_FROM="${3:-}"
 
@@ -45,6 +45,7 @@ case "$DISTRO" in
     debian-10) CODENAME=buster;   IMG=debian-10-genericcloud-amd64.qcow2; WANT_KERNEL=4.19 ;;
     debian-11) CODENAME=bullseye; IMG=debian-11-genericcloud-amd64.qcow2; WANT_KERNEL=5.10 ;;
     debian-12) CODENAME=bookworm; IMG=debian-12-genericcloud-amd64.qcow2; WANT_KERNEL=6.1  ;;
+    debian-13) CODENAME=trixie;   IMG=debian-13-genericcloud-amd64.qcow2; WANT_KERNEL=6.12 ;;
     *) echo "unknown distro: $DISTRO" >&2; exit 2 ;;
 esac
 
@@ -296,6 +297,11 @@ if [ "$DOCKER_FROM" = ce ]; then
         sudo apt-get update
     " || exit 1
     apt_install docker-ce docker-ce-cli containerd.io || exit 1
+elif [ "$CODENAME" = trixie ]; then
+    # Debian 13 split the client out of docker.io into docker-cli, which docker.io
+    # only RECOMMENDS; apt_install passes --no-install-recommends, so without it the
+    # daemon runs and `docker` is not on PATH. Same fix as tests/containers/Dockerfile.
+    apt_install docker.io docker-cli || exit 1
 else
     apt_install docker.io || exit 1
 fi
